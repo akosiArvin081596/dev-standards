@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Managed by dev-standards (synced by team-sync; never edit in a project).
+# SessionStart hook: the fence (layer 3) lives in the `team` plugin, so warn
+# loudly when that plugin is not installed and enabled for this project.
+# Reads files only: no nested `claude` process, no network.
+set -uo pipefail
+
+PLUGIN_ID="team@dev-standards"
+cat >/dev/null 2>&1 || true   # hook input is not needed
+
+config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+# Local settings live at the repo's main checkout, even inside a worktree.
+main_root="$project_dir"
+common_dir=$(git -C "$project_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+case "$common_dir" in
+  */.git) main_root="${common_dir%/.git}" ;;
+esac
+
+installed=no
+installed_file="$config_dir/plugins/installed_plugins.json"
+if [ -r "$installed_file" ] && jq -e --arg id "$PLUGIN_ID" '
+    (.plugins // {}) as $p
+    | if ($p | type) == "object" then ($p | has($id))
+      else any($p[]?; ((.id? // .name? // "") == $id)) end' "$installed_file" >/dev/null 2>&1; then
+  installed=yes
+fi
+
+# `claude --plugin-dir <dir>` (testing the plugin by hand) loads it without an install.
+parent_args=$(ps -o args= -p "$PPID" 2>/dev/null || true)
+case "$parent_args" in
+  *--plugin-dir*team*) installed=yes ;;
+esac
+
+# Enabled state: the last explicit value wins across user < project < local.
+enabled="unset"
+for settings in "$config_dir/settings.json" "$project_dir/.claude/settings.json" "$main_root/.claude/settings.local.json"; do
+  [ -r "$settings" ] || continue
+  value=$(jq -r --arg id "$PLUGIN_ID" 'if (.enabledPlugins? | type) == "object" and (.enabledPlugins | has($id)) then (.enabledPlugins[$id] | tostring) else empty end' "$settings" 2>/dev/null || true)
+  [ -n "$value" ] && enabled="$value"
+done
+
+if [ "$installed" = yes ] && [ "$enabled" = true ]; then
+  exit 0
+fi
+
+problem="not installed"
+[ "$installed" = yes ] && problem="disabled"
+[ "$installed" = no ] && [ "$enabled" != true ] && problem="not installed and not enabled"
+
+jq -n --arg problem "$problem" --arg id "$PLUGIN_ID" '{
+  systemMessage: ("WARNING: the team plugin (" + $id + ") is " + $problem + ", so the fence hook (layer 3) is OFF in this session. Fix: claude plugin install " + $id + " --scope project, then /reload-plugins."),
+  hookSpecificOutput: {
+    hookEventName: "SessionStart",
+    additionalContext: ("WARNING: the team plugin (" + $id + ") is " + $problem + ". Its PreToolUse fence (layer 3) is OFF; only the deny and ask rules in .claude/settings.json protect this session. Tell the user at once, and do not run guarded, GitHub-changing or server actions until it is fixed.")
+  }
+}'
+exit 0
