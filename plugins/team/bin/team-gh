@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-gh: the only way agents change anything on GitHub. Runs one gh command as the
+# project's account (or the agent account), lets reads through, and allows only the
+# writes the team skills need. See docs/rules.md §10 and §13.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-gh <gh arguments...>
+
+Runs one gh command as the project's GitHub account: GITHUB_ACCOUNT in ops/project.conf,
+else DEFAULT_GITHUB_ACCOUNT in defaults.conf. When accounts.conf has an `agent|` line,
+it acts as that agent login instead. The token is taken per command with
+`gh auth token -u <login>` and is never printed; the global gh account never changes.
+
+Reads pass through:
+  pr view|list|diff|checks|status   issue view|list|status   repo view|list
+  run view|list|watch   workflow view|list   release view|list   label list
+  search ...   status   ruleset list|view|check   secret list   variable list|get
+  cache list   api (GET/HEAD only)   version   help   any command with --help
+
+Writes allowed (everything else is refused with exit 4):
+  pr create      [-t -b -F -B -H -d -f --fill-first --fill-verbose -l -T --no-maintainer-edit --dry-run]
+  pr edit [<pr>] [-t -b -F -B --add-label L --remove-label L]
+  pr comment [<pr>] [-b -F --edit-last --create-if-none]
+  pr review [<pr>] --comment [-b -F]          (never --approve or --request-changes)
+  pr merge [<pr>] --auto --squash [--delete-branch] [--match-head-commit SHA]
+  issue create   [-t -b -F -l -T]
+  issue comment <n> [-b -F --edit-last --create-if-none]
+  issue edit <n> --add-label L
+
+  L (labels agents may add or remove): needs-info fixes-main bug feature client-request health
+
+  team-gh pr edit <number> --add-label owner-approved
+      The owner's yes. Allowed only in exactly this form, and always runs as the OWNER
+      login (OWNER_LOGIN in defaults.conf), never as the agent account.
+
+Refused (exit 4):
+  - release PRs (head branch release-please--* or an autorelease: label), checked online
+  - removing owner-approved, guarded, high-risk or tests-changed; adding any label outside L
+  - pr merge without --auto, with --admin, or with a merge method other than --squash
+  - gh api writes: -X/--method other than GET/HEAD, -f/-F/--field/--raw-field/--input
+    without -X GET, any GraphQL mutation, --verbose, another --hostname
+  - -R/--repo (or GH_REPO, or a PR/issue URL) naming any repo but this checkout's origin
+  - settings, rulesets, environments, secrets, variables, workflows, releases, label admin,
+    aliases, extensions, auth, deployments, and every other gh command
+
+Commit statuses go through team-post-check only.
+
+Exit codes: gh's own exit code; 2 usage; 4 refused by policy; 5 gh not logged in.
+EOF
+}
+
+refuse() { team_die "$TEAM_EXIT_REFUSED" "refused: $*"; }
+
+[ $# -gt 0 ] || team_usage_error "missing gh arguments"
+if [ $# -eq 1 ]; then
+  case "$1" in -h|--help) usage; exit 0 ;; esac
+fi
+
+# ------------------------------------------------------------ repo and environment
+
+ORIGIN=""
+if git rev-parse --show-toplevel >/dev/null 2>&1 && git config --get remote.origin.url >/dev/null 2>&1; then
+  ORIGIN=$(team_origin_repo .)
+fi
+
+check_repo_value() {
+  local v="$1"
+  [ -n "$ORIGIN" ] || refuse "-R/--repo $v: run team-gh inside the project checkout (no origin remote here)"
+  tg_same_repo "$v" "$ORIGIN" || refuse "-R/--repo $v is not this checkout's origin ($ORIGIN)"
+}
+
+if [ -n "${GH_REPO:-}" ]; then
+  if [ -z "$ORIGIN" ] || ! tg_same_repo "$GH_REPO" "$ORIGIN"; then
+    refuse "GH_REPO=$GH_REPO is not this checkout's origin (${ORIGIN:-none})"
+  fi
+fi
+# Variables that could redirect the request, the token, or print traffic.
+unset GH_REPO GH_HOST GH_DEBUG DEBUG GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+
+# Every -R/--repo anywhere must be the origin. REST = the arguments without them.
+REST=()
+ARGS=("$@")
+i=0
+while [ "$i" -lt "${#ARGS[@]}" ]; do
+  a="${ARGS[$i]}"
+  case "$a" in
+    -R|--repo)
+      i=$((i + 1))
+      [ "$i" -lt "${#ARGS[@]}" ] || team_usage_error "$a needs a value"
+      check_repo_value "${ARGS[$i]}"
+      ;;
+    --repo=*) check_repo_value "${a#--repo=}" ;;
+    -R?*) v="${a#-R}"; check_repo_value "${v#=}" ;;
+    *) REST+=("$a") ;;
+  esac
+  i=$((i + 1))
+done
+
+CMD="${REST[0]:-}"
+SUB="${REST[1]:-}"
+[ -n "$CMD" ] || team_usage_error "missing gh command"
+
+run_as_project() { team_gh "$@"; }
+
+# Help for a subcommand (`team-gh pr merge --help`): gh prints help and runs nothing. Only the
+# plain form passes, so a --help that another flag would swallow as its value can't skip checks.
+if [ "${#REST[@]}" -le 3 ] && [ "${REST[${#REST[@]}-1]}" = "--help" ]; then
+  help_ok=1
+  for a in "${REST[@]}"; do
+    case "$a" in --help) ;; -*) help_ok=0 ;; esac
+  done
+  if [ "$help_ok" = 1 ]; then run_as_project "$@"; exit $?; fi
+fi
+
+# ------------------------------------------------------------ owner-approved (the owner's yes)
+
+if [ $# -eq 5 ] && [ "$1" = "pr" ] && [ "$2" = "edit" ] && [ "$4" = "--add-label" ] && [ "$5" = "owner-approved" ] \
+   && printf '%s' "$3" | grep -Eq '^[0-9]+$'; then
+  owner=$(team_owner_login .)
+  tg_require_login "$owner"
+  state=$(tg_pr_release_state "$owner" "" "$3") || refuse "could not read PR #$3 to check it is not a release PR"
+  [ "$state" != "release" ] || refuse "PR #$3 is a release PR; agents never label release PRs"
+  team_gh_as "$owner" pr edit "$3" --add-label owner-approved
+  exit $?
+fi
+
+# Any other form that mentions owner-approved in a label flag is refused below, by the
+# label checks; this message makes the canonical form discoverable.
+OWNER_FORM_HINT="owner-approved is added only as: team-gh pr edit <number> --add-label owner-approved"
+
+# ------------------------------------------------------------ flag parsing for writes
+
+# Spec: space-separated "short|long:type" or "long:type"; type v (takes a value), b (boolean),
+# x (forbidden, refused with a reason).
+flag_lookup() {
+  local f="$1" spec="$2" e names type n IFS=' '
+  for e in $spec; do
+    names="${e%%:*}"
+    type="${e##*:}"
+    local old_ifs="$IFS"
+    IFS='|'
+    for n in $names; do
+      if [ "$n" = "$f" ]; then
+        IFS="$old_ifs"
+        printf '%s:%s' "${names##*|}" "$type"
+        return 0
+      fi
+    done
+    IFS="$old_ifs"
+  done
+  return 1
+}
+
+P_FLAGS=()
+P_VALS=()
+P_POS=()
+forbidden_reason=""
+parse_write_args() {
+  local spec="$1" a f v hit canon type
+  shift
+  P_FLAGS=(); P_VALS=(); P_POS=()
+  while [ $# -gt 0 ]; do
+    a="$1"
+    v=""
+    case "$a" in
+      --)
+        shift
+        while [ $# -gt 0 ]; do P_POS+=("$1"); shift; done
+        break
+        ;;
+      --*=*)
+        f="${a%%=*}"; v="${a#*=}"
+        hit=$(flag_lookup "$f" "$spec") || refuse "flag $f is not allowed in team-gh $CMD $SUB"
+        canon="${hit%:*}"; type="${hit##*:}"
+        [ "$type" != x ] || refuse "$f: $forbidden_reason"
+        [ "$type" = v ] || refuse "write $f without =value"
+        ;;
+      --?*|-?)
+        f="$a"
+        hit=$(flag_lookup "$f" "$spec") || refuse "flag $f is not allowed in team-gh $CMD $SUB"
+        canon="${hit%:*}"; type="${hit##*:}"
+        [ "$type" != x ] || refuse "$f: $forbidden_reason"
+        if [ "$type" = v ]; then
+          shift
+          [ $# -gt 0 ] || team_usage_error "$f needs a value"
+          v="$1"
+        fi
+        ;;
+      -?*)
+        f="${a:0:2}"; v="${a:2}"; v="${v#=}"
+        hit=$(flag_lookup "$f" "$spec") || refuse "flag $f is not allowed in team-gh $CMD $SUB"
+        canon="${hit%:*}"; type="${hit##*:}"
+        [ "$type" != x ] || refuse "$f: $forbidden_reason"
+        [ "$type" = v ] || refuse "write short flags separately ($a)"
+        ;;
+      *)
+        P_POS+=("$a")
+        shift
+        continue
+        ;;
+    esac
+    P_FLAGS+=("$canon")
+    P_VALS+=("$v")
+    shift
+  done
+}
+
+has_flag() {
+  local f
+  for f in ${P_FLAGS[@]+"${P_FLAGS[@]}"}; do [ "$f" = "$1" ] && return 0; done
+  return 1
+}
+
+# check_labels <flag> <mode add|remove> : every value of <flag> must be an agent label.
+# Values are split on commas and compared lower-cased, without glob expansion.
+check_labels() {
+  local want="$1" mode="$2" idx=0 f l
+  for f in ${P_FLAGS[@]+"${P_FLAGS[@]}"}; do
+    if [ "$f" = "$want" ]; then
+      while IFS= read -r l || [ -n "$l" ]; do
+        l=$(tg_lower "$(team_trim "$l")")
+        [ -n "$l" ] || continue
+        if [ "$l" = "owner-approved" ] && [ "$mode" = add ]; then refuse "$OWNER_FORM_HINT"; fi
+        if tg_in_list "$l" "$TG_PROTECTED_LABELS" && [ "$mode" = remove ]; then
+          refuse "agents never remove the $l label"
+        fi
+        tg_in_list "$l" "$TG_AGENT_LABELS" || refuse "label '$l' is not one agents may $mode (allowed: $TG_AGENT_LABELS)"
+      done <<EOF
+$(printf '%s' "${P_VALS[$idx]}" | tr ',' '\n')
+EOF
+    fi
+    idx=$((idx + 1))
+  done
+}
+
+# selector_check <selector> <kind pull|issues> : URL selectors must point at the origin
+selector_check() {
+  local sel="$1" path slug
+  case "$sel" in
+    http://*|https://*)
+      path="${sel#*://}"; path="${path#*/}"
+      slug=$(printf '%s' "$path" | cut -d/ -f1-2)
+      [ -n "$ORIGIN" ] || refuse "URL selectors need to run inside the project checkout"
+      tg_same_repo "$slug" "$ORIGIN" || refuse "$sel is not in this checkout's origin ($ORIGIN)"
+      ;;
+  esac
+}
+
+selector_number() {
+  local sel="$1"
+  case "$sel" in
+    http://*|https://*) printf '%s' "${sel##*/}" | sed 's/[^0-9].*$//' ;;
+    \#*) printf '%s' "${sel#\#}" ;;
+    *) printf '%s' "$sel" ;;
+  esac
+}
+
+ACT_LOGIN=""
+acting_login() {
+  local login agent
+  login=$(team_github_account .)
+  agent=$(team_agent_login)
+  [ -n "$agent" ] && login="$agent"
+  printf '%s' "$login"
+}
+
+# refuse_release_pr [selector] : online check, fail closed
+refuse_release_pr() {
+  local sel="${1-}" state
+  state=$(tg_pr_release_state "$ACT_LOGIN" "$ORIGIN" "$sel") \
+    || refuse "could not read the PR${sel:+ $sel} to check it is not a release PR"
+  [ "$state" != "release" ] || refuse "this is a release PR; agents never comment on, review, label or merge release PRs"
+}
+
+# refuse_release_issue <number> : issue commands may target a PR number
+refuse_release_issue() {
+  local n="$1" state
+  printf '%s' "$n" | grep -Eq '^[0-9]+$' || refuse "use the issue number (got '$1')"
+  [ -n "$ORIGIN" ] || refuse "run team-gh issue commands inside the project checkout"
+  state=$(tg_issue_release_state "$ACT_LOGIN" "$ORIGIN" "$n") \
+    || refuse "could not read #$n to check it is not a release PR"
+  [ "$state" != "release" ] || refuse "#$n is a release PR; agents never comment on or label release PRs"
+}
+
+REPO_SPEC="-R|--repo:v"
+BODY_SPEC="-b|--body:v -F|--body-file:v"
+
+write_pr_create() {
+  local branch idx=0 f
+  parse_write_args "-t|--title:v $BODY_SPEC -B|--base:v -H|--head:v -d|--draft:b -f|--fill:b --fill-first:b --fill-verbose:b -l|--label:v -T|--template:v --no-maintainer-edit:b --dry-run:b $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -eq 0 ] || refuse "pr create takes no positional arguments"
+  check_labels --label add
+  branch=$(git symbolic-ref --short -q HEAD 2>/dev/null) || branch=""
+  if tg_is_release_ref "$branch"; then refuse "branch $branch is a release-please branch"; fi
+  for f in ${P_FLAGS[@]+"${P_FLAGS[@]}"}; do
+    if [ "$f" = "--head" ] && tg_is_release_ref "${P_VALS[$idx]}"; then refuse "head ${P_VALS[$idx]} is a release-please branch"; fi
+    idx=$((idx + 1))
+  done
+}
+
+write_pr_edit() {
+  parse_write_args "-t|--title:v $BODY_SPEC -B|--base:v --add-label:v --remove-label:v $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -le 1 ] || refuse "pr edit takes one PR"
+  check_labels --add-label add
+  check_labels --remove-label remove
+  [ "${#P_FLAGS[@]}" -gt 0 ] || team_usage_error "pr edit needs something to change"
+  selector_check "${P_POS[0]:-}" pull
+  refuse_release_pr "${P_POS[0]:-}"
+}
+
+write_pr_comment() {
+  parse_write_args "$BODY_SPEC --edit-last:b --create-if-none:b $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -le 1 ] || refuse "pr comment takes one PR"
+  selector_check "${P_POS[0]:-}" pull
+  refuse_release_pr "${P_POS[0]:-}"
+}
+
+write_pr_review() {
+  forbidden_reason="agents never approve or request changes; use --comment"
+  parse_write_args "-c|--comment:b $BODY_SPEC -a|--approve:x -r|--request-changes:x $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -le 1 ] || refuse "pr review takes one PR"
+  has_flag --comment || refuse "pr review is allowed only with --comment"
+  selector_check "${P_POS[0]:-}" pull
+  refuse_release_pr "${P_POS[0]:-}"
+}
+
+write_pr_merge() {
+  forbidden_reason="merges are --auto --squash only (no --admin, no other method, no custom message)"
+  parse_write_args "--auto:b -s|--squash:b -d|--delete-branch:b --match-head-commit:v --admin:x -m|--merge:x -r|--rebase:x --disable-auto:x -t|--subject:x -b|--body:x -F|--body-file:x -A|--author-email:x $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -le 1 ] || refuse "pr merge takes one PR"
+  has_flag --auto || refuse "pr merge needs --auto (GitHub merges once every required check is green)"
+  has_flag --squash || refuse "pr merge needs --squash"
+  selector_check "${P_POS[0]:-}" pull
+  refuse_release_pr "${P_POS[0]:-}"
+}
+
+write_issue_create() {
+  parse_write_args "-t|--title:v $BODY_SPEC -l|--label:v -T|--template:v $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -eq 0 ] || refuse "issue create takes no positional arguments"
+  check_labels --label add
+}
+
+write_issue_comment() {
+  parse_write_args "$BODY_SPEC --edit-last:b --create-if-none:b $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -eq 1 ] || refuse "issue comment takes exactly one issue number"
+  selector_check "${P_POS[0]}" issues
+  refuse_release_issue "$(selector_number "${P_POS[0]}")"
+}
+
+write_issue_edit() {
+  parse_write_args "--add-label:v $REPO_SPEC" "${REST[@]:2}"
+  [ "${#P_POS[@]}" -eq 1 ] || refuse "issue edit takes exactly one issue number"
+  has_flag --add-label || refuse "issue edit is allowed only with --add-label"
+  check_labels --add-label add
+  selector_check "${P_POS[0]}" issues
+  refuse_release_issue "$(selector_number "${P_POS[0]}")"
+}
+
+# ------------------------------------------------------------ gh api: reads only
+
+check_api() {
+  local method="" fields=0 endpoint="" a v n="${#REST[@]}" j=1
+  while [ "$j" -lt "$n" ]; do
+    a="${REST[$j]}"
+    case "$a" in
+      -X|--method) j=$((j + 1)); method="${REST[$j]:-}" ;;
+      --method=*) method="${a#--method=}" ;;
+      -X?*) method="${a#-X}"; method="${method#=}" ;;
+      -f|-F|--field|--raw-field|--input) fields=1; j=$((j + 1)); v="${REST[$j]:-}"
+        case "$v" in *mutation*) refuse "GraphQL mutations are writes" ;; esac ;;
+      --field=*|--raw-field=*|--input=*|-f?*|-F?*) fields=1
+        case "$a" in *mutation*) refuse "GraphQL mutations are writes" ;; esac ;;
+      -H|--header) j=$((j + 1)); v=$(tg_lower "${REST[$j]:-}")
+        case "$v" in *method-override*) refuse "method override headers are not allowed" ;; esac ;;
+      --header=*) v=$(tg_lower "$a")
+        case "$v" in *method-override*) refuse "method override headers are not allowed" ;; esac ;;
+      --hostname) j=$((j + 1)); [ "${REST[$j]:-}" = "github.com" ] || refuse "only github.com" ;;
+      --hostname=*) [ "${a#--hostname=}" = "github.com" ] || refuse "only github.com" ;;
+      --verbose) refuse "--verbose prints the full request" ;;
+      -q|--jq|-t|--template|-p|--preview|--cache) j=$((j + 1)) ;;
+      --jq=*|--template=*|--preview=*|--cache=*|-q?*|-t?*|-p?*) ;;
+      -i|--include|--paginate|--slurp|--silent) ;;
+      -*) refuse "gh api flag $a is not allowed in team-gh" ;;
+      *) [ -n "$endpoint" ] || endpoint="$a" ;;
+    esac
+    j=$((j + 1))
+  done
+  [ -n "$endpoint" ] || team_usage_error "gh api needs an endpoint"
+  method=$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')
+  if [ -z "$method" ]; then
+    if [ "$fields" = 1 ]; then method=POST; else method=GET; fi
+  fi
+  case "$method" in
+    GET|HEAD) ;;
+    *) refuse "gh api $method is a write; team-gh allows only GET and HEAD (statuses go through team-post-check)" ;;
+  esac
+  case "$endpoint" in
+    graphql|/graphql)
+      for a in ${REST[@]+"${REST[@]}"}; do
+        case "$a" in *mutation*) refuse "GraphQL mutations are writes" ;; esac
+      done
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------ dispatch
+
+case "$CMD" in
+  version|--version|help) run_as_project "$@"; exit $? ;;
+  -*) refuse "put the gh command first (got $CMD)" ;;
+esac
+
+READ=0
+case "$CMD" in
+  api) check_api; READ=1 ;;
+  pr)
+    case "$SUB" in
+      view|list|diff|checks|status) READ=1 ;;
+      create|edit|comment|review|merge) ;;
+      *) refuse "gh pr ${SUB:-<none>} is not allowed (writes: create, edit, comment, review --comment, merge --auto --squash)" ;;
+    esac ;;
+  issue)
+    case "$SUB" in
+      view|list|status) READ=1 ;;
+      create|comment|edit) ;;
+      *) refuse "gh issue ${SUB:-<none>} is not allowed (writes: create, comment, edit --add-label)" ;;
+    esac ;;
+  repo)     case "$SUB" in view|list) READ=1 ;; *) refuse "gh repo $SUB changes or clones repositories" ;; esac ;;
+  run)      case "$SUB" in view|list|watch) READ=1 ;; *) refuse "gh run $SUB is not a read" ;; esac ;;
+  workflow) case "$SUB" in view|list) READ=1 ;; *) refuse "gh workflow $SUB changes workflows" ;; esac ;;
+  release)  case "$SUB" in view|list) READ=1 ;; *) refuse "agents never create, edit, upload to or delete releases" ;; esac ;;
+  label)    case "$SUB" in list) READ=1 ;; *) refuse "label administration is not allowed" ;; esac ;;
+  ruleset)  case "$SUB" in list|view|check) READ=1 ;; *) refuse "rulesets are changed only by team-bootstrap-repo" ;; esac ;;
+  secret)   case "$SUB" in list) READ=1 ;; *) refuse "secrets are set only by team-bootstrap-repo, team-provision and team-store-token" ;; esac ;;
+  variable) case "$SUB" in list|get) READ=1 ;; *) refuse "variables are set only by team-bootstrap-repo and team-provision" ;; esac ;;
+  cache)    case "$SUB" in list) READ=1 ;; *) refuse "gh cache $SUB is not a read" ;; esac ;;
+  search|status) READ=1 ;;
+  *) refuse "gh $CMD is not allowed through team-gh" ;;
+esac
+
+if [ "$READ" = 1 ]; then
+  run_as_project "$@"
+  exit $?
+fi
+
+ACT_LOGIN=$(acting_login)
+tg_require_login "$ACT_LOGIN"
+
+case "$CMD $SUB" in
+  "pr create")     write_pr_create ;;
+  "pr edit")       write_pr_edit ;;
+  "pr comment")    write_pr_comment ;;
+  "pr review")     write_pr_review ;;
+  "pr merge")      write_pr_merge ;;
+  "issue create")  write_issue_create ;;
+  "issue comment") write_issue_comment ;;
+  "issue edit")    write_issue_edit ;;
+esac
+
+team_gh_as "$ACT_LOGIN" "$@"

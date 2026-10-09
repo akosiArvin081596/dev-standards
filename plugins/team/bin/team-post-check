@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-post-check: post one ai-* commit status on the exact commit a review agent checked.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-post-check <sha> <context> <state> <description> [--target-url URL]
+
+Posts a commit status on <sha> in this checkout's origin repo, as the project's account
+(or the agent account when accounts.conf has an `agent|` line).
+
+  <sha>          the full 40-character commit SHA that was reviewed
+  <context>      ai-review | ai-security | ai-qa
+  <state>        pending | success | failure | error
+  <description>  at most 140 characters
+  --target-url   optional https:// link (for example the review comment)
+
+Refuses (exit 4) when the commit belongs to a release PR (head release-please--*):
+agents never review release PRs. The fence lets only the matching review agent run
+this command for its own context.
+
+Exit codes: 0 posted; 1 GitHub error; 2 usage; 4 refused; 5 not in a git repo or gh missing.
+EOF
+}
+
+POS=()
+TARGET_URL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --target-url) [ $# -ge 2 ] || team_usage_error "--target-url needs a value"; TARGET_URL="$2"; shift ;;
+    --target-url=*) TARGET_URL="${1#--target-url=}" ;;
+    --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done; break ;;
+    -?*) team_usage_error "unknown option $1" ;;
+    *) POS+=("$1") ;;
+  esac
+  shift
+done
+
+[ "${#POS[@]}" -eq 4 ] || team_usage_error "expected <sha> <context> <state> <description>"
+SHA=$(tg_lower "${POS[0]}")
+CONTEXT="${POS[1]}"
+STATE="${POS[2]}"
+DESCRIPTION="${POS[3]}"
+
+printf '%s' "$SHA" | grep -Eq '^[0123456789abcdef]{40}$' || team_usage_error "sha must be the full 40-character hex commit SHA"
+tg_in_list "$CONTEXT" "$TG_STATUS_CONTEXTS" || team_usage_error "context must be one of: $TG_STATUS_CONTEXTS"
+tg_in_list "$STATE" "pending success failure error" || team_usage_error "state must be one of: pending success failure error"
+[ -n "$DESCRIPTION" ] || team_usage_error "description must not be empty"
+[ "${#DESCRIPTION}" -le 140 ] || team_usage_error "description is ${#DESCRIPTION} characters; at most 140"
+case "$DESCRIPTION" in *[[:cntrl:]]*) team_usage_error "description must be one line of plain text" ;; esac
+if [ -n "$TARGET_URL" ]; then
+  printf '%s' "$TARGET_URL" | grep -Eq '^https://[^[:space:]]+$' || team_usage_error "--target-url must be an https:// URL"
+fi
+
+team_require_cmd git jq
+team_repo_root >/dev/null
+REPO=$(team_origin_repo .)
+tg_valid_slug "$REPO" || team_die "$TEAM_EXIT_PREREQ" "origin is not a GitHub owner/repo: $REPO"
+
+TG_LOGIN=$(team_github_account .)
+AGENT=$(team_agent_login)
+[ -n "$AGENT" ] && TG_LOGIN="$AGENT"
+tg_require_login "$TG_LOGIN"
+tg_tmp_init
+
+# Release PRs never get ai-* statuses: check every PR that contains this commit.
+tg_api_try GET "repos/$REPO/commits/$SHA/pulls"
+if [ "$TG_RC" != 0 ]; then
+  team_die "$TEAM_EXIT_FAIL" "could not list the PRs for $SHA in $REPO: $(tg_printable "$TG_ERR")"
+fi
+if printf '%s' "$TG_OUT" | jq -e 'any(.[]?; ((.head.ref // "") | startswith("release-please--"))
+      or any(.labels[]?; ((.name // "") | startswith("autorelease:"))))' >/dev/null; then
+  team_die "$TEAM_EXIT_REFUSED" "refused: $SHA belongs to a release PR; agents never review release PRs"
+fi
+
+BODY=$(jq -cn --arg state "$STATE" --arg context "$CONTEXT" --arg description "$DESCRIPTION" --arg url "$TARGET_URL" \
+  '{state: $state, context: $context, description: $description} + (if $url == "" then {} else {target_url: $url} end)')
+
+tg_api_try POST "repos/$REPO/statuses/$SHA" "$BODY"
+if [ "$TG_RC" != 0 ]; then
+  team_die "$TEAM_EXIT_FAIL" "posting $CONTEXT on $SHA failed: $(tg_printable "$TG_ERR")"
+fi
+printf 'posted %s=%s on %s (%s)\n' "$CONTEXT" "$STATE" "$(printf '%s' "$SHA" | cut -c1-12)" "$REPO"
