@@ -69,13 +69,14 @@ All config files are `KEY=value` lines (or `|` tables), **parsed, never sourced*
 ### Other files the pack writes there
 | Path | Format / purpose |
 |---|---|
-| `projects/<project>.conf` | per-project local overrides: `PRODUCTION_HOST`, `STAGING_HOST`, `CLIENT_DOMAIN` (never committed) |
+| `projects/<project>.conf` | per-project local overrides: `PRODUCTION_HOST`, `STAGING_HOST`, `CLIENT_DOMAIN`, `LOCAL_DB_PASSWORD` (mysql/mariadb container root password, written once, 600) — never committed |
+| `projects/<project>-<env>.deploy.pub`, `projects/<project>.known_hosts` | the deploy key's public half (reuse check) and the pinned VPS host key (`team-deploy`) |
 | `ports.registry` | `port|worktree_path|project|created_utc` |
 | `databases.registry` | `engine|host|port|name|project|worktree_path|created_utc` (the only DBs the pack may drop) |
 | `locks/<name>.lock/` | `mkdir` locks (`ports`, `databases`); stale after 120 s |
 | `fence.log` | `utc_ts<TAB>rule_id<TAB>agent_type|main<TAB>redacted command or path` |
 
-Caches outside it: `~/.cache/team-snapshots/<project>/` (sanitized dumps), keychain items `team-release-please-token` and `team-staging-<project>`.
+Local Postgres credentials come from the standard `PGUSER`/`PGPASSWORD` (default: the macOS user, no password). Caches outside it: `~/.cache/team-snapshots/<project>/` (sanitized dumps), keychain items `team-release-please-token` and `team-staging-<project>`.
 
 ## 6. Project files (in each project repo)
 
