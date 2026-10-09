@@ -109,6 +109,13 @@ Examples are Bash commands from the main session unless noted. `vps-test`, `192.
   name is visible.
 - A dynamic push destination (`git push origin "$B"`) or an unknown repo is `push-main`
   ("write it plainly").
+- Staging is not writing: `git add <paths>`, `-A`, `-u` and `.` may name fence and workflow
+  files, and so may `git rm --cached`. Plain `git rm` deletes files and stays fenced.
+- A bare `*`/`?` last component of a literal, readable directory is checked against what is
+  really there (`rm -rf build/*` passes; `cat dir/*` with a `production.env` in it doesn't).
+  With an unreadable or missing directory, and for explicit fence globs
+  (`.claude/settings*.json`, `.cl*/settings.json`), the exemplar match decides.
+- Review agents may also run `date`, `date -u`, `date +FMT` and `date -u +FMT`.
 - Reserved words count only when unquoted and unescaped in command position: `\case`,
   `'case'` or `ca''se` is an ordinary command, and the rest of the line is analysed.
 - zsh (the owner's shell runs the Bash tool) constructs that build code are `disguised`:

@@ -13,6 +13,7 @@ set -f
 # Reasons go to fd 3 (the real stderr). bash's own notices (e.g. "Killed: 9" when the watchdog
 # kills a child) go nowhere, so the first stderr line is always the fence's.
 exec 3>&2 2>/dev/null
+unset GLOBIGNORE
 
 FENCE_DONE=0
 FENCE_CHILD=0
@@ -565,6 +566,12 @@ f_path_kinds() {
     *g* | *D*)
       F_DOTOK=0
       case $fl in *D*) F_DOTOK=1 ;; esac
+      # a bare * or ? as the last component of a literal directory: look at what is
+      # really there instead of guessing (rm -rf build/*, cat src/*)
+      if f_glob_fs "$REPLY"; then
+        PK=$FKS
+        return 0
+      fi
       f_kind_glob "$REPLY"
       PK=$FKS
       return 0
@@ -580,6 +587,49 @@ f_path_kinds() {
   esac
   f_kind_literal "$REPLY"
   PK=$FK
+}
+
+f_glob_fs() {
+  # f_glob_fs <abs pattern>: if the last component is only * and ? (optionally followed by
+  # a zsh qualifier group) and the directory is literal and readable, FKS = the kinds of the
+  # existing entries it matches (return 0). Otherwise return 1 (exemplar matching decides).
+  local p=$1 dir last e b hot=0
+  local -a ents
+  FKS=''
+  last=${p##*/}
+  dir=${p%/*}
+  [ -n "$dir" ] || dir=/
+  case $last in *'('*')') last=${last%%'('*} ;; esac
+  case $last in '' | *[!*?]*) return 1 ;; esac
+  case $dir in *[*?[]* | *$'\001'* | *'{'* | *'('*) return 1 ;; esac
+  [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 1
+  shopt -s nocasematch
+  case $dir/ in
+    *.claude/* | *.git/* | *.ssh/* | *.config/* | *.github/* | *keychains/* | "$F_HOME"/ | "$F_CFGDIR"/) hot=1 ;;
+  esac
+  shopt -u nocasematch
+  set +f
+  shopt -s nullglob
+  [ "$F_DOTOK" = 1 ] && shopt -s dotglob
+  # shellcheck disable=SC2206 # the pattern expands against the directory on purpose
+  ents=("$dir"/$last)
+  shopt -u nullglob dotglob
+  set -f
+  for e in ${ents[@]+"${ents[@]}"}; do
+    b=${e##*/}
+    case $b in . | ..) continue ;; esac
+    if [ "$hot" = 0 ]; then
+      shopt -s nocasematch
+      case $b in
+        *env* | *production* | .claude* | .git* | .mcp.json | .ssh | .netrc | .curlrc | .wgetrc | .z* | .bash* | .profile | .config | library | *credentials*) ;;
+        *) shopt -u nocasematch; continue ;;
+      esac
+      shopt -u nocasematch
+    fi
+    f_kind_literal "$e"
+    [ -n "$FK" ] && FKS="$FKS $FK"
+  done
+  return 0
 }
 
 f_has_kind() { case " $PK " in *" $1 "*) return 0 ;; esac; return 1; }
@@ -1799,6 +1849,19 @@ f_is_plain_read() {
             j=$((j + 1))
           done
           return 0
+          ;;
+        add)
+          # staging only; the working-tree write was fenced when it happened
+          return 0
+          ;;
+        rm)
+          # git rm --cached touches only the index; plain git rm deletes files
+          j=$((GSUB_I + 1))
+          while [ "$j" -lt "$n" ]; do
+            case ${a[j]} in --cached) return 0 ;; --) break ;; esac
+            j=$((j + 1))
+          done
+          return 1
           ;;
       esac
       return 1
@@ -4112,10 +4175,19 @@ f_agent_git() {
 f_agent_bash() {
   # review agents: plain readers, read-only git and gh, team-post-check (checked separately)
   # and their listed extras; everything else is agent-bash
-  local i=$1 ok=0 I0=$1
+  local i=$1 ok=0 I0=$1 j
   case $lname in
     team-post-check) return 0 ;;
     cd | pwd | echo | printf | true | false | sort | uniq | cut | tr | '[[') ok=1 ;;
+    date)
+      # read-only forms: date [-u] [+FORMAT] (never -s, -f, -r or a time to set)
+      ok=1
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -u | +*) ;; *) ok=0 ;; esac
+        j=$((j + 1))
+      done
+      ;;
     git) f_agent_git "$i" && ok=1 ;;
     gh | team-gh)
       f_gh_positionals "$i"
