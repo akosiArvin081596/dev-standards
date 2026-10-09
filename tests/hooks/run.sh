@@ -82,21 +82,21 @@ CALL_LIMIT=${FENCE_TEST_CALL_LIMIT:-20}   # seconds; above hooks.json's 15 s tim
 # expand <text>: replace placeholders with fixture paths
 expand() {
   local s=$1
-  s=${s//"{MAIN}"/$FX/main-repo}
-  s=${s//"{FEAT}"/$FX/feat-repo}
-  s=${s//"{STD}"/$FX/standards-repo}
-  s=${s//"{PROJ}"/$FX/project}
-  s=${s//"{PLAIN}"/$FX/plain}
-  s=${s//"{FX}"/$FX}
-  s=${s//"{HOME}"/$FAKE_HOME}
-  s=${s//"{CFG}"/$FAKE_CFG}
-  s=${s//"{CFG_EMPTY}"/$CFG_EMPTY}
-  s=${s//"{CFG_NOBYPASS}"/$CFG_NOBYPASS}
-  s=${s//"{PLUGIN}"/$PLUGIN}
+  s=${s//"{MAIN}"/"$FX/main-repo"}
+  s=${s//"{FEAT}"/"$FX/feat-repo"}
+  s=${s//"{STD}"/"$FX/standards-repo"}
+  s=${s//"{PROJ}"/"$FX/project"}
+  s=${s//"{PLAIN}"/"$FX/plain"}
+  s=${s//"{FX}"/"$FX"}
+  s=${s//"{HOME}"/"$FAKE_HOME"}
+  s=${s//"{CFG}"/"$FAKE_CFG"}
+  s=${s//"{CFG_EMPTY}"/"$CFG_EMPTY"}
+  s=${s//"{CFG_NOBYPASS}"/"$CFG_NOBYPASS"}
+  s=${s//"{PLUGIN}"/"$PLUGIN"}
   s=${s//"{NL}"/$'\n'}
   s=${s//"{TAB}"/$'\t'}
   s=${s//"{EMPTY}"/}
-  s=${s//"{ECHO500}"/$ECHO500}
+  s=${s//"{ECHO500}"/"$ECHO500"}
   printf '%s' "$s"
 }
 
