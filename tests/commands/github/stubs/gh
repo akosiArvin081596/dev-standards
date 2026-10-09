@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Test stub for gh. Never talks to GitHub.
+#
+# State lives in $GH_STUB_DIR:
+#   routes   lines "<glob>\t<rc>\t<http>\t<response file or ->"; first match wins;
+#            an rc ending in "!" (e.g. "1!") is used once, then disabled
+#   log      one line per call: "<n>|<acting login or none>|<route key>"
+#   body.<n> stdin of call n, when the call reads stdin (--input -, --body-file -, secret set)
+#   noauth-<login>  makes `gh auth token -u <login>` fail
+#
+# Route key: for `gh api` it is "api <METHOD> <endpoint>" (method from -X/--method, else
+# POST when fields or --input are given, else GET); for everything else, all args joined.
+# A --jq/-q expression is applied to the response. Unmatched api GETs fail with HTTP 404;
+# any other unmatched call succeeds with no output.
+set -u
+D="${GH_STUB_DIR:?GH_STUB_DIR not set}"
+n=$(( $(cat "$D/count" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" >"$D/count"
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ]; then
+  login=""
+  [ "${3:-}" = "-u" ] && login="${4:-}"
+  printf '%s|-|auth token -u %s\n' "$n" "$login" >>"$D/log"
+  if [ -z "$login" ] || [ -e "$D/noauth-$login" ]; then
+    echo "no oauth token found for github.com account $login" >&2
+    exit 1
+  fi
+  printf 'gho_FAKE%sTOKENxyz123\n' "$login"
+  exit 0
+fi
+
+acting="none"
+case "${GH_TOKEN:-}" in
+  gho_FAKE*TOKENxyz123) acting="${GH_TOKEN#gho_FAKE}"; acting="${acting%TOKENxyz123}" ;;
+esac
+
+jqexpr=""
+reads_stdin=0
+prev=""
+for a in "$@"; do
+  case "$prev" in -q|--jq) jqexpr="$a" ;; esac
+  case "$a" in --jq=*) jqexpr="${a#--jq=}" ;; esac
+  [ "$a" = "-" ] && reads_stdin=1
+  prev="$a"
+done
+[ "${1:-} ${2:-}" = "secret set" ] && reads_stdin=1
+
+if [ "${1:-}" = "api" ]; then
+  method=""
+  fields=0
+  endpoint=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -X|--method) method="$2"; shift ;;
+      --method=*) method="${1#--method=}" ;;
+      -f|-F|--field|--raw-field|--input) fields=1; shift ;;
+      -H|--header|-q|--jq|-t|--template|-p|--preview|--cache|--hostname) shift ;;
+      -*) ;;
+      *) [ -n "$endpoint" ] || endpoint="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$method" ] || { if [ "$fields" = 1 ]; then method=POST; else method=GET; fi; }
+  method=$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')
+  key="api $method $endpoint"
+else
+  key="$*"
+  method=""
+fi
+
+printf '%s|%s|%s\n' "$n" "$acting" "$key" >>"$D/log"
+if [ "$reads_stdin" = 1 ]; then cat >"$D/body.$n"; fi
+
+matched=0
+rc=0
+http=""
+resp=""
+lineno=0
+if [ -f "$D/routes" ]; then
+  while IFS="$(printf '\t')" read -r pat r h f; do
+    lineno=$((lineno + 1))
+    [ -n "$pat" ] || continue
+    # shellcheck disable=SC2254  # route patterns are globs on purpose
+    case "$key" in
+      $pat) matched=1; rc="$r"; http="$h"; resp="$f"; break ;;
+    esac
+  done <"$D/routes"
+fi
+# rc with a trailing "!" = a route used only once (then disabled)
+case "$rc" in
+  *!)
+    rc="${rc%!}"
+    awk -v n="$lineno" 'BEGIN { FS = OFS = "\t" } NR == n { $1 = "#used" } { print }' "$D/routes" >"$D/routes.tmp"
+    mv "$D/routes.tmp" "$D/routes"
+    ;;
+esac
+if [ "$matched" = 0 ]; then
+  printf '%s|UNMATCHED|%s\n' "$n" "$key" >>"$D/unmatched"
+  if [ "$method" = "GET" ]; then
+    echo '{"message":"Not Found"}'
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+if [ "$resp" != "-" ] && [ -n "$resp" ]; then
+  if [ -n "$jqexpr" ] && [ "$rc" = 0 ]; then
+    jq -r "$jqexpr" "$D/$resp"
+  else
+    cat "$D/$resp"
+  fi
+fi
+if [ "$rc" != 0 ]; then
+  echo "gh: request failed (HTTP ${http:-500})" >&2
+fi
+exit "$rc"

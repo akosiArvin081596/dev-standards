@@ -1,0 +1,17 @@
+{
+  "actions_app_id": 15368,
+  "profiles": {
+    "project": {
+      "actions": ["ci / ci", "gates / guarded-paths", "gates / pr-title"],
+      "statuses": ["ai-review", "ai-security", "ai-qa"]
+    },
+    "standards": {
+      "actions": ["self-test", "ci / ci", "gates / guarded-paths", "gates / pr-title"],
+      "statuses": ["ai-review", "ai-security"]
+    },
+    "template": {
+      "actions": ["template-ci", "gates / guarded-paths", "gates / pr-title"],
+      "statuses": ["ai-review", "ai-security"]
+    }
+  }
+}

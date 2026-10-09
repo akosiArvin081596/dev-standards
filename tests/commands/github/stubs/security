@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Test stub for the macOS `security` tool. Never touches a real keychain.
+# State in $SEC_STUB_DIR: security.log (argv per call), item (the stored password, if any).
+# add-generic-password with a trailing -w reads the "typed" password from stdin, like the
+# real tool's hidden prompt.
+set -u
+D="${SEC_STUB_DIR:?SEC_STUB_DIR not set}"
+printf '%s\n' "$*" >>"$D/security.log"
+case "${1:-}" in
+  find-generic-password)
+    [ -e "$D/item" ] || { echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44; }
+    for a in "$@"; do
+      if [ "$a" = "-w" ]; then cat "$D/item"; printf '\n'; exit 0; fi
+    done
+    echo 'keychain: "/fake/login.keychain-db"'
+    echo 'class: "genp"'
+    exit 0
+    ;;
+  add-generic-password)
+    last=""
+    for a in "$@"; do last="$a"; done
+    if [ "$last" = "-w" ]; then
+      IFS= read -r pw || true
+      [ -n "$pw" ] || exit 1
+      printf '%s' "$pw" >"$D/item"
+    fi
+    exit 0
+    ;;
+esac
+exit 0
