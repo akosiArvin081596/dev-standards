@@ -119,6 +119,14 @@ setup_sandbox() {
   mkdir -p "$STUB_DIR" "$TEAM_CONFIG_DIR" "$CLAUDE_CONFIG_DIR"
   unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT PGHOST PGPORT PGDATABASE PGSERVICE PGUSER PGPASSWORD GH_TOKEN GITHUB_TOKEN
   export PATH="$HERE/stubs:$PATH"
+  # Network guard (tests/lib/net-guard.sh): fake ssh/scp/sftp/rsync go FIRST on PATH, log every
+  # call and refuse; ssh calls are handed to the stubs/ssh simulator after logging. Never connects.
+  # shellcheck source=SCRIPTDIR/../../lib/net-guard.sh
+  . "$REPO/tests/lib/net-guard.sh"
+  NET_GUARD_REAL_HOME="$REAL_HOME"
+  net_guard_install "$T/net-guard"
+  export NET_GUARD_SIMULATOR="$HERE/stubs"
+  if net_guard_assert; then pass "net-guard: fake ssh/scp/sftp/rsync first on PATH, refusing and logging"; else echo "net-guard is not in place; refusing to run any test" >&2; exit 1; fi
 
   # a private copy of the plugin (bin + lib + server); placeholders for server scripts
   # another engineer may not have written yet (the ssh stub never runs them)
