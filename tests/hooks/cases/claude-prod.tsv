@@ -8,7 +8,7 @@ allow	nested-claude	main	Bash	project	claude --bg --name 12-login "/team:ship 12
 allow	nested-claude	main	Bash	project	claude --bg --name 12-login --permission-mode bypassPermissions "/team:ship 12 background-writer"	full bg form
 allow	nested-claude	main	Bash	project	cd "{FEAT}" && claude --bg --name 12-login --permission-mode bypassPermissions "/team:ship 12 background-writer"	exact start-issue form with quoted cd
 allow	nested-claude	main	Bash	project	cd {FEAT} && claude --bg "/team:ship 12 background-writer"	unquoted cd, minimal bg
-allow	nested-claude	main	Bash	project	claude --bg 'fix the login bug'	single-quoted prompt
+deny	nested-claude	main	Bash	project	claude --bg 'fix the login bug'	free-form bg prompt (must be a /team: skill)
 allow	nested-claude	main	Bash	project	claude agents --json --all	list background agents
 allow	nested-claude	main	Bash	project	claude agents --json	list background agents
 allow	nested-claude	main	Bash	project	claude logs abc123	logs

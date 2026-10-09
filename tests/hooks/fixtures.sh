@@ -182,6 +182,14 @@ git push origin main'
   fx_write "$p/deploydir/readme.txt" "fixture"
   fx_write "$p/envdir/.env.production" "APP_KEY=decoy-fixture"
   fx_write "$p/envdir/.env" "APP_ENV=local"
+  # make fixtures (fence-hardening): pattern rule, .DEFAULT, include (one level deep)
+  printf '%s\n' '%.o: %.c' '	git push origin main' >"$p/pat.mk"
+  printf '%s\n' '.DEFAULT:' '	git push origin main' >"$p/def.mk"
+  printf '%s\n' 'include child.mk' 'all:' '	echo top' >"$p/inc.mk"
+  printf '%s\n' 'child:' '	git push origin main' >"$p/child.mk"
+  printf '%s\n' 'all:' '	echo clean-top' >"$p/inc-ok.mk"
+  printf '%s\n' 'child:' '	echo clean-child' >"$p/okchild.mk"
+  printf '%s\n' 'include okchild.mk' 'all:' '	echo ok' >"$p/inc-okchild.mk"
   fx_repo "$p" feat/3-thing "git@github.com:someone/project.git" || return 1
 
   # plain: not a git repo
