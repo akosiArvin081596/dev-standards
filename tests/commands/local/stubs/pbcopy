@@ -1,0 +1,3 @@
+#!/bin/bash
+# Test stub for pbcopy: the "clipboard" is a file in $STUB_DIR.
+cat > "${STUB_DIR:?STUB_DIR is not set}/clipboard"

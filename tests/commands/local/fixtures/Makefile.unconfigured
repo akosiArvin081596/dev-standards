@@ -1,0 +1,4 @@
+# Fixture Makefile: every target is "not configured" (exit 3), like a fresh template.
+.PHONY: setup dev build migrate seed
+setup dev build migrate seed:
+	@echo "not configured: fill in for your stack" >&2; exit 3

@@ -1,0 +1,34 @@
+#!/bin/bash
+# Test stub for macOS security: a fake keychain in $STUB_DIR/keychain-<service> (line 1
+# account, line 2 password). Never touches the real keychain.
+set -u
+d="${STUB_DIR:?STUB_DIR is not set}"
+printf '%s\n' "$*" >> "$d/security.log"
+case "${1:-}" in
+  find-generic-password)
+    shift
+    svc="" w=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s) svc="$2"; shift 2 ;;
+        -a) shift 2 ;;
+        -w) w=1; shift ;;
+        *) shift ;;
+      esac
+    done
+    f="$d/keychain-$svc"
+    [ -r "$f" ] || { echo "security: The specified item could not be found in the keychain." >&2; exit 44; }
+    if [ "$w" = 1 ]; then
+      sed -n 2p "$f"
+    else
+      printf 'keychain: "/stub/login.keychain-db"\nclass: "genp"\nattributes:\n    "acct"<blob>="%s"\n    "svce"<blob>="%s"\n' "$(sed -n 1p "$f")" "$svc"
+    fi
+    ;;
+  -i)
+    cat >> "$d/security-i.log"
+    ;;
+  *)
+    echo "security stub: unhandled: $*" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,4 @@
+# Fixture Makefile for the MySQL project: no-op targets.
+.PHONY: setup seed migrate
+setup seed migrate:
+	@mkdir -p .team && date -u >> .team/$@-ran

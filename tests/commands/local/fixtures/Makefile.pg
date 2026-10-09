@@ -1,0 +1,20 @@
+# Fixture Makefile for the local command tests (GNU Make 3.81). Not a real project.
+-include .env
+export
+
+.PHONY: setup seed migrate dev build
+
+setup:
+	@mkdir -p .team && date -u > .team/setup-ran
+
+seed:
+	@PGPASSWORD="$(DB_PASSWORD)" psql -X -q -v ON_ERROR_STOP=1 -h "$(DB_HOST)" -p "$(DB_PORT)" -U "$(DB_USER)" -d "$(DB_NAME)" -c "CREATE TABLE seeded (id int); INSERT INTO seeded VALUES (1);"
+
+migrate:
+	@mkdir -p .team && date -u >> .team/migrated
+
+dev:
+	@mkdir -p .team/www && printf ok > .team/www/health && cd .team/www && exec python3 -m http.server "$(PORT)" --bind 127.0.0.1
+
+build:
+	@mkdir -p .team/artifact && printf 'release\n' > .team/artifact/index.html

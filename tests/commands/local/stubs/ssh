@@ -1,0 +1,72 @@
+#!/bin/bash
+# Test stub for ssh: records every call in $STUB_DIR, never connects anywhere.
+set -u
+d="${STUB_DIR:?STUB_DIR is not set}"
+printf '%s\n' "$*" >> "$d/ssh.log"
+if [ "${1:-}" = "-G" ]; then
+  printf 'hostname 192.0.2.10\nport %s\nuser tester\n' "${STUB_SSH_PORT:-22}"
+  exit 0
+fi
+args=("$@")
+i=0 dest=""
+while [ "$i" -lt "${#args[@]}" ]; do
+  a="${args[$i]}"
+  case "$a" in
+    -i|-o|-l|-p|-F|-J|-b|-c|-D|-E|-L|-R|-S|-W|-w) i=$((i + 2)) ;;
+    -*) i=$((i + 1)) ;;
+    *) dest="$a"; i=$((i + 1)); break ;;
+  esac
+done
+cmd="${args[*]:$i}"
+printf '%s\n' "$dest" >> "$d/ssh-dest.log"
+# shellcheck disable=SC2016  # the patterns below are literal remote command text
+case "$cmd" in
+  *'/provision" --bundle'*)
+    rm -rf "${d:?}/bundle"
+    mkdir -p "$d/bundle"
+    tar -xzf - -C "$d/bundle"
+    printf '%s\n' "$cmd" > "$d/provision-cmd"
+    echo "[create] user and folders (stub)"
+    echo "[ok]     nginx (stub)"
+    if [ -n "${STUB_LEAK:-}" ]; then
+      pw=$(sed -n 's/^BASIC_AUTH_PASSWORD="\(.*\)"$/\1/p' "$d/bundle/inputs.conf")
+      echo "[update] htpasswd written with $pw"
+      echo "-----BEGIN OPENSSH PRIVATE KEY-----"
+      echo "c3R1Yi1wcml2YXRlLWtleS1ib2R5"
+      echo "-----END OPENSSH PRIVATE KEY-----"
+    fi
+    if [ -n "${STUB_PROVISION_FAIL:-}" ]; then echo "TEAM-RESULT fail stub failure"; exit 1; fi
+    echo "TEAM-RESULT ok"
+    ;;
+  "cat /etc/ssh/ssh_host_ed25519_key.pub")
+    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStubHostKeyForTestsOnly0000000000000000000 root@stub"
+    ;;
+  "latest-name")
+    echo "${STUB_SNAPSHOT_NAME:-sanitized-20261005T030000Z.sql.gz}"
+    ;;
+  "latest")
+    cat "$d/fresh-dump.sql.gz"
+    ;;
+  *'bash "$d/discover"; rc='*)
+    rm -rf "${d:?}/discover-bundle"
+    mkdir -p "$d/discover-bundle"
+    tar -xzf - -C "$d/discover-bundle"
+    printf '%s\n' "$cmd" > "$d/discover-cmd"
+    echo "STUB DISCOVER REPORT"
+    ;;
+  "sudo /usr/local/lib/team/flag "*)
+    echo "flag set (stub)"
+    ;;
+  "sudo /usr/local/lib/team/refresh-staging "*)
+    echo "refresh-staging (stub): $cmd"
+    ;;
+  "deploy "*)
+    cat > "$d/deploy-stdin.tar.gz"
+    echo "deployed (stub)"
+    exit "${STUB_DEPLOY_RC:-0}"
+    ;;
+  *)
+    echo "ssh stub: unhandled: $*" >&2
+    exit 255
+    ;;
+esac

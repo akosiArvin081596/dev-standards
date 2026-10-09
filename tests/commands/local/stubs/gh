@@ -1,0 +1,53 @@
+#!/bin/bash
+# Test stub for gh: records every call in $STUB_DIR, never contacts GitHub.
+set -u
+d="${STUB_DIR:?STUB_DIR is not set}"
+tok=no
+[ -n "${GH_TOKEN:-}" ] && tok=yes
+printf 'token=%s %s\n' "$tok" "$*" >> "$d/gh.log"
+
+opt() {   # opt <name> <args...> : value after <name>
+  local want="$1"; shift
+  while [ $# -gt 0 ]; do
+    [ "$1" = "$want" ] && { printf '%s' "${2:-}"; return 0; }
+    shift
+  done
+  return 0
+}
+
+case "${1:-} ${2:-}" in
+  "auth token")
+    echo "gho_STUBTOKENforTESTSonly000000000"
+    ;;
+  "issue view")
+    f="$d/issue-$3.json"
+    [ -r "$f" ] || { echo "GraphQL: Could not resolve to an issue" >&2; exit 1; }
+    cat "$f"
+    ;;
+  "pr list")
+    head=$(opt --head "$@")
+    key=$(printf '%s' "$head" | tr '/' '_')
+    if [ -e "$d/merged-$key" ]; then echo '[{"number":7}]'; else echo '[]'; fi
+    ;;
+  "secret list")
+    env=$(opt --env "$@")
+    f="$d/secrets-$env.json"
+    if [ -r "$f" ]; then cat "$f"; else echo '[]'; fi
+    ;;
+  "secret set")
+    env=$(opt --env "$@")
+    mkdir -p "$d/secrets"
+    cat > "$d/secrets/${env:-repo}.$3"
+    echo "Set Actions secret $3 for $(opt --repo "$@")"
+    exit "${STUB_GH_SECRET_RC:-0}"
+    ;;
+  "variable set")
+    mkdir -p "$d/variables"
+    opt --body "$@" > "$d/variables/$3"
+    echo "Set variable $3"
+    ;;
+  *)
+    echo "gh stub: unhandled: $*" >&2
+    exit 1
+    ;;
+esac
