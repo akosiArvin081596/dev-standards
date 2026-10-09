@@ -448,6 +448,58 @@ EOF
   expect_rc "symlinked folder pointing outside the checkout: refused" 1 sync_in "$P3" "$rel110" --to v1.1.0
   ok "nothing written outside the checkout" [ -z "$(ls -A "$T/outside")" ]
   expect_rc "outside a git repo: exit 5" 5 sync_in "$T/home" "$rel110" --to v1.1.0
+
+  # --check without --to: the lock's own release, and the lock compared by content (S5)
+  local P4="$T/sync-proj4" lock4 bytes
+  make_repo "$P4" "git@github.com:octo-owner/fourth-app.git" octo-owner
+  expect_rc "S5 setup: sync to v1.1.0" 0 sync_in "$P4" "$rel110" --to v1.1.0
+  lock4="$P4/.claude/team-standards.lock"
+  stub_reset
+  route "api GET repos/akosiArvin081596/dev-standards/releases?per_page=100" \
+    '[{"tag_name":"v1.2.0","draft":false,"prerelease":false},{"tag_name":"v1.1.0","draft":false,"prerelease":false}]'
+  route "api GET repos/akosiArvin081596/dev-standards/tarball/v1.1.0" "@$rel110"
+  route "api GET repos/akosiArvin081596/dev-standards/tarball/v1.2.0" "@$rel120"
+  expect_rc "--check without --to: a newer v1.2.0 is not drift" 0 sync_in "$P4" "" --check
+  expect_out "--check checks the lock's own release" "up to date with v1.1.0"
+  ok "--check downloaded the lock's release" called "api GET repos/akosiArvin081596/dev-standards/tarball/v1.1.0"
+  ok "--check did not fetch the newer release" not called "api GET repos/akosiArvin081596/dev-standards/tarball/v1.2.0"
+  ok "--check did not even list releases" not called "api GET repos/akosiArvin081596/dev-standards/releases*"
+  stub_clear_log
+  expect_rc "plain sync still moves to the newest v1 release" 0 sync_in "$P4" "$rel120"
+  ok "plain sync listed the releases" called "api GET repos/akosiArvin081596/dev-standards/releases*"
+  ok "plain sync moved the lock to v1.2.0" [ "$(jq -r .release "$lock4")" = v1.2.0 ]
+  expect_rc "S5 reset: back to v1.1.0" 0 sync_in "$P4" "$rel110" --to v1.1.0
+
+  # same content, other key order and formatting
+  jq -c '{files: (.files | to_entries | reverse | from_entries), standards_repo, release}' "$lock4" >"$T/lock.reordered"
+  cp "$T/lock.reordered" "$lock4"
+  ok "S5 setup: lock bytes really differ from jq -S output" not cmp -s "$lock4" <(jq -S . "$lock4")
+  stub_reset
+  expect_rc "--check: reordered lock keys are not drift" 0 sync_in "$P4" "$rel110" --check
+  expect_no_out "--check: lock not listed as changed" "[update]  .claude/team-standards.lock"
+  expect_out "--check: lock shown as ok" "[ok]      .claude/team-standards.lock"
+  bytes=$(cat "$lock4")
+  expect_rc "sync with a reordered lock: nothing to do" 0 sync_in "$P4" "$rel110" --to v1.1.0
+  expect_out "sync with a reordered lock: already up to date" "already up to date with v1.1.0"
+  ok "sync did not rewrite the reordered lock" [ "$(cat "$lock4")" = "$bytes" ]
+
+  # a real difference in the lock is still drift
+  jq '.files[".claude/settings.json"] = "sha256:0000"' "$lock4" >"$T/lock.bad" && cp "$T/lock.bad" "$lock4"
+  expect_rc "--check: a changed lock hash is drift" 1 sync_in "$P4" "$rel110" --check
+  expect_out "--check: lock listed as changed" "[update]  .claude/team-standards.lock"
+  printf 'not json\n' >"$lock4"
+  expect_rc "--check: an unreadable lock fails" 1 sync_in "$P4" "$rel110" --check --to v1.1.0
+  expect_rc "sync refuses to guess from an unreadable lock" 1 sync_in "$P4" "$rel110" --to v1.1.0
+  rm -f "$lock4"
+  expect_rc "S5 reset: without the bad lock, sync writes a fresh one" 0 sync_in "$P4" "$rel110" --to v1.1.0
+
+  # a lock that names no real version: --check falls back to the release resolution
+  jq '.release = "main"' "$lock4" >"$T/lock.main" && cp "$T/lock.main" "$lock4"
+  stub_reset
+  route "api GET repos/akosiArvin081596/dev-standards/releases/latest" '{"tag_name":"v1.1.0"}'
+  expect_rc "--check with a non-version lock release: resolves the latest" 1 sync_in "$P4" "$rel110" --check
+  ok "--check with a non-version lock release asked for the latest" called "api GET repos/akosiArvin081596/dev-standards/releases/latest"
+  expect_out "--check: lock naming another release is drift" "[update]  .claude/team-standards.lock"
 }
 
 # ------------------------------------------------------------------------------ team-conflict-check

@@ -24,11 +24,14 @@ Run in a project checkout. Fetches a dev-standards release (a read) and:
 It never touches project-owned files.
 
 Which release: --to <tag>; else the newest vX.Y.Z release with the lock's major; else
-(no lock yet) the latest release.
+(no lock yet) the latest release. --check without --to checks against the release the
+lock names (when it is a vX.Y.Z), so a newer release is not drift. The lock file is
+compared by content (jq -S), so key order or formatting is never drift.
 
   --init    first sync of a new project: also deletes .github/workflows/template-ci.yml
   --to TAG  sync to this exact release (a different major is an upgrade)
   --check   change nothing; list what would change and exit 1 on any drift
+            (against the lock's own release unless --to is given)
 
 TEAM_STANDARDS_TARBALL=<file> uses a local release tarball instead of downloading.
 
@@ -94,6 +97,10 @@ need_login() {
 # ------------------------------------------------------------ which release
 
 TAG="$TO"
+if [ -z "$TAG" ] && [ "$CHECK" = 1 ] && semver_tag "$OLD_RELEASE"; then
+  # --check verifies the project against the release its lock names, not a newer one.
+  TAG="$OLD_RELEASE"
+fi
 if [ -z "$TAG" ]; then
   need_login
   if semver_tag "$OLD_RELEASE"; then
@@ -237,6 +244,11 @@ while IFS= read -r p; do
   src="$STAGE/$p"
   action=ok
   if [ ! -e "$p" ]; then action=create
+  elif [ "$p" = "$LOCK" ]; then
+    # The lock is compared by content, never by key order or formatting.
+    a=$(jq -cS . "$src" 2>/dev/null) || a=""
+    b=$(jq -cS . "$p" 2>/dev/null) || b=""
+    if [ -z "$b" ] || [ "$a" != "$b" ]; then action=update; fi
   elif ! cmp -s "$src" "$p"; then action=update
   elif [ -x "$src" ] && [ ! -x "$p" ]; then action=update
   elif [ ! -x "$src" ] && [ -x "$p" ]; then action=update
