@@ -166,19 +166,22 @@ team_path_within() {
 # ---------------------------------------------------------------- make
 
 # team_make_status <log> <target> <make rc> : 0, 3 (not configured) or 1.
-# GNU make exits 2 when a recipe exits 3, so read its final "*** [...] Error 3" line.
+# Same rule as scripts/ci/make-target.sh: make turns a recipe's exit 3 into its own exit 2,
+# so "not configured" needs make's exit 2 AND a "*** [...] Error 3" line AND the text
+# "not configured". Anything else (a missing target or Makefile, a tool that happens to
+# exit 3) is a failure.
 team_make_status() {
-  local log="$1" target="$2" rc="$3" last
+  local log="$1" rc="$3"
   [ "$rc" -eq 0 ] && return 0
-  if grep -Eq "No rule to make target [\`']$target'|No targets specified and no makefile found" "$log" 2>/dev/null; then
+  if [ "$rc" -eq 2 ] && grep -Eq '\*\*\* \[[^]]*\] Error 3$' "$log" 2>/dev/null \
+     && grep -q 'not configured' "$log" 2>/dev/null; then
     return 3
   fi
-  last=$(grep -E '^make(\[[0-9]+\])?: \*\*\* ' "$log" 2>/dev/null | tail -n 1 || true)
-  case "$last" in
-    *"Error 3") return 3 ;;
-  esac
   return 1
 }
+
+# team_has_makefile <dir>
+team_has_makefile() { [ -f "$1/Makefile" ] || [ -f "$1/makefile" ] || [ -f "$1/GNUmakefile" ]; }
 
 # team_run_make <dir> <target> : runs make there (output → stderr); returns 0, 3 or 1
 team_run_make() {
@@ -195,23 +198,22 @@ team_run_make() {
 }
 
 # team_run_cmd <dir> <command string> <what> : runs a project command (MIGRATE_CMD,
-# SEED_CMD) with bash; make's not-configured exit maps to 3. Output → stderr.
+# SEED_CMD) with bash. Returns 3 only for "not configured": a make target per
+# team_make_status, or any other command that exits 3 AND prints "not configured".
+# Output → stderr.
 team_run_cmd() {
-  local dir="$1" cmd="$2" log rc st target
+  local dir="$1" cmd="$2" log rc st
   log=$(mktemp "${TMPDIR:-/tmp}/team-cmd.XXXXXX")
   set +e
   (cd "$dir" && bash -c "$cmd") 2>&1 | tee "$log" >&2
   rc=${PIPESTATUS[0]}
-  st=$rc
+  st=0
   if [ "$rc" -ne 0 ]; then
-    target=""
-    case "$cmd" in make\ *) target="${cmd#make }"; target="${target%% *}" ;; esac
-    if [ -n "$target" ]; then
-      team_make_status "$log" "$target" "$rc"
-      st=$?
-    elif [ "$rc" -ne 3 ]; then
-      st=1
-    fi
+    st=1
+    case "$cmd" in
+      make\ *) team_make_status "$log" "" "$rc"; st=$? ;;
+      *) [ "$rc" -eq 3 ] && grep -q 'not configured' "$log" && st=3 ;;
+    esac
   fi
   set -e
   rm -f "$log"
@@ -468,9 +470,23 @@ team_require_project_conf() {
   [ -r "$1/ops/project.conf" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: $1/ops/project.conf is missing"
 }
 
-# team_tar_create <dir> <out|-> <paths...> : portable tar.gz (no macOS metadata or xattrs)
+# team_tar_create <dir> <out|-> <paths...> : portable tar.gz without macOS metadata.
+# COPYFILE_DISABLE=1 stops macOS tar writing ._ AppleDouble files (GNU tar ignores it);
+# bsdtar alone also gets --no-xattrs --no-mac-metadata (GNU tar rejects the latter), so
+# Linux never sees LIBARCHIVE.xattr headers.
+TEAM_TAR_FLAGS=""
 team_tar_create() {
   local dir="$1" out="$2"
   shift 2
-  COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$out" -C "$dir" "$@"
+  if [ -z "$TEAM_TAR_FLAGS" ]; then
+    case "$(tar --version 2>/dev/null | head -n 1)" in
+      *bsdtar*) TEAM_TAR_FLAGS="--no-xattrs --no-mac-metadata" ;;
+      *) TEAM_TAR_FLAGS="none" ;;
+    esac
+  fi
+  if [ "$TEAM_TAR_FLAGS" = none ]; then
+    COPYFILE_DISABLE=1 tar -czf "$out" -C "$dir" "$@"
+  else
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$out" -C "$dir" "$@"
+  fi
 }

@@ -22,8 +22,9 @@ retries). The server prints a plan ([create]/[update]/[ok]/[skip]) and, with
 Without --apply: shows the server's plan and the NAMES of the secrets and variables
 it would set. Nothing changes anywhere.
 
-With --apply and TEAM-RESULT ok, it pins the server's host key and stores, piping
-every value on stdin and never printing one:
+With --apply and TEAM-RESULT ok, it pins the server's host key (the TEAM-HOSTKEY line
+of the same connection; no second ssh) and stores, piping every value on stdin and
+never printing one:
   environment secrets  DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY
                        DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL
                        (+ staging: BASIC_AUTH_USER BASIC_AUTH_PASSWORD)
@@ -31,9 +32,11 @@ every value on stdin and never printing one:
   repo variable        STAGING_READY=true / PRODUCTION_READY=true
   keychain             team-staging-<project> (staging basic-auth login)
   ~/.ssh               team-dbpull-<project> (production db-pull key, mode 600)
-Private repos (VISIBILITY=private): production values never go to GitHub; the
-production deploy key stays at ~/.ssh/team-deploy-<project>-production and the
-pinned host key at $TEAM_CONFIG_DIR/projects/<project>.known_hosts (team-deploy).
+Private repos (VISIBILITY=private, GitHub Free has no environments there):
+  staging     the same secret names are stored as REPO secrets, plus STAGING_READY
+  production  nothing goes to GitHub; the deploy key stays at
+              ~/.ssh/team-deploy-<project>-production and the pinned host key at
+              $TEAM_CONFIG_DIR/projects/<project>.known_hosts (team-deploy)
 
 Keys are not rotated on re-runs (an existing DEPLOY_SSH_KEY secret, db-pull key or
 staging login is kept) unless --rotate-keys.
@@ -104,6 +107,15 @@ user="$project-$env"
 
 private_prod=0
 [ "$visibility" = private ] && [ "$env" = production ] && private_prod=1
+# where GitHub secrets go: the environment, or (private repo staging: GitHub Free has no
+# environments on private repos) the repo itself. Production never reaches GitHub on a
+# private repo, so the repo-level names can't clash.
+scope=(--env "$env")
+scope_label="environment secrets ($env)"
+if [ "$visibility" = private ] && [ "$env" = staging ]; then
+  scope=()
+  scope_label="repo secrets (private repo: no environments on GitHub Free)"
+fi
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/team-provision.XXXXXX")
 chmod 700 "$tmp"
@@ -120,11 +132,11 @@ deploy_existing=0
 if [ "$private_prod" = 1 ]; then
   [ -f "$local_deploy_key" ] && deploy_existing=1
 else
-  if names=$(team_gh_as "$account" secret list --env "$env" --repo "$repo" --json name 2>/dev/null); then
+  if names=$(team_gh_as "$account" secret list ${scope[@]+"${scope[@]}"} --repo "$repo" --json name 2>/dev/null); then
     printf '%s' "$names" | jq -e 'any(.[]?; .name == "DEPLOY_SSH_KEY")' >/dev/null 2>&1 \
       && [ -r "$pub_store" ] && deploy_existing=1
   else
-    team_warn "could not list $env secrets of $repo (does the $env environment exist? team-bootstrap-repo creates it)"
+    team_warn "could not list the $scope_label of $repo (does the $env environment exist? team-bootstrap-repo creates it)"
   fi
 fi
 gen_deploy=1
@@ -223,12 +235,14 @@ secret_names="$secret_names DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL"
 ready_var=$(printf '%s_READY' "$env" | tr '[:lower:]' '[:upper:]')
 
 if [ "$TEAM_APPLY" != 1 ]; then
+  grep -q '^TEAM-HOSTKEY ' "$tmp/out" \
+    || team_warn "the server printed no TEAM-HOSTKEY line (no SSH host key to pin): --apply would stop before storing anything"
   echo
   echo "With --apply, after TEAM-RESULT ok, team-provision would also store (names only):"
   if [ "$private_prod" = 1 ]; then
     echo "  nothing in GitHub for production (private repo): deploy key → $local_deploy_key, host key → $TEAM_CONFIG_DIR/projects/$project.known_hosts"
   else
-    echo "  environment secrets ($env) in $repo: $secret_names"
+    echo "  $scope_label in $repo: $secret_names"
     [ "$env" = production ] && echo "  repo secret in $repo: PRODUCTION_HEALTH_URL"
     echo "  repo variable in $repo: $ready_var=true"
   fi
@@ -239,11 +253,16 @@ if [ "$TEAM_APPLY" != 1 ]; then
 fi
 
 # ---- after a successful apply: pin the host key, store values ------------------------------------
-hostkey=$(ssh "$alias" cat /etc/ssh/ssh_host_ed25519_key.pub | tr -d '\r' | head -n 1) \
-  || team_die "$TEAM_EXIT_FAIL" "could not read the server's host key (not retried); re-run with --apply to store the secrets"
-kt=$(printf '%s' "$hostkey" | awk '{print $1}')
-kb=$(printf '%s' "$hostkey" | awk '{print $2}')
-[ "$kt" = ssh-ed25519 ] || team_die "$TEAM_EXIT_FAIL" "unexpected host key type from the server"
+# The host key comes from the same connection: server/provision prints
+# "TEAM-HOSTKEY <keytype> <base64>" just before TEAM-RESULT.
+hostkey=$(tr -d '\r' < "$tmp/out" | grep '^TEAM-HOSTKEY ' | tail -n 1 || true)
+[ -n "$hostkey" ] || team_die "$TEAM_EXIT_FAIL" "server/provision printed no TEAM-HOSTKEY line, so the server has no SSH host key to pin (or runs older server scripts). The host key is never skipped: nothing was stored in GitHub, the keychain or ~/.ssh. Fix the server's host key and re-run with --apply"
+kt=$(printf '%s' "$hostkey" | awk '{print $2}')
+kb=$(printf '%s' "$hostkey" | awk '{print $3}')
+case "$kt" in
+  ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) ;;
+  *) team_die "$TEAM_EXIT_FAIL" "unexpected host key type from the server" ;;
+esac
 case "$kb" in AAAA*) ;; *) team_die "$TEAM_EXIT_FAIL" "unexpected host key from the server" ;; esac
 case "$kb" in *[!A-Za-z0-9+/=]*) team_die "$TEAM_EXIT_FAIL" "unexpected host key from the server" ;; esac
 port=$(team_vps_ssh_port "$alias")
@@ -283,23 +302,23 @@ if [ "$private_prod" = 1 ]; then
   [ "$gen_deploy" = 1 ] && install_key "$tmp/deploy" "$local_deploy_key"
   echo "[skip]  GitHub: production secrets stay off GitHub for a private repo (deploy with team-deploy production)"
 else
-  put_secret DEPLOY_HOST "$ip" --env "$env"
-  put_secret DEPLOY_USER "$user" --env "$env"
-  put_secret DEPLOY_PORT "$port" --env "$env"
+  put_secret DEPLOY_HOST "$ip" ${scope[@]+"${scope[@]}"}
+  put_secret DEPLOY_USER "$user" ${scope[@]+"${scope[@]}"}
+  put_secret DEPLOY_PORT "$port" ${scope[@]+"${scope[@]}"}
   if [ "$gen_deploy" = 1 ]; then
-    set_secret DEPLOY_SSH_KEY --env "$env" < "$tmp/deploy"
+    set_secret DEPLOY_SSH_KEY ${scope[@]+"${scope[@]}"} < "$tmp/deploy"
     case " $failed " in
       *" DEPLOY_SSH_KEY "*) team_warn "the server now trusts a new deploy key that GitHub does not have: re-run with --apply --rotate-keys" ;;
       *) ( umask 022; cp "$tmp/deploy.pub" "$pub_store" ) ;;
     esac
   fi
   put_secret DEPLOY_KNOWN_HOSTS "$kh_line
-" --env "$env"
-  put_secret APP_URL "https://$host" --env "$env"
-  put_secret HEALTH_URL "https://$host$health_path" --env "$env"
+" ${scope[@]+"${scope[@]}"}
+  put_secret APP_URL "https://$host" ${scope[@]+"${scope[@]}"}
+  put_secret HEALTH_URL "https://$host$health_path" ${scope[@]+"${scope[@]}"}
   if [ "$env" = staging ]; then
-    put_secret BASIC_AUTH_USER "$ba_user" --env "$env"
-    put_secret BASIC_AUTH_PASSWORD "$ba_pass" --env "$env"
+    put_secret BASIC_AUTH_USER "$ba_user" ${scope[@]+"${scope[@]}"}
+    put_secret BASIC_AUTH_PASSWORD "$ba_pass" ${scope[@]+"${scope[@]}"}
   fi
   if [ "$env" = production ]; then
     put_secret PRODUCTION_HEALTH_URL "https://$host$health_path"

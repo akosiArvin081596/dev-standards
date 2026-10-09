@@ -92,11 +92,12 @@ esac
 [ -d "$root/$artifact" ] && [ -n "$(ls -A "$root/$artifact" 2>/dev/null)" ] \
   || team_die "$TEAM_EXIT_FAIL" "make build left $artifact empty"
 [ -d "$root/ops" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no ops/ folder to ship with the release"
+[ ! -e "$root/$artifact/ops" ] && [ ! -L "$root/$artifact/ops" ] \
+  || team_die "$TEAM_EXIT_FAIL" "the artifact has its own ops/ entry; it would clash with the project's ops/ in the release (as in scripts/ci/package.sh)"
 
 pkg=$(mktemp -d "${TMPDIR:-/tmp}/team-deploy.XXXXXX")
 trap 'rm -rf "${pkg:?}"' EXIT
 cp -R "$root/$artifact/." "$pkg/"
-rm -rf "${pkg:?}/ops"
 cp -R "$root/ops" "$pkg/ops"
 mkdir -p "$root/.team"
 team_tar_create "$pkg" "$tarball" .

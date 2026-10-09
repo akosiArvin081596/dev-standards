@@ -116,6 +116,7 @@ case "$action" in
   up)
     [ -n "$port" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no PORT in $env_file (create the worktree with team-new-worktree)"
     team_require_cmd make curl
+    team_has_makefile "$root" || team_die "$TEAM_EXIT_FAIL" "no Makefile in $root: team-app runs 'make dev'"
     mkdir -p "$root/.team"
     started=0
     if r=$(team_app_running "$root"); then

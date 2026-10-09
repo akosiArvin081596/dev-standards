@@ -35,11 +35,16 @@ case "$cmd" in
       echo "c3R1Yi1wcml2YXRlLWtleS1ib2R5"
       echo "-----END OPENSSH PRIVATE KEY-----"
     fi
+    # like server/provision: the host key line comes just before TEAM-RESULT
+    if [ -z "${STUB_NO_HOSTKEY:-}" ]; then
+      if [ "${STUB_HOSTKEY_TYPE:-}" = ecdsa ]; then
+        echo "TEAM-HOSTKEY ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYStubEcdsaHostKeyForTests0000="
+      else
+        echo "TEAM-HOSTKEY ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStubHostKeyForTestsOnly0000000000000000000"
+      fi
+    fi
     if [ -n "${STUB_PROVISION_FAIL:-}" ]; then echo "TEAM-RESULT fail stub failure"; exit 1; fi
     echo "TEAM-RESULT ok"
-    ;;
-  "cat /etc/ssh/ssh_host_ed25519_key.pub")
-    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStubHostKeyForTestsOnly0000000000000000000 root@stub"
     ;;
   "latest-name")
     echo "${STUB_SNAPSHOT_NAME:-sanitized-20261005T030000Z.sql.gz}"

@@ -113,7 +113,17 @@ t_app() {
   ok "no pidfile left after exit 3" [ ! -e "$r3/.team/app.pid" ]
   make_project "$r4" cmdtest-appnt none Makefile.mysql
   printf 'PORT=%s\n' "$port" > "$r4/.env"
-  expect_rc 3 "up exits 3 when there is no dev target" sh -c "cd '$r4' && /bin/bash '$BIN/team-app' up --timeout 10"
+  expect_rc 1 "up fails (1, not 3) when there is no dev target" sh -c "cd '$r4' && /bin/bash '$BIN/team-app' up --timeout 10"
+
+  local r5="$T/nomake"
+  make_project "$r5" cmdtest-nomake none Makefile.pg
+  git -C "$r5" rm -q Makefile && git -C "$r5" commit -q -m "chore: no Makefile" && git -C "$r5" push -q origin main 2>/dev/null
+  printf 'PORT=%s\n' "$port" > "$r5/.env"
+  expect_rc 1 "up fails clearly when the repo has no Makefile" sh -c "cd '$r5' && /bin/bash '$BIN/team-app' up --timeout 5"
+  ok "the message names the missing Makefile" has "$T/last.err" "no Makefile"
+  expect_rc 0 "team-new-worktree in a repo without a Makefile skips make setup" sh -c "cd '$r5' && /bin/bash '$BIN/team-new-worktree' 5 --type chore --slug no-make"
+  ok "it says make setup was skipped" has "$T/last.err" "no Makefile in this repo; skipped make setup"
+  expect_rc 0 "and removes cleanly" sh -c "cd '$r5' && /bin/bash '$BIN/team-remove-worktree' 5"
 }
 
 # ------------------------------------------------------------------------------ worktrees
@@ -218,12 +228,23 @@ t_lib() {
   ok "env_set: replaces the first PORT, drops duplicates, keeps others" [ "$(tr '\n' '|' < "$T/envtest")" = "A=2|PORT=8005|B=two words|NEW='x y&\\z \$HOME'|" ]
   # shellcheck disable=SC2016  # a literal $HOME is the point of this check
   ok "env_get reads a quoted value back unchanged" [ "$(run_lib "team_env_get '$T/envtest' NEW")" = 'x y&\z $HOME' ]
-  printf 'make: *** [setup] Error 3\n' > "$T/mk1"
+  printf 'not configured: fill in for your stack\nmake: *** [setup] Error 3\n' > "$T/mk1"
+  printf 'pytest: internal error\nmake: *** [Makefile:5: test] Error 3\n' > "$T/mk1b"
+  printf 'not configured: fill in for your stack\nmake: *** [setup] Error 1\n' > "$T/mk1c"
   printf 'make[1]: *** [x] Error 3\nmake: *** [setup] Error 2\n' > "$T/mk2"
   printf "make: *** No rule to make target \`dev'.  Stop.\n" > "$T/mk3"
-  ok "make status: Error 3 → not configured" sh -c "/bin/bash -c \". '$lib/team-common.sh'; . '$lib/team-local.sh'; team_make_status '$T/mk1' setup 2\"; [ \$? = 3 ]"
-  ok "make status: nested failure → 1" sh -c "/bin/bash -c \". '$lib/team-common.sh'; . '$lib/team-local.sh'; team_make_status '$T/mk2' setup 2\"; [ \$? = 1 ]"
-  ok "make status: no such target → not configured" sh -c "/bin/bash -c \". '$lib/team-common.sh'; . '$lib/team-local.sh'; team_make_status '$T/mk3' dev 2\"; [ \$? = 3 ]"
+  mkst() { /bin/bash -c ". '$lib/team-common.sh'; . '$lib/team-local.sh'; team_make_status '$1' x $2"; echo $?; }
+  ok "make status: exit 2 + Error 3 line + 'not configured' → 3" [ "$(mkst "$T/mk1" 2)" = 3 ]
+  ok "make status: Error 3 line without the text → 1" [ "$(mkst "$T/mk1b" 2)" = 1 ]
+  ok "make status: the text without an Error 3 line → 1" [ "$(mkst "$T/mk1c" 2)" = 1 ]
+  ok "make status: both markers but make did not exit 2 → 1" [ "$(mkst "$T/mk1" 1)" = 1 ]
+  ok "make status: nested failure → 1" [ "$(mkst "$T/mk2" 2)" = 1 ]
+  ok "make status: no such target is a failure, not 'not configured'" [ "$(mkst "$T/mk3" 2)" = 1 ]
+  mkdir -p "$T/runcmd"
+  # shellcheck disable=SC2016  # inner commands are literal
+  ok "run_cmd: a non-make command exiting 3 with the text → 3" [ "$(run_lib "rc=0; team_run_cmd '$T/runcmd' 'echo not configured >&2; exit 3' x 2>/dev/null || rc=\$?; echo \$rc")" = 3 ]
+  # shellcheck disable=SC2016  # inner commands are literal
+  ok "run_cmd: a non-make command exiting 3 without the text → 1" [ "$(run_lib "rc=0; team_run_cmd '$T/runcmd' 'exit 3' x 2>/dev/null || rc=\$?; echo \$rc")" = 1 ]
   ok "urlencode" [ "$(run_lib "team_urlencode 'a b/c@d:e'")" = "a%20b%2Fc%40d%3Ae" ]
   p=$(free_port $((PBASE + 20)) $((PBASE + 24)))
   start_listener "$p" "$T/listener-v4"
@@ -473,7 +494,7 @@ t_provision() {
   ok "apply: values went on stdin, never as gh arguments" sh -c "! grep -q -e '$pw' -e '192.0.2.10' -e 'cmdtest-prov-staging.example' '$STUB_DIR/gh.log' && [ \$(grep -c -e '--body' '$STUB_DIR/gh.log') = \$(grep -c 'variable set STAGING_READY --body true' '$STUB_DIR/gh.log') ]"
   ok "apply: host key pinned locally for team-deploy" [ "$(cat "$TEAM_CONFIG_DIR/projects/cmdtest-prov.known_hosts")" = "192.0.2.10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStubHostKeyForTestsOnly0000000000000000000" ]
   ok "apply: ssh only to the alias (never the IP)" sh -c "! grep -v -x 'vps-test' '$STUB_DIR/ssh-dest.log' | grep -q ."
-  ok "apply: two connections (provision, host key), no retries" [ "$(grep -v '^-G ' "$STUB_DIR/ssh.log" | grep -c .)" = 2 ]
+  ok "apply: ONE connection (host key from its TEAM-HOSTKEY line), no retries" [ "$(grep -v '^-G ' "$STUB_DIR/ssh.log" | grep -c .)" = 1 ]
 
   # re-run without rotation keeps keys and login
   printf '%s\n%s\n' cmdtest-prov "$pw" > "$STUB_DIR/keychain-team-staging-cmdtest-prov"
@@ -499,6 +520,15 @@ t_provision() {
   rm -rf "${STUB_DIR:?}/secrets" "${STUB_DIR:?}/variables"
   expect_rc 1 "server failure: TEAM-RESULT fail → exit 1" sh -c "cd '$r' && STUB_PROVISION_FAIL=1 /bin/bash '$BIN/team-provision' staging --apply"
   ok "server failure: nothing stored" sh -c "[ ! -d '$STUB_DIR/secrets' ] && [ ! -d '$STUB_DIR/variables' ]"
+  expect_rc 0 "no TEAM-HOSTKEY line: the plan still runs" sh -c "cd '$r' && STUB_NO_HOSTKEY=1 /bin/bash '$BIN/team-provision' staging"
+  ok "no TEAM-HOSTKEY line: the plan warns that --apply would stop" has "$T/last.err" "no TEAM-HOSTKEY line"
+  expect_rc 1 "no TEAM-HOSTKEY line → apply exits 1 (never skips pinning)" sh -c "cd '$r' && STUB_NO_HOSTKEY=1 /bin/bash '$BIN/team-provision' staging --apply"
+  ok "no TEAM-HOSTKEY line: says so, nothing stored" sh -c "grep -q 'TEAM-HOSTKEY' '$T/last.err' && [ ! -d '$STUB_DIR/secrets' ] && [ ! -d '$STUB_DIR/variables' ]"
+  rm -rf "${STUB_DIR:?}/secrets" "${STUB_DIR:?}/variables"
+  expect_rc 0 "an ecdsa host key (no ed25519 on the server) is pinned too" sh -c "cd '$r' && STUB_HOSTKEY_TYPE=ecdsa /bin/bash '$BIN/team-provision' staging --apply"
+  ok "ecdsa: known_hosts secret carries the ecdsa key" [ "$(cat "$STUB_DIR/secrets/staging.DEPLOY_KNOWN_HOSTS")" = "192.0.2.10 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYStubEcdsaHostKeyForTests0000=" ]
+  rm -rf "${STUB_DIR:?}/secrets" "${STUB_DIR:?}/variables"
+  rm -f "$STUB_DIR/keychain-team-staging-cmdtest-prov"
 
   local rp="$T/privproj"
   make_project "$rp" cmdtest-priv postgres Makefile.pg "VISIBILITY=private"
@@ -506,6 +536,17 @@ t_provision() {
   ok "private: no production values in GitHub" sh -c "[ ! -d '$STUB_DIR/secrets' ] && [ ! -e '$STUB_DIR/variables/PRODUCTION_READY' ]"
   ok "private: deploy key kept on the Mac, mode 600" [ "$(file_mode "$HOME/.ssh/team-deploy-cmdtest-priv-production" 2>/dev/null)" = 600 ]
   ok "private: host key pinned in the config folder" [ -s "$TEAM_CONFIG_DIR/projects/cmdtest-priv.known_hosts" ]
+
+  # S4: GitHub Free has no environments on private repos → staging uses repo secrets
+  : > "$STUB_DIR/gh.log"
+  expect_rc 0 "private repo: staging plan" sh -c "cd '$rp' && /bin/bash '$BIN/team-provision' staging"
+  ok "private staging plan: lists repo secrets" has "$T/last.out" "repo secrets (private repo: no environments on GitHub Free) in test-owner/cmdtest-priv: DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL BASIC_AUTH_USER BASIC_AUTH_PASSWORD"
+  rm -rf "${STUB_DIR:?}/secrets" "${STUB_DIR:?}/variables"
+  expect_rc 0 "private repo: staging apply" sh -c "cd '$rp' && /bin/bash '$BIN/team-provision' staging --apply"
+  ok "private staging: the §12 staging names stored as REPO secrets" [ "$(secret_files)" = "repo.APP_URL repo.BASIC_AUTH_PASSWORD repo.BASIC_AUTH_USER repo.DEPLOY_HOST repo.DEPLOY_KNOWN_HOSTS repo.DEPLOY_PORT repo.DEPLOY_SSH_KEY repo.DEPLOY_USER repo.HEALTH_URL " ]
+  ok "private staging: STAGING_READY=true" [ "$(cat "$STUB_DIR/variables/STAGING_READY" 2>/dev/null)" = true ]
+  ok "private staging: no --env on any secret call" sh -c "grep -q 'secret set' '$STUB_DIR/gh.log' && ! grep 'secret ' '$STUB_DIR/gh.log' | grep -q -- '--env'"
+  ok "private staging: user and URL values" sh -c "[ \"\$(cat '$STUB_DIR/secrets/repo.DEPLOY_USER')\" = cmdtest-priv-staging ] && [ \"\$(cat '$STUB_DIR/secrets/repo.APP_URL')\" = https://cmdtest-priv-staging.example.test ]"
   expect_rc 2 "unknown argument" sh -c "cd '$r' && /bin/bash '$BIN/team-provision' staging --force"
 }
 
@@ -534,6 +575,12 @@ t_deploy() {
   local r3="$T/deploy-nc"
   make_project "$r3" cmdtest-dep none Makefile.unconfigured
   expect_rc 3 "make build not configured → exit 3" sh -c "cd '$r3' && /bin/bash '$BIN/team-deploy' staging --apply"
+  local r4="$T/deploy-ops"
+  make_project "$r4" cmdtest-dep none Makefile.pg
+  mkdir -p "$r4/.team/artifact/ops"
+  : > "$STUB_DIR/ssh.log"
+  expect_rc 1 "an artifact with its own ops/ is refused" sh -c "cd '$r4' && /bin/bash '$BIN/team-deploy' staging --apply"
+  ok "refused before any connection, and says why" sh -c "[ ! -s '$STUB_DIR/ssh.log' ] && grep -q 'artifact has its own ops/' '$T/last.err'"
 }
 
 # ------------------------------------------------------------------------------ fences
