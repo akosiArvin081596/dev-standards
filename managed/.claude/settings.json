@@ -171,7 +171,15 @@
       "Edit(**/.git/hooks/**)",
       "Edit(**/.github/workflows/**)",
       "mcp__github",
-      "mcp__claude_ai_GitHub"
+      "mcp__claude_ai_GitHub",
+      "Bash(gh api -f *)",
+      "Bash(gh api -F *)",
+      "Bash(gh api * -f *)",
+      "Bash(gh api * -F *)",
+      "Bash(gh api *--field*)",
+      "Bash(gh api *--raw-field*)",
+      "Bash(gh api *--input*)",
+      "Bash(gh api *labels*)"
     ],
     "ask": [
       "Bash(team-gh pr edit * --add-label owner-approved)",

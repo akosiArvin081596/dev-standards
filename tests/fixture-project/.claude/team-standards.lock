@@ -4,7 +4,7 @@
   "files": {
     ".claude/hooks/plugin-check": "sha256:65e1ff8a14ffffb45dbdc31a5266375038a15b5af53a3bca08eef1a8427ea373",
     ".claude/rules/team/team.md": "sha256:1d27a7444774942b5e4be45caff5e3eace6f766b7d9233e4a82ceaa986d5e4b5",
-    ".claude/settings.json": "sha256:41ba74de4b0cfc1960c48d3cc964fa72e2a07e1ac6349d9550a333c1ac3475fd",
+    ".claude/settings.json": "sha256:4740821fb302400fcad15df238ce9749ba6e5527802062bff02e14670cb46991",
     ".github/ISSUE_TEMPLATE/bug.yml": "sha256:1d41aa512979d378fed38f3fdf64f3ff97ed45561d5c7817ca0a9ff0a36bd57e",
     ".github/ISSUE_TEMPLATE/client-request.yml": "sha256:660bd43b959ff8968aed8aeff6333aaa48b85aa1f1e00e6eccea4865ec34d5a4",
     ".github/ISSUE_TEMPLATE/config.yml": "sha256:8c3c2c7631793da89d57254694e899b3558a1413853becea2c445b0c4268572a",

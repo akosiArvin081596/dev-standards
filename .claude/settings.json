@@ -174,7 +174,15 @@
       "Edit(/.claude/worktrees/*/.claude/settings*.json)",
       "Edit(/.claude/worktrees/*/.claude/agents/**)",
       "Edit(/.claude/worktrees/*/.claude/hooks/**)",
-      "Edit(/.claude/worktrees/*/.mcp.json)"
+      "Edit(/.claude/worktrees/*/.mcp.json)",
+      "Bash(gh api -f *)",
+      "Bash(gh api -F *)",
+      "Bash(gh api * -f *)",
+      "Bash(gh api * -F *)",
+      "Bash(gh api *--field*)",
+      "Bash(gh api *--raw-field*)",
+      "Bash(gh api *--input*)",
+      "Bash(gh api *labels*)"
     ],
     "ask": [
       "Bash(team-gh pr edit * --add-label owner-approved)",
