@@ -1,0 +1,25 @@
+# Local state and secrets: never committed
+.env
+.env.*
+!.env.example
+.team/
+.team-standards/
+*.dump
+*.sql.gz
+dumps/
+*.pem
+*.key
+.DS_Store
+node_modules/
+
+# Claude Code: commit the shared files (re-included in case a global ignore hides them)
+!.claude/
+!.claude/settings.json
+!CLAUDE.md
+!.mcp.json
+!managed/**
+!tests/fixture-project/**
+
+# ...but never local settings or worktrees, anywhere (keep these last)
+**/.claude/settings.local.json
+**/.claude/worktrees/

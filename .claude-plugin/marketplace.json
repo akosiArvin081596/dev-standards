@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "dev-standards",
+  "owner": {
+    "name": "akosiArvin081596"
+  },
+  "metadata": {
+    "description": "Team workflow pack: one plugin (team) for running Claude Code agents as a team in git worktrees."
+  },
+  "plugins": [
+    {
+      "name": "team",
+      "source": "./plugins/team",
+      "description": "Skills, review agents, fences and commands for trunk-based, agent-run projects."
+    }
+  ]
+}

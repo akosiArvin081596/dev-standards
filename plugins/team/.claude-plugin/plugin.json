@@ -1,0 +1,9 @@
+{
+  "name": "team",
+  "version": "0.1.0",
+  "description": "Skills, review agents, fences and commands for trunk-based, agent-run projects.",
+  "author": {
+    "name": "akosiArvin081596"
+  },
+  "repository": "https://github.com/akosiArvin081596/dev-standards"
+}
