@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# team-staging-login: copy a project's staging basic-auth login from the macOS keychain to
+# the clipboard, without printing it. For the owner, in a normal terminal only.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-staging-login <project>
+
+Copies the staging login stored by `team-provision staging --apply` (keychain item
+team-staging-<project>; account = the username) to the clipboard as
+  Username: <user>
+  Password: <password>
+so you can open staging or send it to the client. Nothing is printed and nothing is
+changed except the clipboard. Refuses to run inside Claude Code (CLAUDECODE=1).
+Exit codes: 0 copied, 1 no such keychain item, 2 usage, 4 refused, 5 missing tool.
+EOF
+}
+
+project=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -*) team_usage_error "unknown option: $1" ;;
+    *) [ -z "$project" ] || team_usage_error "only one project"; project="$1"; shift ;;
+  esac
+done
+[ -n "$project" ] || team_usage_error "missing project name"
+case "$project" in [a-z]*) ;; *) team_usage_error "project must match [a-z][a-z0-9-]*" ;; esac
+case "$project" in *[!a-z0-9-]*) team_usage_error "project must match [a-z][a-z0-9-]*" ;; esac
+
+if team_in_claude_code; then
+  team_die "$TEAM_EXIT_REFUSED" "refusing to run inside Claude Code: the staging login is for you only. Run it in a normal terminal: team-staging-login $project"
+fi
+team_require_cmd security pbcopy
+
+item="team-staging-$project"
+attrs=$(security find-generic-password -s "$item" 2>/dev/null) \
+  || team_die "$TEAM_EXIT_FAIL" "no keychain item $item (run team-provision staging --apply for $project first)"
+user=$(printf '%s\n' "$attrs" | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p' | head -n 1)
+[ -n "$user" ] || team_die "$TEAM_EXIT_FAIL" "keychain item $item has no account (username)"
+pass=$(security find-generic-password -s "$item" -a "$user" -w 2>/dev/null) \
+  || team_die "$TEAM_EXIT_FAIL" "could not read the password of $item"
+printf 'Username: %s\nPassword: %s\n' "$user" "$pass" | pbcopy
+pass=""
+echo "Copied the staging login for $project to the clipboard (username $user)."

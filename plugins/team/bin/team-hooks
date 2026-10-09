@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# team-hooks: the only way the pack sets core.hooksPath. Points git at .githooks, or, when
+# the repo already uses another hooks path, at generated wrappers that run .githooks/<hook>
+# and then chain to the previous path's hook.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-hooks [--check]
+
+Sets core.hooksPath for this repo (shared by all its worktrees):
+  - no hooks path yet (and no custom hooks in .git/hooks) → core.hooksPath=.githooks
+  - another path already set (e.g. .husky/_), or custom hooks in .git/hooks →
+    writes wrappers to <git common dir>/team-hooks/ that run .githooks/<hook> first
+    and then <previous>/<hook> when present (stdin is passed to both), sets
+    core.hooksPath to that folder and records the old path in team.previousHooksPath
+Safe to run twice: re-running refreshes the wrappers.
+
+  --check   report only; exit 1 when core.hooksPath is not set by team-hooks.
+Exit codes: 0 ok, 1 not set (--check) or failure, 2 usage, 5 not in a git repo.
+EOF
+}
+
+check=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --check) check=1; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+
+team_require_cmd git
+root=$(team_canon_dir "$(team_repo_root .)")
+common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)
+common=$(team_canon_dir "$common")
+wrap_dir="$common/team-hooks"
+current=$(git -C "$root" config --get core.hooksPath 2>/dev/null || true)
+previous=$(git -C "$root" config --get team.previousHooksPath 2>/dev/null || true)
+
+# Hooks a wrapper is always generated for (client-side, harmless when empty). Others are
+# wrapped only when one of the two folders has them, because some hooks change git's
+# behaviour just by existing (push-to-checkout, proc-receive, fsmonitor-watchman).
+STD_HOOKS="applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg commit-msg post-commit pre-rebase post-checkout post-merge pre-push post-rewrite pre-auto-gc"
+# Hooks git feeds on stdin: buffered so both hooks receive it.
+STDIN_HOOKS=" pre-push post-rewrite reference-transaction pre-receive post-receive "
+
+is_githooks() {
+  case "$1" in
+    .githooks|./.githooks|.githooks/|./.githooks/|"$root/.githooks"|"$root/.githooks/") return 0 ;;
+  esac
+  return 1
+}
+
+# custom (non-sample, executable) hooks in <common>/hooks
+custom_git_hooks() {
+  local f
+  [ -d "$common/hooks" ] || return 1
+  for f in "$common/hooks"/*; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    case "$f" in *.sample) continue ;; esac
+    return 0
+  done
+  return 1
+}
+
+state() {
+  if is_githooks "$current"; then
+    echo "core.hooksPath=.githooks"
+    return 0
+  fi
+  if [ -n "$current" ] && [ "$current" = "$wrap_dir" ] && [ -f "$wrap_dir/pre-commit" ]; then
+    echo "core.hooksPath=$wrap_dir (wrappers: .githooks, then ${previous:-nothing})"
+    return 0
+  fi
+  if [ -n "$current" ]; then
+    echo "core.hooksPath=$current (not set by team-hooks; run team-hooks to chain it)"
+  else
+    echo "core.hooksPath is not set (run team-hooks)"
+  fi
+  return 1
+}
+
+if [ "$check" = 1 ]; then
+  if state; then exit 0; else exit 1; fi
+fi
+
+# ---- decide -----------------------------------------------------------------------------
+if [ -z "$current" ] || is_githooks "$current"; then
+  if [ -z "$current" ] && custom_git_hooks; then
+    previous="$common/hooks"
+  else
+    git -C "$root" config core.hooksPath .githooks
+    git -C "$root" config --unset team.previousHooksPath 2>/dev/null || true
+    [ -d "$root/.githooks" ] || team_warn "$root/.githooks does not exist yet; hooks will run once it does"
+    echo "core.hooksPath=.githooks"
+    exit 0
+  fi
+elif [ "$current" != "$wrap_dir" ]; then
+  previous="$current"
+fi
+# else: already ours; refresh the wrappers for the recorded previous path
+
+if [ -z "$previous" ]; then
+  git -C "$root" config core.hooksPath .githooks
+  echo "core.hooksPath=.githooks"
+  exit 0
+fi
+
+# ---- generate wrappers -----------------------------------------------------------------------
+names=" $STD_HOOKS "
+prev_abs="$previous"
+case "$prev_abs" in /*) ;; *) prev_abs="$root/$prev_abs" ;; esac
+for d in "$root/.githooks" "$prev_abs"; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    [ -f "$f" ] || continue
+    n=$(basename "$f")
+    case "$n" in *.*|_*|h) continue ;; esac
+    case "$names" in *" $n "*) ;; *) names="$names$n " ;; esac
+  done
+done
+
+mkdir -p "$wrap_dir"
+quoted_prev=$(printf '%s' "$previous" | sed "s/'/'\\\\''/g")
+for n in $names; do
+  stdin_mode=pass
+  case "$STDIN_HOOKS" in *" $n "*) stdin_mode=buffer ;; esac
+  tmp="$wrap_dir/.$n.tmp.$$"
+  cat > "$tmp" <<EOF
+#!/usr/bin/env bash
+# Generated by team-hooks (dev-standards). Do not edit: re-run team-hooks instead.
+# Runs .githooks/$n, then the previous hooks path's $n. Git runs hooks from the
+# worktree root, so relative paths resolve per worktree.
+set -u
+hook='$n'
+prev='$quoted_prev'
+mode='$stdin_mode'
+first=".githooks/\$hook"
+second="\$prev/\$hook"
+buf=""
+if [ "\$mode" = buffer ]; then
+  buf=\$(mktemp "\${TMPDIR:-/tmp}/team-hook.XXXXXX") || exit 1
+  trap 'rm -f "\$buf"' EXIT
+  cat > "\$buf"
+fi
+run() {
+  if [ -n "\$buf" ]; then "\$@" < "\$buf"; else "\$@"; fi
+}
+if [ -f "\$first" ] && [ -x "\$first" ]; then
+  run "\$first" "\$@" || exit \$?
+fi
+if [ -f "\$second" ] && [ -x "\$second" ]; then
+  run "\$second" "\$@" || exit \$?
+fi
+exit 0
+EOF
+  chmod 755 "$tmp"
+  mv "$tmp" "$wrap_dir/$n"
+done
+
+git -C "$root" config team.previousHooksPath "$previous"
+git -C "$root" config core.hooksPath "$wrap_dir"
+echo "core.hooksPath=$wrap_dir (wrappers: .githooks, then $previous)"

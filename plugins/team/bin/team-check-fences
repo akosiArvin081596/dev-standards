@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# team-check-fences: prove the fences without crossing them. Feeds simulated tool calls
+# (never runs them) to the fence hook, checks the project's deny/ask rules and plugin
+# check, and reads the repo's GitHub settings back through team-verify-repo.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-check-fences [--hook PATH] [--offline]
+
+Run in a project checkout. Prints a pass/fail table of:
+  - the fence hook's decision for simulated tool calls (JSON on its stdin; nothing
+    is ever executed): one per forbidden action, plus allowed controls. VPS values
+    come from your real defaults.conf; the hook writes its log to a temp copy, so
+    fence.log is not filled with simulated denials.
+  - .claude/settings.json: the key deny and ask rules, the plugin enabled, no
+    defaultMode, auto memory off
+  - .claude/hooks/plugin-check (the team plugin installed and enabled)
+  - team-verify-repo for the repo's GitHub settings (skipped with --offline)
+
+  --hook PATH   fence to test (default: the plugin's hooks/fence)
+  --offline     skip team-verify-repo (no GitHub calls)
+Changes nothing. Exit codes: 0 all pass, 1 any failure, 2 usage, 5 missing hook or
+not in a git repo.
+EOF
+}
+
+hook="" offline=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --hook) [ $# -ge 2 ] || team_usage_error "--hook needs a path"; hook="$2"; shift 2 ;;
+    --hook=*) hook="${1#*=}"; shift ;;
+    --offline) offline=1; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+[ -n "$hook" ] || hook="$TEAM_PLUGIN_ROOT/hooks/fence"
+[ -f "$hook" ] && [ -x "$hook" ] || team_die "$TEAM_EXIT_PREREQ" "fence hook not found or not executable: $hook"
+team_require_cmd git jq
+root=$(team_canon_dir "$(team_repo_root .)")
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/team-check-fences.XXXXXX")
+chmod 700 "$scratch"
+trap 'rm -rf "${scratch:?}"' EXIT
+
+# ---- config: a private copy of the real one (real VPS values, separate fence.log) --------
+cfg="$scratch/config"
+mkdir -p "$cfg"
+for f in defaults.conf accounts.conf; do
+  [ -r "$TEAM_CONFIG_DIR/$f" ] && cp "$TEAM_CONFIG_DIR/$f" "$cfg/$f"
+done
+chmod -R go-rwx "$cfg"
+alias=$(team_default VPS_ALIAS "")
+ip=$(team_default VPS_IP "")
+vhost=$(team_default VPS_HOSTNAME "")
+domain=$(team_default DOMAIN "")
+admin=$(team_default VPS_ADMIN_USER "admin")
+forbidden=$(team_default VPS_FORBIDDEN_ALIASES "" | awk '{print $1}')
+[ -n "$ip" ] || ip="192.0.2.10"   # TEST-NET: never reachable
+
+# ---- a scratch repo on a feature branch (branch-dependent cases) ------------------------------
+repo="$scratch/repo"
+git init -q "$repo"
+git -C "$repo" checkout -q -b feat/1-fence-check
+git -C "$repo" -c user.name=fence-check -c user.email=fence-check@example.invalid \
+  -c core.hooksPath=/dev/null commit -q --allow-empty -m "chore: fence check scratch"
+git -C "$repo" remote add origin "git@github.com:example/fence-check.git"
+mkdir -p "$repo/.claude/hooks"
+sha=$(git -C "$repo" rev-parse HEAD)
+
+rows=""
+fails=0
+add_row() {   # add_row PASS|FAIL <expected> <got> <label> <detail>
+  rows="$rows$1|$2|$3|$4|$5
+"
+  [ "$1" = PASS ] || fails=$((fails + 1))
+}
+
+# case_json <tool> <agent_type|""> <field> <value>
+case_json() {
+  jq -cn --arg tool "$1" --arg agent "$2" --arg field "$3" --arg value "$4" --arg cwd "$repo" '
+    {session_id: "team-check-fences", transcript_path: "/dev/null", cwd: $cwd,
+     permission_mode: "bypassPermissions", hook_event_name: "PreToolUse",
+     tool_name: $tool, tool_input: {($field): $value}, tool_use_id: "toolu_check"}
+    + (if $agent == "" then {} else {agent_type: $agent, agent_id: "agent-check"} end)'
+}
+
+decide() {   # decide <json> → sets DECISION (allow|deny) and REASON
+  local out rc=0
+  out=$(printf '%s' "$1" | (cd "$repo" && TEAM_CONFIG_DIR="$cfg" CLAUDE_PLUGIN_ROOT="$TEAM_PLUGIN_ROOT" \
+    CLAUDE_PROJECT_DIR="$repo" "$hook") 2>"$scratch/stderr") || rc=$?
+  REASON=""
+  if [ "$rc" = 2 ]; then
+    DECISION=deny
+    REASON=$(head -n 1 "$scratch/stderr")
+  elif [ "$rc" = 0 ] && [ "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)" = deny ]; then
+    DECISION=deny
+    REASON=$(printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""' 2>/dev/null)
+  elif [ "$rc" = 0 ]; then
+    DECISION=allow
+  else
+    DECISION=allow
+    REASON="hook exited $rc (Claude Code lets the call through)"
+  fi
+  REASON=$(printf '%s' "$REASON" | tr '\n\t|' '   ' | cut -c1-70)
+}
+
+check() {   # check <deny|allow> <label> <tool> <agent> <field> <value>
+  decide "$(case_json "$3" "$4" "$5" "$6")"
+  if [ "$DECISION" = "$1" ]; then add_row PASS "$1" "$DECISION" "$2" "$REASON"; else add_row FAIL "$1" "$DECISION" "$2" "$REASON"; fi
+}
+bash_deny() { check deny "$1" Bash "${3:-}" command "$2"; }
+bash_allow() { check allow "$1" Bash "${3:-}" command "$2"; }
+
+# ---- forbidden actions -----------------------------------------------------------------------
+bash_deny "push to main" "git push origin main"
+bash_deny "push HEAD:main" "git push origin HEAD:main"
+bash_deny "push to main in a compound command" "git status && git push origin main"
+bash_deny "push to main via git -C" "git -C . push origin HEAD:main"
+bash_deny "push to main in a subshell" "(cd . && git push origin HEAD:refs/heads/main)"
+bash_deny "push to main via bash -c" "bash -c 'git push origin main'"
+bash_deny "push to a release-please branch" "git push origin HEAD:release-please--branches--main"
+bash_deny "force push" "git push --force origin feat/1-fence-check"
+bash_deny "force push with +refspec" "git push origin +feat/1-fence-check"
+bash_deny "create a tag" "git tag v9.9.9"
+bash_deny "push tags" "git push origin --tags"
+bash_deny "push a tag ref" "git push origin refs/tags/v9.9.9"
+bash_deny "create a release" "gh release create v9.9.9 --notes x"
+bash_deny "delete a release (team-gh)" "team-gh release delete v9.9.9 --yes"
+bash_deny "merge with --admin" "gh pr merge 1 --admin --squash"
+bash_deny "merge without --auto" "team-gh pr merge 1 --squash"
+bash_deny "skip hooks (--no-verify)" "git commit --no-verify -m 'feat: x'"
+bash_deny "change core.hooksPath" "git config core.hooksPath /tmp/hooks"
+bash_deny "raw gh write: pr create" "gh pr create --title 'feat: x' --body x"
+bash_deny "raw gh write with GH_TOKEN prefix" "GH_TOKEN=x gh issue comment 1 --body hi"
+bash_deny "gh api POST (-X)" "gh api repos/example/fence-check/issues -X POST -f title=x"
+bash_deny "gh api implicit POST (-f)" "gh api repos/example/fence-check/issues -f title=x"
+bash_deny "gh api GraphQL mutation" "gh api graphql -f query='mutation { addStar(input: {starrableId: \"x\"}) { clientMutationId } }'"
+bash_deny "curl POST to api.github.com" "curl -X POST https://api.github.com/repos/example/fence-check/issues -d '{\"title\":\"x\"}'"
+check deny "owner-approved from a subagent" Bash team:team-reviewer command "team-gh pr edit 1 --add-label owner-approved"
+bash_deny "owner-approved in another form" "team-gh pr edit 1 --add-label owner-approved,bug"
+check deny "team-post-check from the wrong agent" Bash team:team-qa command "team-post-check $sha ai-review success ok"
+bash_deny "team-post-check from the main session" "team-post-check $sha ai-review success ok"
+bash_deny "read a token: gh auth token" "gh auth token"
+bash_deny "read credentials: git credential fill" "printf 'host=github.com\\n' | git credential fill"
+bash_deny "read an SSH private key" "cat ~/.ssh/id_ed25519"
+bash_deny "read the keychain" "security find-generic-password -s team-release-please-token -w"
+bash_deny "read a production env file" "cat .env.production"
+bash_deny "write .claude/settings.json (Bash)" "echo '{}' > .claude/settings.json"
+check deny "write .claude/settings.json (Write tool)" Write "" file_path "$repo/.claude/settings.json"
+check deny "edit .claude/hooks/ (Edit tool)" Edit "" file_path "$repo/.claude/hooks/plugin-check"
+bash_deny "python3 -c writes settings.local.json" "python3 -c \"open('.claude/settings.local.json','w').write('{}')\""
+bash_deny "ssh to the VPS by IP" "ssh $admin@$ip uptime"
+[ -n "$vhost" ] && bash_deny "ssh to the VPS by hostname" "ssh $vhost uptime"
+[ -n "$domain" ] && bash_deny "ssh to the domain" "ssh $domain uptime"
+[ -n "$forbidden" ] && bash_deny "ssh to a forbidden alias" "ssh $forbidden uptime"
+bash_deny "ssh to an unknown host" "ssh unknown-host.example.org uptime"
+bash_deny "scp to the VPS by IP" "scp ./file $ip:/tmp/"
+if [ -n "$alias" ]; then
+  bash_deny "ssh -o ProxyCommand" "ssh -o ProxyCommand='nc %h %p' $alias uptime"
+  bash_deny "ssh -J jump host" "ssh -J jump.example.org $alias uptime"
+fi
+bash_deny "nested claude -p" "claude -p 'hello'"
+bash_deny "disguised: eval" "eval 'git push origin main'"
+bash_deny "disguised: base64 into a shell" "echo Z2l0IHB1c2ggb3JpZ2luIG1haW4= | base64 -d | bash"
+bash_deny "disguised: command from a variable" "g=git; \$g push origin main"
+bash_deny "disguised: command from quotes" "\"gi\"\"t\" push origin main"
+bash_deny "production deploy" "team-deploy production --apply"
+bash_deny "production flag" "team-flag production new-checkout on"
+
+# ---- allowed controls ---------------------------------------------------------------------------
+bash_allow "git status" "git status"
+bash_allow "first push of a feature branch" "git push -u origin HEAD"
+bash_allow "team-gh pr create --body-file" "team-gh pr create --title 'feat: add x' --body-file .team/pr-body.md"
+bash_allow "team-gh auto-merge" "team-gh pr merge 1 --auto --squash --delete-branch"
+bash_allow "read-only gh" "gh pr view 1 --json title,state"
+bash_allow "commit message mentioning push to main" "git commit -m 'docs: explain why agents never push to main'"
+bash_allow "plain read of a fence file" "cat .claude/settings.json"
+check allow "team-post-check from the matching agent" Bash team:team-reviewer command "team-post-check $sha ai-review success 'reviewed'"
+[ -n "$alias" ] && bash_allow "ssh to the VPS alias (asks the owner)" "ssh $alias uptime"
+
+# ---- settings rules ------------------------------------------------------------------------------
+settings="$root/.claude/settings.json"
+if [ ! -r "$settings" ] || ! jq -e . "$settings" >/dev/null 2>&1; then
+  add_row FAIL "present" "missing" "settings: .claude/settings.json" "missing or not valid JSON"
+else
+  for r in "Bash(git push --force *)" "Bash(git tag *)" "Bash(gh auth token *)" "Bash(gh release create *)" \
+           "Bash(gh pr merge *)" "Bash(team-deploy production *)" "Bash(team-flag production *)" \
+           "Bash(claude -p *)" "Bash(security find-generic-password *)" "Read(~/.ssh/**)" "Edit(~/.claude/**)"; do
+    if jq -e --arg r "$r" '(.permissions.deny // []) | index($r) != null' "$settings" >/dev/null; then
+      add_row PASS deny deny "settings deny: $r" ""
+    else
+      add_row FAIL deny missing "settings deny: $r" "rule not found"
+    fi
+  done
+  if jq -e '(.permissions.deny // []) | any(test("^Edit\\(.*\\.claude/settings\\*\\.json\\)$"))' "$settings" >/dev/null; then
+    add_row PASS deny deny "settings deny: Edit(.claude/settings*.json)" ""
+  else
+    add_row FAIL deny missing "settings deny: Edit(.claude/settings*.json)" "rule not found"
+  fi
+  for r in "Bash(ssh *)" "Bash(scp *)" "Bash(team-discover *)" "Bash(team-provision *)" "Bash(team-flag *)" \
+           "Bash(team-refresh-staging *)" "Bash(team-bootstrap-repo *--apply*)" \
+           "Bash(team-gh pr edit * --add-label owner-approved)"; do
+    if jq -e --arg r "$r" '((.permissions.ask // []) + (.permissions.deny // [])) | index($r) != null' "$settings" >/dev/null; then
+      add_row PASS "ask/deny" present "settings yes-moment: $r" ""
+    else
+      add_row FAIL "ask/deny" missing "settings yes-moment: $r" "rule not found"
+    fi
+  done
+  if jq -e '(.permissions.defaultMode == null) and (.defaultMode == null)' "$settings" >/dev/null; then
+    add_row PASS unset unset "settings: no defaultMode" ""
+  else
+    add_row FAIL unset set "settings: no defaultMode" "defaultMode must never be set"
+  fi
+  if jq -e --arg id "$TEAM_PLUGIN_ID" '.enabledPlugins[$id] == true' "$settings" >/dev/null; then
+    add_row PASS enabled enabled "settings: $TEAM_PLUGIN_ID enabled" ""
+  else
+    add_row FAIL enabled missing "settings: $TEAM_PLUGIN_ID enabled" ""
+  fi
+  if jq -e '.autoMemoryEnabled == false' "$settings" >/dev/null; then
+    add_row PASS off off "settings: autoMemoryEnabled false" ""
+  else
+    add_row FAIL off on "settings: autoMemoryEnabled false" ""
+  fi
+fi
+
+# ---- plugin check --------------------------------------------------------------------------------
+pc="$root/.claude/hooks/plugin-check"
+if [ -x "$pc" ]; then
+  pc_out=$(CLAUDE_PROJECT_DIR="$root" "$pc" </dev/null 2>/dev/null || true)
+  if [ -z "$pc_out" ]; then
+    add_row PASS ok ok "plugin-check: team plugin installed and enabled" ""
+  else
+    msg=$(printf '%s' "$pc_out" | jq -r '.systemMessage // empty' 2>/dev/null | cut -c1-70)
+    add_row FAIL ok warning "plugin-check: team plugin installed and enabled" "${msg:-warning printed}"
+  fi
+else
+  add_row FAIL present missing "plugin-check: .claude/hooks/plugin-check" "missing or not executable"
+fi
+
+# ---- GitHub settings ------------------------------------------------------------------------------
+verify="$TEAM_BIN_DIR/team-verify-repo"
+verify_out=""
+if [ "$offline" = 1 ]; then
+  add_row PASS skip skip "team-verify-repo" "skipped (--offline)"
+elif [ ! -x "$verify" ]; then
+  add_row FAIL present missing "team-verify-repo" "not installed in $TEAM_BIN_DIR"
+else
+  slug_repo=$(team_conf_get "$root/ops/project.conf" GITHUB_REPO "")
+  [ -n "$slug_repo" ] || slug_repo=$(team_origin_repo "$root")
+  case "$slug_repo" in
+    */dev-standards) profile=standards ;;
+    */project-starter) profile=template ;;
+    *) profile=project ;;
+  esac
+  vrc=0
+  verify_out=$(cd "$root" && "$verify" "$slug_repo" --profile "$profile" 2>&1) || vrc=$?
+  if [ "$vrc" = 0 ]; then
+    add_row PASS pass pass "team-verify-repo $slug_repo ($profile)" ""
+  else
+    add_row FAIL pass "exit $vrc" "team-verify-repo $slug_repo ($profile)" "see its table above"
+  fi
+fi
+
+# ---- table ------------------------------------------------------------------------------------------
+[ -z "$verify_out" ] || { printf '%s\n\n' "$verify_out"; }
+printf '%-5s  %-8s  %-8s  %-50s  %s\n' RESULT EXPECTED GOT CHECK DETAIL
+printf '%s\n' "$rows" | while IFS='|' read -r res exp got label detail; do
+  [ -n "$res" ] || continue
+  printf '%-5s  %-8s  %-8s  %-50s  %s\n' "$res" "$exp" "$got" "$label" "$detail"
+done
+total=$(printf '%s' "$rows" | grep -c . || true)
+echo
+echo "$((total - fails))/$total checks passed (hook: $hook)"
+[ "$fails" = 0 ] || exit 1

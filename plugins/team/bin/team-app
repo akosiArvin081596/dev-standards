@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# team-app: start, stop or report this worktree's app (`make dev` in its own process group).
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-app up|down|status [--timeout S]
+
+Run in a worktree (or the main checkout). Reads PORT and APP_URL from the env file
+(ENV_FILE, default .env) and HEALTH_PATH (default /health) from ops/project.conf.
+
+  up       starts `make dev` in its own process group with PORT and APP_URL exported,
+           logging to .team/app.log, pidfile .team/app.pid (pid|pgid|cwd|utc), and
+           waits up to --timeout seconds (default 90) for APP_URL+HEALTH_PATH to answer.
+           Already running → reports it. Refuses when another process holds PORT.
+  down     stops the recorded process group (TERM, then KILL after 10 s) after
+           checking with lsof that it still works inside this worktree; removes the
+           pidfile. Never touches processes it did not start.
+  status   prints state=running|stopped, pid, url and health.
+
+Prints key=value lines (state pid url health). Exit codes: 0 ok, 1 failure (app
+exited or not healthy in time), 2 usage, 3 `make dev` not configured, 4 refused
+(port taken by another process, pidfile points elsewhere).
+EOF
+}
+
+action="" timeout=90
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --timeout) [ $# -ge 2 ] || team_usage_error "--timeout needs a value"; timeout="$2"; shift 2 ;;
+    --timeout=*) timeout="${1#*=}"; shift ;;
+    up|down|status) [ -z "$action" ] || team_usage_error "only one action"; action="$1"; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+[ -n "$action" ] || team_usage_error "missing action: up, down or status"
+case "$timeout" in ''|*[!0-9]*) team_usage_error "--timeout must be a number of seconds" ;; esac
+
+team_require_cmd git lsof
+root=$(team_canon_dir "$(team_repo_root .)")
+pconf="$root/ops/project.conf"
+env_name=$(team_conf_get "$pconf" ENV_FILE ".env")
+env_file="$root/$env_name"
+port=$(team_env_get "$env_file" PORT "")
+app_url=$(team_env_get "$env_file" APP_URL "")
+[ -n "$app_url" ] || { [ -n "$port" ] && app_url="http://localhost:$port"; }
+health_path=$(team_conf_get "$pconf" HEALTH_PATH "/health")
+case "$health_path" in /*) ;; *) health_path="/$health_path" ;; esac
+pidfile=$(team_app_pidfile "$root")
+log="$root/.team/app.log"
+
+healthy() { curl -fsS -o /dev/null --max-time 3 "${app_url%/}$health_path" 2>/dev/null; }
+
+report() {
+  local state="$1" pid="${2:-}" health="unknown"
+  if [ "$state" = running ]; then
+    if healthy; then health=ok; else health=starting; fi
+  else
+    health=down
+  fi
+  printf 'state=%s\npid=%s\nurl=%s\nhealth=%s\n' "$state" "$pid" "$app_url" "$health"
+}
+
+stop_group() {
+  local pgid="$1" i
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  for ((i = 0; i < 20; i++)); do
+    [ -n "$(team_pgid_members "$pgid")" ] || return 0
+    sleep 0.5
+  done
+  team_warn "process group $pgid did not stop after TERM; sending KILL"
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+  for ((i = 0; i < 10; i++)); do
+    [ -n "$(team_pgid_members "$pgid")" ] || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+case "$action" in
+  status)
+    if r=$(team_app_running "$root"); then
+      report running "${r%% *}"
+    else
+      report stopped
+    fi
+    ;;
+
+  down)
+    if [ ! -e "$pidfile" ]; then
+      report stopped
+      exit 0
+    fi
+    if r=$(team_app_running "$root"); then
+      pgid="${r#* }"
+      stop_group "$pgid" || team_die "$TEAM_EXIT_FAIL" "process group $pgid is still running"
+      rm -f "$pidfile"
+      team_info "stopped the app (process group $pgid)"
+    else
+      IFS='|' read -r opid opgid ocwd orest < "$pidfile" || true
+      if [ -n "${opgid:-}" ] && [ -n "$(team_pgid_members "$opgid" 2>/dev/null)" ]; then
+        team_warn "process group ${opgid} no longer works inside $root (reused PID?); not touching it"
+      fi
+      rm -f "$pidfile"
+      : "${opid:-}" "${ocwd:-}" "${orest:-}"
+    fi
+    report stopped
+    ;;
+
+  up)
+    [ -n "$port" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no PORT in $env_file (create the worktree with team-new-worktree)"
+    team_require_cmd make curl
+    mkdir -p "$root/.team"
+    started=0
+    if r=$(team_app_running "$root"); then
+      pid="${r%% *}"
+      team_info "already running (pid $pid)"
+    else
+      started=1
+      rm -f "$pidfile"
+      if team_port_listening "$port"; then
+        holder=$(team_port_listener_pids "$port" | tr '\n' ' ')
+        team_die "$TEAM_EXIT_REFUSED" "port $port is already in use by another process (pid ${holder% }); not starting a second app"
+      fi
+      printf '== %s team-app up (port %s) ==\n' "$(team_utc_now)" "$port" > "$log"
+      set -m
+      (cd "$root" && PORT="$port" APP_URL="$app_url" exec nohup make dev >> "$log" 2>&1 < /dev/null) &
+      pid=$!
+      set +m
+      pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+      [ -n "$pgid" ] || pgid="$pid"
+      printf '%s|%s|%s|%s\n' "$pid" "$pgid" "$root" "$(team_utc_now)" > "$pidfile"
+      team_info "started make dev (pid $pid, log .team/app.log)"
+    fi
+
+    waited=0
+    while :; do
+      if healthy; then
+        report running "$pid"
+        exit 0
+      fi
+      if ! team_pid_alive "$pid"; then
+        if [ "$started" = 0 ]; then
+          rm -f "$pidfile"
+          team_die "$TEAM_EXIT_FAIL" "the running app (pid $pid) exited; run team-app up again"
+        fi
+        rc=0
+        wait "$pid" 2>/dev/null || rc=$?
+        rm -f "$pidfile"
+        st=1
+        team_make_status "$log" dev "$rc" || st=$?
+        [ "$rc" -ne 0 ] || st=1
+        if [ "$st" = 3 ]; then
+          team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: make dev is not filled in for this stack yet"
+        fi
+        tail -n 20 "$log" >&2 || true
+        team_die "$TEAM_EXIT_FAIL" "make dev exited (status $rc) before ${app_url%/}$health_path answered; see .team/app.log"
+      fi
+      [ "$waited" -lt "$timeout" ] || break
+      sleep 1
+      waited=$((waited + 1))
+    done
+    tail -n 20 "$log" >&2 || true
+    team_die "$TEAM_EXIT_FAIL" "not healthy after ${timeout}s; it is still starting (see .team/app.log), stop it with: team-app down"
+    ;;
+esac

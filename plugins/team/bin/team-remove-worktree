@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# team-remove-worktree: stop a worktree's app, drop only the database the pack recorded
+# for it, free its port, remove the worktree, and delete its branch once the PR is merged.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-remove-worktree <path|issue> [--force]
+
+Removes one pack worktree (under <main>/.claude/worktrees/), run from the main
+checkout or any worktree of the same repo:
+  1. refuses a worktree with uncommitted or untracked changes unless --force
+  2. team-app down there
+  3. drops a database ONLY when databases.registry records it for this worktree
+     and (Postgres) its comment starts with "team-pack:"; never by name pattern
+  4. frees the port in ports.registry
+  5. unlinks <worktree>/.team/evidence (the screenshots stay in the main checkout's
+     .team/evidence/) and runs git worktree remove
+  6. deletes the local branch only when its PR is merged (checked with gh)
+
+--force also removes a dirty worktree, and keeps a recorded database (with a
+warning) when its server cannot be reached.
+Prints key=value lines: removed branch branch_deleted dropped port_freed.
+Exit codes: 0 ok, 1 failure, 2 usage, 4 refused (dirty, not a pack worktree).
+EOF
+}
+
+target="" force=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --force) force=1; shift ;;
+    -*) team_usage_error "unknown option: $1" ;;
+    *) [ -z "$target" ] || team_usage_error "only one worktree"; target="$1"; shift ;;
+  esac
+done
+[ -n "$target" ] || team_usage_error "missing worktree path or issue number"
+
+team_require_cmd git lsof
+main=$(team_canon_dir "$(team_main_root .)")
+wt_base="$main/$TEAM_WORKTREES_SUBDIR"
+
+# ---- resolve the worktree --------------------------------------------------------------
+wt=""
+registered_paths=$(git -C "$main" worktree list --porcelain | sed -n 's/^worktree //p')
+case "$target" in
+  *[!0-9]*)
+    [ -d "$target" ] || team_die "$TEAM_EXIT_USAGE" "no such folder: $target"
+    wt=$(team_canon_dir "$target")
+    ;;
+  *)
+    while IFS= read -r p; do
+      case "$p" in
+        "$wt_base/$target-"*) case "${p#"$wt_base/"}" in */*) ;; *) wt="$p"; break ;; esac ;;
+      esac
+    done <<EOF
+$registered_paths
+EOF
+    [ -n "$wt" ] || team_die "$TEAM_EXIT_USAGE" "no pack worktree for issue #$target under $wt_base"
+    ;;
+esac
+[ "$wt" != "$main" ] || team_die "$TEAM_EXIT_REFUSED" "refusing to remove the main checkout"
+case "$wt" in
+  "$wt_base"/*) case "${wt#"$wt_base/"}" in */*) team_die "$TEAM_EXIT_REFUSED" "$wt is not a pack worktree folder" ;; esac ;;
+  *) team_die "$TEAM_EXIT_REFUSED" "$wt is not under $wt_base; the pack only removes its own worktrees" ;;
+esac
+printf '%s\n' "$registered_paths" | grep -Fxq "$wt" \
+  || team_die "$TEAM_EXIT_REFUSED" "$wt is not a registered worktree of $main"
+
+branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+
+# ---- 1. dirty check -----------------------------------------------------------------------
+if [ "$force" = 0 ]; then
+  dirty=$(git -C "$wt" status --porcelain --untracked-files=normal 2>/dev/null || echo "status-failed")
+  [ -z "$dirty" ] || team_die "$TEAM_EXIT_REFUSED" "$wt has uncommitted or untracked changes; commit or discard them, or pass --force"
+fi
+
+# ---- 2. stop the app ------------------------------------------------------------------------
+if ! (cd "$wt" && "$TEAM_SELF_DIR/team-app" down) >&2; then
+  team_warn "could not stop the app in $wt; continuing"
+fi
+
+# ---- 3. drop the recorded databases -----------------------------------------------------------
+dropped=""
+reg=$(team_db_registry)
+project=$(team_project_name "$wt")
+if [ -r "$reg" ]; then
+  entries=$(awk -F'|' -v w="$wt" '$6 == w' "$reg")
+  team_lock_acquire databases 120
+  trap 'team_lock_release databases' EXIT
+  while IFS='|' read -r engine h pt name rproject rwt created; do
+    [ -n "$engine" ] || continue
+    case "$name" in ''|*[!A-Za-z0-9_]*) team_warn "skipping registry entry with an unexpected name"; continue ;; esac
+    case "$engine" in
+      postgres)
+        u="${PGUSER:-$(id -un)}"; pw="${PGPASSWORD:-}"
+        env_name=$(team_conf_get "$wt/ops/project.conf" ENV_FILE ".env")
+        if [ "$(team_env_get "$wt/$env_name" DB_NAME "")" = "$name" ]; then
+          u=$(team_env_get "$wt/$env_name" DB_USER "$u")
+          pw=$(team_env_get "$wt/$env_name" DB_PASSWORD "$pw")
+        fi
+        if ! exists=$(team_pg_query "$h" "$pt" "$u" "$pw" "SELECT count(*) FROM pg_database WHERE datname = '$name'" 2>/dev/null); then
+          [ "$force" = 1 ] || team_die "$TEAM_EXIT_FAIL" "cannot reach Postgres on $h:$pt to drop $name; start it and re-run (or --force to keep the database)"
+          team_warn "cannot reach Postgres on $h:$pt; keeping database $name and its registry entry"
+          continue
+        fi
+        if [ "$exists" = "0" ]; then
+          team_db_unregister "$engine" "$pt" "$name" "$wt"
+          continue
+        fi
+        comment=$(team_pg_comment "$h" "$pt" "$u" "$pw" "$name")
+        case "$comment" in
+          team-pack:*)
+            team_pg_drop "$h" "$pt" "$u" "$pw" "$name"
+            dropped="$dropped $name"
+            team_info "dropped database $name on $h:$pt"
+            ;;
+          *)
+            team_warn "database $name on $h:$pt is recorded but its comment is not the pack's marker; leaving it in place"
+            ;;
+        esac
+        team_db_unregister "$engine" "$pt" "$name" "$wt"
+        ;;
+      mysql|mariadb)
+        c=$(team_mysql_container "${rproject:-$project}")
+        pw=$(team_conf_get "$TEAM_CONFIG_DIR/projects/${rproject:-$project}.conf" LOCAL_DB_PASSWORD "")
+        if [ -z "$pw" ] || ! team_mysql_query "$c" "$pw" "SELECT 1" >/dev/null 2>&1; then
+          [ "$force" = 1 ] || team_die "$TEAM_EXIT_FAIL" "cannot reach container $c to drop $name; start it (docker start $c) and re-run (or --force to keep the database)"
+          team_warn "cannot reach container $c; keeping database $name and its registry entry"
+          continue
+        fi
+        team_mysql_query "$c" "$pw" "DROP DATABASE IF EXISTS \`$name\`" >/dev/null
+        dropped="$dropped $name"
+        team_info "dropped database $name in $c"
+        team_db_unregister "$engine" "$pt" "$name" "$wt"
+        ;;
+      *) team_warn "unknown engine '$engine' in the registry; leaving $name" ;;
+    esac
+    : "$rwt" "$created"
+  done <<EOF
+$entries
+EOF
+  team_lock_release databases
+  trap - EXIT
+fi
+
+# ---- 4. free the port ------------------------------------------------------------------------
+team_lock_acquire ports 120
+trap 'team_lock_release ports' EXIT
+port_freed=$(team_port_of_worktree "$wt")
+team_registry_remove "$(team_ports_registry)" 2 "$wt"
+team_lock_release ports
+trap - EXIT
+
+# ---- 5. remove the worktree (the evidence link only, never its target) ---------------------------
+if [ -L "$wt/.team/evidence" ]; then
+  rm -f "$wt/.team/evidence"
+fi
+if [ "$force" = 1 ]; then
+  git -C "$main" worktree remove --force "$wt" >&2
+else
+  git -C "$main" worktree remove "$wt" >&2
+fi
+
+# ---- 6. delete the branch once its PR is merged -----------------------------------------------
+branch_deleted=no
+if [ -n "$branch" ] && git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+  if merged=$(cd "$main" && team_gh pr list --head "$branch" --state merged --json number 2>/dev/null); then
+    n=$(printf '%s' "$merged" | jq 'length' 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 0 ]; then
+      git -C "$main" branch -D "$branch" >&2
+      branch_deleted=yes
+    else
+      team_info "kept branch $branch (no merged PR for it)"
+    fi
+  else
+    team_warn "could not check the PR state for $branch; kept the branch"
+  fi
+fi
+
+printf 'removed=%s\n' "$wt"
+printf 'branch=%s\n' "$branch"
+printf 'branch_deleted=%s\n' "$branch_deleted"
+printf 'dropped=%s\n' "${dropped# }"
+printf 'port_freed=%s\n' "$port_freed"

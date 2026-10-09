@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# team-new-worktree: create (or finish) the worktree for one issue, with its own branch,
+# port, env file, database, evidence link and (optional) agent identity.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-new-worktree <issue> [--type T] [--slug S] [--no-setup]
+
+Creates the worktree for an issue, run from the project's main checkout or any of
+its worktrees:
+  branch    <type>/<issue>-<slug>, from origin/main with --no-track
+  folder    <main>/.claude/worktrees/<issue>-<slug>
+  port      first free port in WORKTREE_PORT_MIN..WORKTREE_PORT_MAX (default 8000-8099),
+            recorded in ports.registry under the ports lock
+  env file  .env.example copied to ENV_FILE (default .env) with PORT, APP_URL,
+            APP_TIMEZONE, DB_*, DATABASE_URL (if present), PLAYWRIGHT_PROFILE_DIR,
+            TEAM_WORKTREE=1 and sandbox/log modes for outside services
+  database  DB_ENGINE from ops/project.conf: postgres → created on LOCAL_PG_HOST:LOCAL_PG_PORT
+            with comment team-pack:<project>:<path>; mysql/mariadb → created in the project
+            container team-<project>-db; recorded in databases.registry; none → skipped
+  evidence  <worktree>/.team/evidence → <main>/.team/evidence (survives removal)
+  identity  with an agent line in accounts.conf: per-worktree user.name, user.email and
+            remote.origin.pushurl over the agent's SSH alias
+Then, unless --no-setup: `make setup` (not configured → notice) and team-db-pull
+(cached snapshot, else SEED_CMD).
+
+Without --type/--slug they come from the issue (gh): labels bug → fix,
+feature/client-request → feat (default feat); slug from the title. With both
+given there is no gh call, so <issue> may be any number (review-pr passes a PR
+number: team-new-worktree <pr> --type chore --slug review).
+
+Safe to run twice: an existing worktree for the issue is reused and any missing step
+is completed. Prints key=value lines on stdout:
+  path branch port db app_url env_file identity
+Exit codes: 0 ok, 1 failure, 2 usage, 4 refused (foreign database or container),
+5 missing prerequisite.
+EOF
+}
+
+issue="" type="" slug="" setup=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --type) [ $# -ge 2 ] || team_usage_error "--type needs a value"; type="$2"; shift 2 ;;
+    --type=*) type="${1#*=}"; shift ;;
+    --slug) [ $# -ge 2 ] || team_usage_error "--slug needs a value"; slug="$2"; shift 2 ;;
+    --slug=*) slug="${1#*=}"; shift ;;
+    --no-setup) setup=0; shift ;;
+    -*) team_usage_error "unknown option: $1" ;;
+    *) [ -z "$issue" ] || team_usage_error "only one issue number"; issue="$1"; shift ;;
+  esac
+done
+[ -n "$issue" ] || team_usage_error "missing issue number"
+case "$issue" in *[!0-9]*|0*) team_usage_error "issue must be a positive number: $issue" ;; esac
+if [ -n "$type" ]; then
+  case "$type" in feat|fix|chore|docs|refactor|hotfix) ;; *) team_usage_error "type must be one of feat fix chore docs refactor hotfix" ;; esac
+fi
+if [ -n "$slug" ]; then
+  case "$slug" in *[!a-z0-9-]*|-*|*-) team_usage_error "slug must match [a-z0-9-]{1,40}" ;; esac
+  [ "${#slug}" -le 40 ] || team_usage_error "slug must be at most 40 characters"
+fi
+
+team_require_cmd git awk lsof
+main=$(team_main_root .)
+main=$(team_canon_dir "$main")
+wt_base="$main/$TEAM_WORKTREES_SUBDIR"
+
+# ---- find an existing worktree for this issue (any slug) -------------------------
+existing=""
+while IFS= read -r line; do
+  case "$line" in
+    "worktree $wt_base/$issue-"*)
+      p="${line#worktree }"
+      case "${p#"$wt_base/"}" in */*) continue ;; esac
+      existing="$p"
+      break
+      ;;
+  esac
+done <<EOF
+$(git -C "$main" worktree list --porcelain)
+EOF
+
+if [ -n "$existing" ] && [ -d "$existing" ]; then
+  wt="$existing"
+  branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+  team_info "reusing existing worktree $wt"
+else
+  if [ -z "$type" ] || [ -z "$slug" ]; then
+    json=$(cd "$main" && team_gh issue view "$issue" --json title,labels) \
+      || team_die "$TEAM_EXIT_FAIL" "could not read issue #$issue (pass --type and --slug to skip the lookup)"
+    if [ -z "$type" ]; then
+      labels=" $(printf '%s' "$json" | jq -r '[.labels[]?.name] | join(" ")') "
+      case "$labels" in
+        *" bug "*) type=fix ;;
+        *) type=feat ;;
+      esac
+    fi
+    if [ -z "$slug" ]; then
+      slug=$(team_slugify "$(printf '%s' "$json" | jq -r '.title // ""')")
+      [ -n "$slug" ] || slug="issue"
+    fi
+  fi
+  branch="$type/$issue-$slug"
+  wt="$wt_base/$issue-$slug"
+  git check-ref-format "refs/heads/$branch" || team_usage_error "invalid branch name: $branch"
+
+  team_lock_acquire worktrees 120
+  trap 'team_lock_release worktrees' EXIT
+  if ! git -C "$main" fetch --quiet origin main >&2; then
+    git -C "$main" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null \
+      || team_die "$TEAM_EXIT_FAIL" "git fetch origin main failed and there is no origin/main yet"
+    team_warn "git fetch origin main failed; using the last fetched origin/main"
+  fi
+  mkdir -p "$wt_base"
+  if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+    team_info "branch $branch exists; checking it out in $wt"
+    git -C "$main" worktree add "$wt" "$branch" >&2 || team_die "$TEAM_EXIT_FAIL" "git worktree add failed for $branch"
+  else
+    git -C "$main" worktree add -b "$branch" --no-track "$wt" origin/main >&2 \
+      || team_die "$TEAM_EXIT_FAIL" "git worktree add failed for $branch"
+  fi
+  team_lock_release worktrees
+  trap - EXIT
+  wt=$(team_canon_dir "$wt")
+fi
+
+# ---- project settings (from the worktree's own copy of ops/project.conf) ---------
+pconf="$wt/ops/project.conf"
+project=$(team_project_name "$wt")
+env_name=$(team_conf_get "$pconf" ENV_FILE ".env")
+case "$env_name" in /*|*..*) team_die "$TEAM_EXIT_NOT_CONFIGURED" "ENV_FILE must be a relative path inside the repo" ;; esac
+env_file="$wt/$env_name"
+engine=$(team_conf_get "$pconf" DB_ENGINE "none")
+tz=$(team_conf_get "$pconf" PROJECT_TIMEZONE "")
+[ -n "$tz" ] || tz=$(team_default DEFAULT_TIMEZONE "UTC")
+
+# ---- evidence link: screenshots live in the main checkout -------------------------
+mkdir -p "$main/.team/evidence" "$wt/.team"
+ev="$wt/.team/evidence"
+if [ -L "$ev" ]; then
+  [ "$(readlink "$ev")" = "$main/.team/evidence" ] || ln -sfn "$main/.team/evidence" "$ev"
+elif [ -d "$ev" ]; then
+  if rmdir "$ev" 2>/dev/null; then
+    ln -s "$main/.team/evidence" "$ev"
+  else
+    team_warn "$ev is a non-empty folder; leaving it (move its files to $main/.team/evidence)"
+  fi
+else
+  ln -s "$main/.team/evidence" "$ev"
+fi
+
+# ---- identity: optional agent machine account -------------------------------------
+identity=$(team_agent_login)
+if [ -n "$identity" ]; then
+  a_alias=$(team_account_field "$identity" 3 || true)
+  a_name=$(team_account_field "$identity" 4 || true)
+  a_email=$(team_account_field "$identity" 5 || true)
+  if [ "$(git -C "$main" config --bool --get extensions.worktreeConfig 2>/dev/null || true)" != "true" ]; then
+    git -C "$main" config extensions.worktreeConfig true
+  fi
+  [ -n "$a_name" ] && git -C "$wt" config --worktree user.name "$a_name"
+  [ -n "$a_email" ] && git -C "$wt" config --worktree user.email "$a_email"
+  if [ -n "$a_alias" ]; then
+    slug_repo=$(team_origin_repo "$wt")
+    git -C "$wt" config --worktree remote.origin.pushurl "git@$a_alias:$slug_repo.git"
+  else
+    team_warn "agent $identity has no SSH alias in accounts.conf; pushes keep the default remote"
+  fi
+else
+  identity=$(team_github_account "$main" 2>/dev/null || true)
+fi
+
+# ---- port ---------------------------------------------------------------------------
+pmin=$(team_default WORKTREE_PORT_MIN 8000)
+pmax=$(team_default WORKTREE_PORT_MAX 8099)
+case "$pmin$pmax" in *[!0-9]*) team_die "$TEAM_EXIT_NOT_CONFIGURED" "WORKTREE_PORT_MIN/MAX must be numbers" ;; esac
+
+team_lock_acquire ports 120
+trap 'team_lock_release ports' EXIT
+team_ports_prune
+port=$(team_port_of_worktree "$wt")
+if [ -z "$port" ]; then
+  taken=" "
+  reg=$(team_ports_registry)
+  if [ -r "$reg" ]; then
+    while IFS='|' read -r p w rest || [ -n "$p" ]; do
+      [ -n "$p" ] && [ "$w" != "$wt" ] && taken="$taken$p "
+    done < "$reg"
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        w="${line#worktree }"
+        [ "$w" = "$wt" ] && continue
+        p=$(team_conf_get "$w/$env_name" PORT "")
+        [ -n "$p" ] && taken="$taken$p "
+        ;;
+    esac
+  done <<EOF
+$(git -C "$main" worktree list --porcelain)
+EOF
+  # this worktree's env file may already hold a usable port (registry lost)
+  mine=$(team_conf_get "$env_file" PORT "")
+  if [ -n "$mine" ] && [ "$mine" -ge "$pmin" ] 2>/dev/null && [ "$mine" -le "$pmax" ] \
+     && case "$taken" in *" $mine "*) false ;; *) true ;; esac && ! team_port_listening "$mine"; then
+    port="$mine"
+  else
+    p="$pmin"
+    while [ "$p" -le "$pmax" ]; do
+      case "$taken" in
+        *" $p "*) ;;
+        *) team_port_listening "$p" || { port="$p"; break; } ;;
+      esac
+      p=$((p + 1))
+    done
+  fi
+  [ -n "$port" ] || team_die "$TEAM_EXIT_FAIL" "no free port in $pmin-$pmax"
+  team_registry_add "$(team_ports_registry)" "$port|$wt|$project|$(team_utc_now)"
+fi
+team_lock_release ports
+trap - EXIT
+
+# ---- env file -------------------------------------------------------------------------
+if [ ! -e "$env_file" ]; then
+  mkdir -p "$(dirname "$env_file")"
+  ( umask 077
+    if [ -r "$wt/.env.example" ]; then cat "$wt/.env.example" > "$env_file"; else : > "$env_file"; fi )
+  chmod 600 "$env_file"
+fi
+app_url="http://localhost:$port"
+team_env_set "$env_file" PORT "$port"
+team_env_set "$env_file" APP_URL "$app_url"
+team_env_set "$env_file" APP_TIMEZONE "$tz"
+team_env_set "$env_file" PLAYWRIGHT_PROFILE_DIR ".team/playwright-profile"
+team_env_set "$env_file" TEAM_WORKTREE "1"
+team_env_set "$env_file" MAIL_MODE "log"
+team_env_set "$env_file" SMS_MODE "log"
+team_env_set "$env_file" PAYMENTS_MODE "sandbox"
+team_env_set "$env_file" WEBHOOKS_MODE "log"
+mkdir -p "$wt/.team/playwright-profile"
+
+# ---- database -----------------------------------------------------------------------
+db=""
+case "$engine" in
+  none|"") ;;
+  postgres)
+    team_require_cmd psql
+    db=$(team_db_name "$project" "$issue")
+    h=$(team_default LOCAL_PG_HOST localhost)
+    pt=$(team_default LOCAL_PG_PORT 5432)
+    u="${PGUSER:-$(id -un)}"
+    pw="${PGPASSWORD:-}"
+    team_warn_shared_port "$pt" "local Postgres"
+    team_pg_ping "$h" "$pt" "$u" "$pw"
+    team_lock_acquire databases 120
+    trap 'team_lock_release databases' EXIT
+    if team_pg_exists "$h" "$pt" "$u" "$pw" "$db"; then
+      team_db_registered postgres "$pt" "$db" "$wt" \
+        || team_die "$TEAM_EXIT_REFUSED" "database $db already exists on $h:$pt and was not created by the pack for $wt; not touching it"
+    else
+      team_pg_create "$h" "$pt" "$u" "$pw" "$db" "$(team_pg_comment_for "$project" "$wt")" \
+        || team_die "$TEAM_EXIT_FAIL" "could not create database $db on $h:$pt"
+      team_info "created database $db on $h:$pt"
+      team_db_registered postgres "$pt" "$db" "$wt" \
+        || team_registry_add "$(team_db_registry)" "postgres|$h|$pt|$db|$project|$wt|$(team_utc_now)"
+    fi
+    team_lock_release databases
+    trap - EXIT
+    team_env_set "$env_file" DB_HOST "$h"
+    team_env_set "$env_file" DB_PORT "$pt"
+    team_env_set "$env_file" DB_NAME "$db"
+    team_env_set "$env_file" DB_USER "$u"
+    team_env_set "$env_file" DB_PASSWORD "$pw"
+    if team_env_has_key "$env_file" DATABASE_URL; then
+      cred=$(team_urlencode "$u")
+      [ -n "$pw" ] && cred="$cred:$(team_urlencode "$pw")"
+      team_env_set "$env_file" DATABASE_URL "postgresql://$cred@$h:$pt/$db"
+    fi
+    ;;
+  mysql|mariadb)
+    db=$(team_db_name "$project" "$issue")
+    image=$(team_conf_get "$pconf" LOCAL_DB_IMAGE "")
+    pt=$(team_conf_get "$pconf" LOCAL_DB_PORT "")
+    [ -n "$image" ] && [ -n "$pt" ] \
+      || team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: set LOCAL_DB_IMAGE and LOCAL_DB_PORT in ops/project.conf"
+    case "$pt" in *[!0-9]*) team_die "$TEAM_EXIT_NOT_CONFIGURED" "LOCAL_DB_PORT must be a number" ;; esac
+    h=127.0.0.1
+    c=$(team_mysql_container "$project")
+    team_lock_acquire databases 300
+    trap 'team_lock_release databases' EXIT
+    pw=$(team_mysql_password "$project")
+    team_mysql_ensure "$project" "$image" "$pt" "$pw"
+    team_warn_shared_port "$pt" "container $c"
+    if team_mysql_exists "$c" "$pw" "$db"; then
+      team_db_registered "$engine" "$pt" "$db" "$wt" \
+        || team_die "$TEAM_EXIT_REFUSED" "database $db already exists in $c and was not created by the pack for $wt; not touching it"
+    else
+      team_mysql_query "$c" "$pw" "CREATE DATABASE \`$db\`" >/dev/null \
+        || team_die "$TEAM_EXIT_FAIL" "could not create database $db in $c"
+      team_info "created database $db in container $c"
+      team_db_registered "$engine" "$pt" "$db" "$wt" \
+        || team_registry_add "$(team_db_registry)" "$engine|$h|$pt|$db|$project|$wt|$(team_utc_now)"
+    fi
+    team_lock_release databases
+    trap - EXIT
+    team_env_set "$env_file" DB_HOST "$h"
+    team_env_set "$env_file" DB_PORT "$pt"
+    team_env_set "$env_file" DB_NAME "$db"
+    team_env_set "$env_file" DB_USER "root"
+    team_env_set "$env_file" DB_PASSWORD "$pw"
+    if team_env_has_key "$env_file" DATABASE_URL; then
+      team_env_set "$env_file" DATABASE_URL "mysql://root:$(team_urlencode "$pw")@$h:$pt/$db"
+    fi
+    ;;
+  *) team_die "$TEAM_EXIT_NOT_CONFIGURED" "unknown DB_ENGINE '$engine' in ops/project.conf (postgres, mysql, mariadb or none)" ;;
+esac
+
+# ---- setup + data (once; a marker records success) --------------------------------
+marker="$wt/.team/setup-done"
+if [ "$setup" = 1 ] && [ ! -e "$marker" ]; then
+  rc=0
+  team_run_make "$wt" setup || rc=$?
+  case "$rc" in
+    0) ;;
+    3) team_info "notice: make setup is not configured yet (fill it in for your stack); continuing" ;;
+    *) team_die "$TEAM_EXIT_FAIL" "make setup failed in $wt; fix it and re-run team-new-worktree $issue" ;;
+  esac
+  rc=0
+  (cd "$wt" && "$TEAM_SELF_DIR/team-db-pull") >&2 || rc=$?
+  case "$rc" in
+    0|3) ;;
+    *) team_die "$TEAM_EXIT_FAIL" "team-db-pull failed (exit $rc) in $wt; fix it and re-run team-new-worktree $issue" ;;
+  esac
+  team_utc_now > "$marker"
+fi
+
+printf 'path=%s\n' "$wt"
+printf 'branch=%s\n' "$branch"
+printf 'port=%s\n' "$port"
+printf 'db=%s\n' "$db"
+printf 'app_url=%s\n' "$app_url"
+printf 'env_file=%s\n' "$env_file"
+printf 'identity=%s\n' "$identity"

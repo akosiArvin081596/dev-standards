@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# team-db-pull: restore the newest cached sanitized snapshot into this worktree's database
+# (or load the fake seed data when there is none yet), then run migrations.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-db-pull [--fresh]
+
+Run in a worktree root. Restores the newest sanitized dump from the local cache
+(~/.cache/team-snapshots/<project>/, or $TEAM_SNAPSHOT_CACHE/<project>/) into the
+database named in the worktree's env file, then runs MIGRATE_CMD. With no cached
+dump yet (a new project before production's first nightly snapshot) it runs
+MIGRATE_CMD then SEED_CMD and says so.
+
+What it changes: the worktree's own database only. It is dropped and re-created
+first when it is recorded in databases.registry for this worktree; an unrecorded
+database is restored into only when it is empty. Connections always use the env
+file's explicit DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD.
+
+  --fresh   first download the newest sanitized dump from the server with the
+            restricted db-pull key (~/.ssh/team-dbpull-<project>). One attempt, no
+            retries. Without the key: production is not provisioned yet (exit 6).
+
+Exit codes: 0 ok, 1 failure, 2 usage, 3 not configured, 4 refused (unrecorded,
+non-empty database), 5 missing prerequisite, 6 production not provisioned yet.
+EOF
+}
+
+fresh=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --fresh) fresh=1; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+
+team_require_cmd git
+root=$(team_canon_dir "$(team_repo_root .)")
+pconf="$root/ops/project.conf"
+engine=$(team_conf_get "$pconf" DB_ENGINE "none")
+case "$engine" in
+  none|"") team_info "DB_ENGINE is none: no database to restore"; exit 0 ;;
+  postgres|mysql|mariadb) ;;
+  *) team_die "$TEAM_EXIT_NOT_CONFIGURED" "unknown DB_ENGINE '$engine' in ops/project.conf" ;;
+esac
+project=$(team_project_name "$root")
+env_name=$(team_conf_get "$pconf" ENV_FILE ".env")
+env_file="$root/$env_name"
+[ -r "$env_file" ] || team_die "$TEAM_EXIT_PREREQ" "no env file $env_file (create the worktree with team-new-worktree)"
+h=$(team_env_get "$env_file" DB_HOST "")
+pt=$(team_env_get "$env_file" DB_PORT "")
+dbn=$(team_env_get "$env_file" DB_NAME "")
+u=$(team_env_get "$env_file" DB_USER "")
+pw=$(team_env_get "$env_file" DB_PASSWORD "")
+[ -n "$h" ] && [ -n "$pt" ] && [ -n "$dbn" ] \
+  || team_die "$TEAM_EXIT_NOT_CONFIGURED" "DB_HOST, DB_PORT and DB_NAME must be set in $env_file"
+case "$dbn" in *[!A-Za-z0-9_]*) team_die "$TEAM_EXIT_REFUSED" "DB_NAME '$dbn' has unexpected characters" ;; esac
+migrate_cmd=$(team_conf_get "$pconf" MIGRATE_CMD "")
+seed_cmd=$(team_conf_get "$pconf" SEED_CMD "")
+cache="${TEAM_SNAPSHOT_CACHE:-$HOME/.cache/team-snapshots}/$project"
+
+# ---- download (one attempt) -----------------------------------------------------------
+if [ "$fresh" = 1 ]; then
+  key="$HOME/.ssh/team-dbpull-$project"
+  [ -f "$key" ] || team_die "$TEAM_EXIT_OWNER" "production is not provisioned yet: there is no db-pull key at $key. It is created by 'team-provision production --apply' (the owner's yes); until production's first nightly snapshot, worktrees use the fake seed data."
+  team_require_cmd ssh gzip
+  alias=$(team_vps_alias)
+  ssh_dbpull() {
+    ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -l "$project-production" "$alias" "$@"
+  }
+  name=$(ssh_dbpull latest-name) || team_die "$TEAM_EXIT_FAIL" "could not ask the server for the latest snapshot name (not retried, to stay clear of fail2ban)"
+  name=$(printf '%s' "$name" | tr -d '\r' | head -n 1)
+  case "$name" in
+    sanitized-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.sql.gz) ;;
+    *) team_die "$TEAM_EXIT_FAIL" "the server returned an unexpected snapshot name" ;;
+  esac
+  mkdir -p "$cache"
+  chmod 700 "$cache"
+  if [ -s "$cache/$name" ]; then
+    team_info "newest snapshot $name is already cached"
+  else
+    part="$cache/$name.part"
+    if ! ( umask 077; ssh_dbpull latest > "$part" ); then
+      rm -f "$part"
+      team_die "$TEAM_EXIT_FAIL" "download of $name failed (not retried)"
+    fi
+    if ! gzip -t "$part" 2>/dev/null; then
+      rm -f "$part"
+      team_die "$TEAM_EXIT_FAIL" "downloaded snapshot is not a valid gzip file; discarded"
+    fi
+    mv "$part" "$cache/$name"
+    team_info "downloaded $name"
+  fi
+fi
+
+dump=""
+if [ -d "$cache" ]; then
+  dump=$(find "$cache" -maxdepth 1 -type f -name 'sanitized-*.sql.gz' 2>/dev/null | LC_ALL=C sort | tail -n 1)
+fi
+
+# ---- make the database ready -------------------------------------------------------------
+registered=0
+team_db_registered "$engine" "$pt" "$dbn" "$root" && registered=1
+case "$engine" in
+  postgres)
+    team_require_cmd psql
+    team_pg_ping "$h" "$pt" "$u" "$pw"
+    if [ "$registered" = 1 ]; then
+      team_pg_drop "$h" "$pt" "$u" "$pw" "$dbn" \
+        || team_die "$TEAM_EXIT_FAIL" "could not drop $dbn on $h:$pt (is something still connected to it?)"
+      team_pg_create "$h" "$pt" "$u" "$pw" "$dbn" "$(team_pg_comment_for "$project" "$root")" \
+        || team_die "$TEAM_EXIT_FAIL" "could not re-create $dbn on $h:$pt"
+      team_info "re-created database $dbn on $h:$pt"
+    else
+      team_pg_exists "$h" "$pt" "$u" "$pw" "$dbn" \
+        || team_die "$TEAM_EXIT_FAIL" "database $dbn does not exist on $h:$pt"
+      n=$(team_pg_table_count "$h" "$pt" "$u" "$pw" "$dbn")
+      [ "$n" = "0" ] || team_die "$TEAM_EXIT_REFUSED" "database $dbn on $h:$pt is not recorded for this worktree and is not empty; not overwriting it"
+    fi
+    ;;
+  mysql|mariadb)
+    c=$(team_mysql_container "$project")
+    if [ "$registered" = 1 ]; then
+      MYSQL_PWD="$pw" docker exec -i -e MYSQL_PWD "$c" true 2>/dev/null \
+        || team_die "$TEAM_EXIT_FAIL" "project database container $c is not running (run team-new-worktree again to start it)"
+      team_mysql_query "$c" "$pw" "DROP DATABASE IF EXISTS \`$dbn\`; CREATE DATABASE \`$dbn\`" >/dev/null \
+        || team_die "$TEAM_EXIT_FAIL" "could not re-create $dbn in $c"
+      team_info "re-created database $dbn in $c"
+    else
+      n=$(team_mysql_query "$c" "$pw" "SELECT count(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '$dbn'")
+      [ "$n" = "0" ] || team_die "$TEAM_EXIT_REFUSED" "database $dbn is not recorded for this worktree and is not empty; not overwriting it"
+    fi
+    ;;
+esac
+
+run_project_cmd() {
+  local what="$1" cmd="$2" rc=0
+  if [ -z "$cmd" ]; then
+    team_info "notice: $what is not set in ops/project.conf; skipped"
+    return 0
+  fi
+  team_run_cmd "$root" "$cmd" "$what" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) team_info "notice: $what ($cmd) is not configured yet; skipped" ;;
+    *) team_die "$TEAM_EXIT_FAIL" "$what ($cmd) failed" ;;
+  esac
+}
+
+# ---- restore or seed ----------------------------------------------------------------------
+if [ -n "$dump" ]; then
+  team_info "restoring $(basename "$dump") into $dbn"
+  case "$engine" in
+    postgres)
+      gzip -dc "$dump" | team_pg "$h" "$pt" "$u" "$pw" -d "$dbn" >/dev/null \
+        || team_die "$TEAM_EXIT_FAIL" "restore of $(basename "$dump") failed"
+      ;;
+    mysql|mariadb)
+      if command -v mysql >/dev/null 2>&1; then
+        gzip -dc "$dump" | MYSQL_PWD="$pw" mysql --protocol=TCP -h "$h" -P "$pt" -u "$u" "$dbn" \
+          || team_die "$TEAM_EXIT_FAIL" "restore of $(basename "$dump") failed"
+      else
+        gzip -dc "$dump" | team_mysql_exec "$c" "$pw" "$dbn" \
+          || team_die "$TEAM_EXIT_FAIL" "restore of $(basename "$dump") failed"
+      fi
+      ;;
+  esac
+  run_project_cmd MIGRATE_CMD "$migrate_cmd"
+  team_info "done: $dbn holds snapshot $(basename "$dump") plus this branch's migrations"
+else
+  team_info "notice: no sanitized snapshot yet for $project (production has no nightly dump yet); loading the fake seed data instead"
+  run_project_cmd MIGRATE_CMD "$migrate_cmd"
+  run_project_cmd SEED_CMD "$seed_cmd"
+  team_info "done: $dbn holds the fake seed data"
+fi
