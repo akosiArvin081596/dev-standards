@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-sync: bring a project's managed files, lock file and workflow pins to a dev-standards release.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-sync [--init] [--to <vX.Y.Z>] [--check]
+
+Run in a project checkout. Fetches a dev-standards release (a read) and:
+  - copies every file under the release's managed/ folder into the project
+  - rewrites the reusable-workflow pins in .github/workflows/
+    (akosiArvin081596/dev-standards/.github/workflows/<x>.yml@vN) to the release's major
+  - writes .claude/team-standards.lock:
+      {"files": {"<path>": "sha256:<hex>", ...}, "release": "vX.Y.Z", "standards_repo": "..."}
+  - removes managed files an older release had and this one dropped (only paths the old
+    lock lists)
+It never touches project-owned files.
+
+Which release: --to <tag>; else the newest vX.Y.Z release with the lock's major; else
+(no lock yet) the latest release.
+
+  --init    first sync of a new project: also deletes .github/workflows/template-ci.yml
+  --to TAG  sync to this exact release (a different major is an upgrade)
+  --check   change nothing; list what would change and exit 1 on any drift
+
+TEAM_STANDARDS_TARBALL=<file> uses a local release tarball instead of downloading.
+
+Exit codes: 0 synced / up to date; 1 failure or drift (--check); 2 usage; 3 no GitHub
+account configured; 4 refused (run in dev-standards, or --init in the template);
+5 not in a git repo or a tool is missing.
+EOF
+}
+
+INIT=0
+CHECK=0
+TO=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --init) INIT=1 ;;
+    --check) CHECK=1 ;;
+    --to) [ $# -ge 2 ] || team_usage_error "--to needs a tag"; TO="$2"; shift ;;
+    --to=*) TO="${1#--to=}" ;;
+    *) team_usage_error "unknown argument $1" ;;
+  esac
+  shift
+done
+semver_tag() { printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; }
+[ -z "$TO" ] || semver_tag "$TO" || team_usage_error "--to needs a release tag like v1.2.3"
+
+team_require_cmd git jq tar
+ROOT=$(team_repo_root)
+cd "$ROOT"
+ROOT_REAL=$(pwd -P)
+
+if git config --get remote.origin.url >/dev/null 2>&1; then
+  ORIGIN=$(team_origin_repo .)
+  if tg_same_repo "$ORIGIN" "$TEAM_STANDARDS_REPO"; then
+    team_die "$TEAM_EXIT_REFUSED" "refused: team-sync runs in projects; dev-standards is the source of the managed files"
+  fi
+  if [ "$INIT" = 1 ] && tg_same_repo "$ORIGIN" "$TEAM_TEMPLATE_REPO"; then
+    team_die "$TEAM_EXIT_REFUSED" "refused: --init would delete the template's own template-ci.yml"
+  fi
+fi
+
+tg_tmp_init
+LOCK=".claude/team-standards.lock"
+OLD_RELEASE=""
+OLD_FILES=""
+if [ -f "$LOCK" ]; then
+  jq -e 'type == "object"' "$LOCK" >/dev/null 2>&1 || team_die "$TEAM_EXIT_FAIL" "$LOCK is not valid JSON"
+  OLD_RELEASE=$(jq -r '.release // ""' "$LOCK")
+  OLD_FILES=$(jq -r '(.files // {}) | keys[]' "$LOCK")
+fi
+
+# The account for GitHub reads, resolved only when a read is needed.
+TG_LOGIN=""
+need_login() {
+  [ -z "$TG_LOGIN" ] || return 0
+  TG_LOGIN=$(team_github_account .)
+  local agent
+  agent=$(team_agent_login)
+  [ -z "$agent" ] || TG_LOGIN="$agent"
+  tg_require_login "$TG_LOGIN"
+}
+
+# ------------------------------------------------------------ which release
+
+TAG="$TO"
+if [ -z "$TAG" ]; then
+  need_login
+  if semver_tag "$OLD_RELEASE"; then
+    major="${OLD_RELEASE#v}"
+    major="${major%%.*}"
+    releases=$(tg_api_get_all "repos/$TEAM_STANDARDS_REPO/releases?per_page=100" '.')
+    TAG=$(printf '%s' "$releases" | jq -r --arg m "$major" '
+      [ .[] | select((.draft | not) and (.prerelease | not))
+        | .tag_name | select(test("^v" + $m + "\\.[0-9]+\\.[0-9]+$"))
+        | {t: ., v: (ltrimstr("v") | split(".") | map(tonumber))} ]
+      | sort_by(.v) | last | .t // empty')
+    [ -n "$TAG" ] || team_die "$TEAM_EXIT_FAIL" "no v$major.x.y release of $TEAM_STANDARDS_REPO found"
+  else
+    TAG=$(tg_api_get "repos/$TEAM_STANDARDS_REPO/releases/latest" | jq -r '.tag_name // empty')
+    semver_tag "$TAG" || team_die "$TEAM_EXIT_FAIL" "the latest $TEAM_STANDARDS_REPO release has no vX.Y.Z tag"
+  fi
+fi
+MAJOR="${TAG#v}"
+MAJOR="${MAJOR%%.*}"
+
+# ------------------------------------------------------------ fetch and unpack (outside data)
+
+ARCHIVE="$TG_TMP/standards.tar.gz"
+if [ -n "${TEAM_STANDARDS_TARBALL:-}" ]; then
+  [ -r "$TEAM_STANDARDS_TARBALL" ] || team_die "$TEAM_EXIT_PREREQ" "TEAM_STANDARDS_TARBALL not readable: $TEAM_STANDARDS_TARBALL"
+  cp "$TEAM_STANDARDS_TARBALL" "$ARCHIVE"
+else
+  need_login
+  team_gh_as "$TG_LOGIN" api "repos/$TEAM_STANDARDS_REPO/tarball/$TAG" </dev/null >"$ARCHIVE" 2>"$TG_TMP/dl.err" \
+    || team_die "$TEAM_EXIT_FAIL" "could not download $TEAM_STANDARDS_REPO@$TAG: $(tg_printable "$(head -n 1 "$TG_TMP/dl.err")")"
+fi
+mkdir -p "$TG_TMP/x"
+# BSD and GNU tar both strip leading / and refuse .. entries by default.
+tar -xzf "$ARCHIVE" -C "$TG_TMP/x" 2>/dev/null || team_die "$TEAM_EXIT_FAIL" "release $TAG: not a readable tarball"
+TOPS=$(find "$TG_TMP/x" -mindepth 1 -maxdepth 1 -type d)
+[ "$(printf '%s\n' "$TOPS" | grep -c .)" = 1 ] || team_die "$TEAM_EXIT_FAIL" "release $TAG: unexpected tarball layout"
+MANAGED="$TOPS/managed"
+[ -d "$MANAGED" ] || team_die "$TEAM_EXIT_FAIL" "release $TAG has no managed/ folder"
+[ -z "$(find "$MANAGED" ! -type f ! -type d)" ] || team_die "$TEAM_EXIT_FAIL" "release $TAG: managed/ holds links or special files; refusing"
+
+NEW_FILES=$(cd "$MANAGED" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+[ -n "$NEW_FILES" ] || team_die "$TEAM_EXIT_FAIL" "release $TAG: managed/ is empty"
+while IFS= read -r p; do
+  case "$p" in
+    .git|.git/*|*/.git/*|"$LOCK") team_die "$TEAM_EXIT_FAIL" "release $TAG: refusing managed path $p" ;;
+    *[[:cntrl:]]*) team_die "$TEAM_EXIT_FAIL" "release $TAG: refusing a managed path with control characters" ;;
+  esac
+done <<EOF
+$NEW_FILES
+EOF
+
+# ------------------------------------------------------------ build the target state in a stage
+
+STAGE="$TG_TMP/stage"
+mkdir -p "$STAGE"
+while IFS= read -r p; do
+  mkdir -p "$STAGE/$(dirname "$p")"
+  cp "$MANAGED/$p" "$STAGE/$p"
+  if [ -x "$MANAGED/$p" ]; then chmod 0755 "$STAGE/$p"; else chmod 0644 "$STAGE/$p"; fi
+done <<EOF
+$NEW_FILES
+EOF
+
+is_managed() { printf '%s\n' "$NEW_FILES" | grep -Fqx -- "$1"; }
+
+STD_RE=$(printf '%s' "$TEAM_STANDARDS_REPO" | sed 's/[].[\*^$+?(){}|]/\\&/g')
+PIN_FILES=""
+rewrite_pins() {  # rewrite_pins <file> (in place, in the stage)
+  local f="$1" tmp="$1.pin.$$"
+  sed -E "s#(${STD_RE}/\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml)@v[0-9][0-9.]*#\\1@v${MAJOR}#g" "$f" >"$tmp"
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+if [ -d .github/workflows ]; then
+  for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$f" ] || continue
+    [ "$INIT" = 1 ] && [ "$f" = ".github/workflows/template-ci.yml" ] && continue
+    is_managed "$f" && continue
+    grep -q "$TEAM_STANDARDS_REPO/.github/workflows/" "$f" || continue
+    mkdir -p "$STAGE/.github/workflows"
+    cp "$f" "$STAGE/$f"
+    PIN_FILES="$PIN_FILES $f"
+  done
+fi
+while IFS= read -r p; do
+  case "$p" in .github/workflows/*) rewrite_pins "$STAGE/$p" ;; esac
+done <<EOF
+$NEW_FILES
+EOF
+for f in $PIN_FILES; do rewrite_pins "$STAGE/$f"; done
+
+files_json='{}'
+while IFS= read -r p; do
+  files_json=$(jq -c --arg p "$p" --arg h "sha256:$(team_sha256 "$STAGE/$p")" '. + {($p): $h}' <<<"$files_json")
+done <<EOF
+$NEW_FILES
+EOF
+mkdir -p "$STAGE/.claude"
+jq -nS --arg repo "$TEAM_STANDARDS_REPO" --arg rel "$TAG" --argjson files "$files_json" \
+  '{standards_repo: $repo, release: $rel, files: $files}' >"$STAGE/$LOCK"
+
+DELETES=""
+if [ -n "$OLD_FILES" ]; then
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in /*|..|../*|*/../*|*/..|.git|.git/*) team_warn "ignoring unsafe path in the old lock: $p"; continue ;; esac
+    is_managed "$p" && continue
+    [ -e "$p" ] && DELETES="$DELETES
+$p"
+  done <<EOF
+$OLD_FILES
+EOF
+fi
+if [ "$INIT" = 1 ] && [ -e .github/workflows/template-ci.yml ]; then
+  DELETES="$DELETES
+.github/workflows/template-ci.yml"
+fi
+
+# ------------------------------------------------------------ compare, then apply or report
+
+# safe_dst <relative path> : the destination must stay inside the checkout (no symlinked parents)
+safe_dst() {
+  local p="$1" d real
+  [ ! -L "$p" ] || team_die "$TEAM_EXIT_FAIL" "refusing to write through a symlink: $p"
+  d=$(dirname "$p")
+  while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+  real=$(cd "$d" && pwd -P)
+  case "$real/" in "$ROOT_REAL"/*) ;; *) team_die "$TEAM_EXIT_FAIL" "refusing to write outside the checkout: $p" ;; esac
+}
+
+ALL=$(cd "$STAGE" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+DRIFT=0
+if [ "$CHECK" = 1 ]; then MODE="check"; else MODE="sync"; fi
+printf 'team-sync: %s %s → %s%s\n' "$MODE" "${OLD_RELEASE:-(no lock)}" "$TAG" "$([ "$INIT" = 1 ] && printf ' (init)')"
+if semver_tag "$OLD_RELEASE"; then
+  old_major="${OLD_RELEASE#v}"; old_major="${old_major%%.*}"
+  [ "$old_major" = "$MAJOR" ] || printf 'major upgrade: v%s → v%s (workflow pins move to @v%s)\n' "$old_major" "$MAJOR" "$MAJOR"
+fi
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  src="$STAGE/$p"
+  action=ok
+  if [ ! -e "$p" ]; then action=create
+  elif ! cmp -s "$src" "$p"; then action=update
+  elif [ -x "$src" ] && [ ! -x "$p" ]; then action=update
+  elif [ ! -x "$src" ] && [ -x "$p" ]; then action=update
+  fi
+  printf '%-9s %s\n' "[$action]" "$p"
+  [ "$action" = ok ] && continue
+  DRIFT=1
+  [ "$CHECK" = 1 ] && continue
+  safe_dst "$p"
+  mkdir -p "$(dirname "$p")"
+  cp "$src" "$p"
+  if [ -x "$src" ]; then chmod 0755 "$p"; else chmod 0644 "$p"; fi
+done <<EOF
+$ALL
+EOF
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  printf '%-9s %s\n' "[delete]" "$p"
+  DRIFT=1
+  [ "$CHECK" = 1 ] && continue
+  safe_dst "$p"
+  rm -f "${ROOT_REAL:?}/$p"
+done <<EOF
+$DELETES
+EOF
+
+if [ "$CHECK" = 1 ]; then
+  if [ "$DRIFT" = 1 ]; then
+    printf 'drift: the project differs from %s (run team-sync%s to update)\n' "$TAG" "$([ -n "$TO" ] && printf ' --to %s' "$TO")"
+    exit "$TEAM_EXIT_FAIL"
+  fi
+  printf 'up to date with %s\n' "$TAG"
+  exit 0
+fi
+if [ "$DRIFT" = 1 ]; then printf 'synced to %s\n' "$TAG"; else printf 'already up to date with %s\n' "$TAG"; fi

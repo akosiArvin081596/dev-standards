@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-worktree-report: list every git worktree across my repos, marking merged and stale ones.
+# Read-only: never fetches, never changes anything in those repos.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-worktree-report [--root DIR]... [--depth N] [--stale-days N] [--offline]
+
+Finds git repos under each root (default ~/Projects and ~/Documents/Projects, searched
+N levels deep, default 4) and lists every linked worktree of each:
+
+  repo, worktree path, branch, PR state, days since its last commit, marks
+  merged   a PR from this branch was merged (from PR state, since squash merges
+           don't show in git branch --merged)
+  stale    no commit for --stale-days days (default 30)
+  missing  the worktree folder is gone (git calls it prunable)
+  locked   git worktree lock is set
+
+PR state is read with `gh pr list --head <branch> --state all` (a read) as the account
+mapped from the remote's owner or SSH alias in accounts.conf; anything unmapped is
+"unknown". --offline skips GitHub entirely.
+
+It never fetches, prunes or removes anything; use it to plan a cleanup.
+
+Exit codes: 0 report printed; 2 usage; 5 a root doesn't exist or git is missing.
+EOF
+}
+
+ROOTS=()
+DEPTH=4
+STALE_DAYS=30
+OFFLINE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --root) [ $# -ge 2 ] || team_usage_error "--root needs a folder"; ROOTS+=("$2"); shift ;;
+    --root=*) ROOTS+=("${1#--root=}") ;;
+    --depth) [ $# -ge 2 ] || team_usage_error "--depth needs a number"; DEPTH="$2"; shift ;;
+    --stale-days) [ $# -ge 2 ] || team_usage_error "--stale-days needs a number"; STALE_DAYS="$2"; shift ;;
+    --offline) OFFLINE=1 ;;
+    *) team_usage_error "unknown argument $1" ;;
+  esac
+  shift
+done
+printf '%s' "$DEPTH" | grep -Eq '^[1-9][0-9]?$' || team_usage_error "--depth must be 1-99"
+printf '%s' "$STALE_DAYS" | grep -Eq '^[0-9]+$' || team_usage_error "--stale-days must be a number"
+
+team_require_cmd git
+if [ "${#ROOTS[@]}" -eq 0 ]; then
+  for d in "$HOME/Projects" "$HOME/Documents/Projects"; do
+    [ -d "$d" ] && ROOTS+=("$d")
+  done
+  [ "${#ROOTS[@]}" -gt 0 ] || team_die "$TEAM_EXIT_PREREQ" "neither ~/Projects nor ~/Documents/Projects exists; pass --root"
+else
+  for d in "${ROOTS[@]}"; do [ -d "$d" ] || team_die "$TEAM_EXIT_PREREQ" "not a folder: $d"; done
+fi
+
+# Never take optional locks (no index refresh) in repos we only read.
+export GIT_OPTIONAL_LOCKS=0
+NOW=$(date +%s)
+[ "$OFFLINE" = 1 ] || command -v gh >/dev/null 2>&1 || OFFLINE=1
+
+# shellcheck disable=SC2088  # a literal ~ for display only
+tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+ymd() { date -u -r "$1" +%Y-%m-%d 2>/dev/null || date -u -d "@$1" +%Y-%m-%d 2>/dev/null || printf '?'; }
+
+OK_LOGINS=" "
+BAD_LOGINS=" "
+login_usable() {
+  local l="$1"
+  case "$OK_LOGINS" in *" $l "*) return 0 ;; esac
+  case "$BAD_LOGINS" in *" $l "*) return 1 ;; esac
+  if command gh auth token -u "$l" >/dev/null 2>&1; then OK_LOGINS="$OK_LOGINS$l "; return 0; fi
+  BAD_LOGINS="$BAD_LOGINS$l "
+  return 1
+}
+
+# pr_state <login> <owner/repo> <branch> : "merged #n", "open #n", "closed #n", "no PR" or "unknown"
+pr_state() {
+  local login="$1" slug="$2" branch="$3" json
+  if [ "$OFFLINE" = 1 ] || [ -z "$login" ] || [ -z "$slug" ] || ! login_usable "$login"; then
+    printf 'unknown'
+    return 0
+  fi
+  json=$(team_gh_as "$login" pr list -R "$slug" --head "$branch" --state all --limit 20 --json number,state </dev/null 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  printf '%s' "$json" | jq -r '
+    if type != "array" then "unknown"
+    elif any(.[]; .state == "MERGED") then "merged #\([.[] | select(.state == "MERGED") | .number] | max)"
+    elif any(.[]; .state == "OPEN") then "open #\([.[] | select(.state == "OPEN") | .number] | max)"
+    elif length > 0 then "closed #\([.[] | .number] | max)"
+    else "no PR" end' 2>/dev/null || printf 'unknown'
+}
+
+TOTAL=0
+N_MERGED=0
+N_STALE=0
+N_MISSING=0
+printf '%-28s  %-50s  %-34s  %-12s  %-16s  %s\n' "REPO" "WORKTREE" "BRANCH" "PR" "LAST COMMIT" "MARKS"
+
+report_repo() {
+  local repo="$1" url="" login="" slug="" porcelain wt sha branch flags line
+  porcelain=$(git -C "$repo" worktree list --porcelain 2>/dev/null) || return 0
+  url=$(git -C "$repo" config --get remote.origin.url 2>/dev/null) || url=""
+  if [ -n "$url" ]; then
+    slug=$(tg_remote_parts "$url")
+    slug="${slug#*|}"
+    login=$(tg_account_for_remote "$url")
+  fi
+  # Blocks separated by blank lines; the first block is the main worktree.
+  local idx=0
+  wt=""; sha=""; branch=""; flags=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }" ;;
+      "HEAD "*) sha="${line#HEAD }" ;;
+      "branch "*) branch="${line#branch refs/heads/}" ;;
+      detached) branch="" ;;
+      locked|"locked "*) flags="$flags locked" ;;
+      prunable|"prunable "*) flags="$flags missing" ;;
+      bare) flags="$flags bare" ;;
+      "")
+        [ -n "$wt" ] && { [ "$idx" -eq 0 ] || report_one "$repo" "$slug" "$login" "$wt" "$sha" "$branch" "$flags"; idx=$((idx + 1)); }
+        wt=""; sha=""; branch=""; flags=""
+        ;;
+    esac
+  done <<EOF
+$porcelain
+
+EOF
+}
+
+report_one() {
+  local repo="$1" slug="$2" login="$3" wt="$4" sha="$5" branch="$6" flags="$7" ct days pr marks="" last
+  TOTAL=$((TOTAL + 1))
+  ct=""
+  if [ -n "$sha" ]; then ct=$(git -C "$repo" log -1 --format=%ct "$sha" 2>/dev/null) || ct=""; fi
+  if [ -n "$ct" ]; then days=$(( (NOW - ct) / 86400 )); else days=""; fi
+  if [ -n "$branch" ]; then pr=$(pr_state "$login" "$slug" "$branch"); else pr="(detached)"; fi
+  case "$pr" in "merged "*) marks="merged"; N_MERGED=$((N_MERGED + 1)) ;; esac
+  if [ -n "$days" ] && [ "$days" -gt "$STALE_DAYS" ]; then marks="$marks stale"; N_STALE=$((N_STALE + 1)); fi
+  case " $flags " in *" missing "*) N_MISSING=$((N_MISSING + 1)) ;; esac
+  marks=$(team_trim "$marks$flags")
+  last="?"
+  if [ -n "$ct" ]; then last="$(ymd "$ct") ${days}d"; fi
+  printf '%-28s  %-50s  %-34s  %-12s  %-16s  %s\n' \
+    "$(basename "$repo")" "$(tilde "$wt")" "${branch:-(detached)}" "$pr" "$last" "${marks:--}"
+}
+
+for root in "${ROOTS[@]}"; do
+  while IFS= read -r gitdir; do
+    [ -n "$gitdir" ] || continue
+    report_repo "$(dirname "$gitdir")"
+  done <<EOF
+$(find "$root" -maxdepth "$DEPTH" \( -name node_modules -o -name .Trash -o -name vendor -o -path '*/.claude/worktrees' \) -prune \
+    -o -type d -name .git -print -prune 2>/dev/null | LC_ALL=C sort)
+EOF
+done
+
+printf '\n%d linked worktree(s): %d merged, %d stale (> %d days), %d missing. Nothing was changed.\n' \
+  "$TOTAL" "$N_MERGED" "$N_STALE" "$STALE_DAYS" "$N_MISSING"

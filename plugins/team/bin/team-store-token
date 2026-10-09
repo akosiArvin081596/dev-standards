@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-store-token: store the release-please token in the macOS keychain once, and set it on dev-standards.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+KEYCHAIN_ITEM="team-release-please-token"
+
+usage() {
+  cat <<EOF
+Usage: team-store-token
+
+Run once, yourself, in a normal terminal (it refuses to run inside Claude Code).
+
+1. The macOS keychain asks for the token with hidden input (twice) and stores it as the
+   generic password "$KEYCHAIN_ITEM" (account: your Mac user). An existing item is
+   replaced. The token never appears in arguments, output or files.
+2. It is then piped from the keychain into
+   gh secret set RELEASE_PLEASE_TOKEN --repo $TEAM_STANDARDS_REPO
+   as the owner of that repo. team-bootstrap-repo --apply sets it on every other
+   repo the same way.
+
+Create the token first at GitHub → Settings → Developer settings → Fine-grained tokens:
+  - Resource owner: the account that owns your pack repos
+  - Repository access: dev-standards and every pack project (or All repositories, so
+    new projects work without editing the token)
+  - Repository permissions: Contents: Read and write; Pull requests: Read and write;
+    Issues: Read and write; Metadata: Read-only (added automatically)
+  - The token's owner must be a repository admin: the release-tags ruleset lets only
+    admins create v* tags, and release-please creates them with this token
+  - Expiration: pick a date and put a reminder in your calendar; when it expires,
+    release PRs stop appearing. Re-run team-store-token, then
+    team-bootstrap-repo <owner/repo> --apply in each project.
+
+Options: -h, --help
+
+Exit codes: 0 stored and set; 1 failure; 4 refused (inside Claude Code); 5 missing tool
+or gh not logged in as the dev-standards owner.
+EOF
+}
+
+case "${1-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) team_usage_error "unknown argument $1" ;;
+esac
+
+if team_in_claude_code; then
+  team_die "$TEAM_EXIT_REFUSED" "refused: run team-store-token yourself in a normal terminal, not inside Claude Code"
+fi
+
+team_require_cmd security gh tr
+OWNER="${TEAM_STANDARDS_REPO%%/*}"
+tg_is_account_login "$OWNER" || team_die "$TEAM_EXIT_PREREQ" "$OWNER has no account| line in $TEAM_CONFIG_DIR/accounts.conf"
+tg_require_login "$OWNER"
+
+printf 'Paste the release-please token when the keychain asks (input is hidden).\n'
+# -w as the last argument makes security prompt for the password itself (hidden, twice).
+security add-generic-password -U -s "$KEYCHAIN_ITEM" -a "${USER:-$(id -un)}" -l "team release-please token" -w \
+  || team_die "$TEAM_EXIT_FAIL" "the keychain did not store the token"
+
+security find-generic-password -s "$KEYCHAIN_ITEM" -w 2>/dev/null | tr -d '\r\n' \
+  | team_gh_as "$OWNER" secret set RELEASE_PLEASE_TOKEN --repo "$TEAM_STANDARDS_REPO" >/dev/null \
+  || team_die "$TEAM_EXIT_FAIL" "stored in the keychain, but setting RELEASE_PLEASE_TOKEN on $TEAM_STANDARDS_REPO failed; re-run to retry"
+
+printf 'Stored in the keychain as %s and set RELEASE_PLEASE_TOKEN on %s.\n' "$KEYCHAIN_ITEM" "$TEAM_STANDARDS_REPO"
+printf 'Other repos get it from team-bootstrap-repo <owner/repo> --apply.\n'

@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-merge-if-green: private-repo fallback. Verify every required check on a PR's head commit,
+# then squash-merge exactly that commit and delete the branch.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-merge-if-green <pr> [--profile project|standards|template] [--dry-run]
+
+For private repos on GitHub Free, where rulesets and auto-merge aren't available.
+Run in the project checkout. Checks, on the PR's current head commit:
+  - every required GitHub Actions check (config/required-checks.json for the profile,
+    default project) has a successful run from the GitHub Actions app
+  - every required ai-* commit status is success
+  - no open main-red issue, unless the PR is labelled fixes-main
+  - a guarded PR carries owner-approved, and the latest labeled/unlabeled event for it
+    is a `labeled` by the owner (repo variable OWNER_LOGIN, else the repo owner)
+Prints each check. If all pass, squash-merges that exact commit (title "<PR title> (#n)",
+blank message) and deletes the branch. Refuses release PRs (exit 4).
+
+  --dry-run   check only, never merge
+
+Exit codes: 0 merged (or all green with --dry-run); 1 a check isn't green or the merge
+failed; 2 usage; 4 release PR; 5 missing prerequisite.
+EOF
+}
+
+PR=""
+PROFILE="project"
+DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --profile) [ $# -ge 2 ] || team_usage_error "--profile needs a value"; PROFILE="$2"; shift ;;
+    --profile=*) PROFILE="${1#--profile=}" ;;
+    --dry-run) DRY=1 ;;
+    -*) team_usage_error "unknown option $1" ;;
+    *) [ -z "$PR" ] || team_usage_error "one PR at a time"; PR="${1#\#}" ;;
+  esac
+  shift
+done
+printf '%s' "$PR" | grep -Eq '^[0-9]+$' || team_usage_error "give the PR number"
+tg_valid_profile "$PROFILE" || team_usage_error "profile must be one of: $TG_PROFILES"
+
+team_require_cmd git jq
+team_repo_root >/dev/null
+REPO=$(team_origin_repo .)
+tg_valid_slug "$REPO" || team_die "$TEAM_EXIT_PREREQ" "origin is not a GitHub owner/repo: $REPO"
+TG_LOGIN=$(team_github_account .)
+AGENT=$(team_agent_login)
+[ -n "$AGENT" ] && TG_LOGIN="$AGENT"
+tg_require_login "$TG_LOGIN"
+tg_tmp_init
+CHECKS_JSON=$(tg_required_checks_json "$PROFILE")
+
+PR_JSON=$(team_gh_as "$TG_LOGIN" pr view "$PR" -R "$REPO" \
+  --json number,title,state,isDraft,headRefName,headRefOid,labels </dev/null 2>"$TG_TMP/pr.err") \
+  || team_die "$TEAM_EXIT_FAIL" "could not read PR #$PR in $REPO: $(tg_printable "$(head -n 1 "$TG_TMP/pr.err")")"
+HEAD_REF=$(printf '%s' "$PR_JSON" | jq -r '.headRefName // ""')
+if tg_is_release_ref "$HEAD_REF" || printf '%s' "$PR_JSON" | jq -e 'any(.labels[]?; (.name // "") | startswith("autorelease:"))' >/dev/null; then
+  team_die "$TEAM_EXIT_REFUSED" "refused: PR #$PR is a release PR; only the owner merges release PRs"
+fi
+STATE=$(printf '%s' "$PR_JSON" | jq -r '.state // ""')
+[ "$STATE" = OPEN ] || team_die "$TEAM_EXIT_FAIL" "PR #$PR is $STATE, not open"
+[ "$(printf '%s' "$PR_JSON" | jq -r '.isDraft // false')" != true ] || team_die "$TEAM_EXIT_FAIL" "PR #$PR is a draft"
+SHA=$(printf '%s' "$PR_JSON" | jq -r '.headRefOid // ""')
+printf '%s' "$SHA" | grep -Eq '^[0123456789abcdef]{40}$' || team_die "$TEAM_EXIT_FAIL" "PR #$PR has no head commit"
+TITLE=$(printf '%s' "$PR_JSON" | jq -r '.title // ""')
+has_label() { printf '%s' "$PR_JSON" | jq -e --arg l "$1" 'any(.labels[]?; .name == $l)' >/dev/null; }
+
+FAILS=0
+pass() { printf '%-6s %s\n' "[pass]" "$*"; }
+fail() { printf '%-6s %s\n' "[fail]" "$*"; FAILS=$((FAILS + 1)); }
+
+printf 'team-merge-if-green: %s PR #%s at %s (profile %s)\n' "$REPO" "$PR" "$(printf '%s' "$SHA" | cut -c1-12)" "$PROFILE"
+
+RUNS=$(tg_api_get_all "repos/$REPO/commits/$SHA/check-runs?per_page=100" '.check_runs')
+STATUSES=$(tg_api_get "repos/$REPO/commits/$SHA/status?per_page=100" | jq -c '.statuses // []')
+
+while IFS= read -r chk; do
+  [ -n "$chk" ] || continue
+  ctx=$(printf '%s' "$chk" | jq -r .context)
+  app=$(printf '%s' "$chk" | jq -r '.integration_id // empty')
+  if [ -n "$app" ]; then
+    run=$(printf '%s' "$RUNS" | jq -c --arg n "$ctx" --argjson app "$app" \
+      '[ .[] | select(.name == $n and (.app.id // 0) == $app) ] | sort_by(.started_at // "", .id) | last // empty')
+    if [ -z "$run" ]; then
+      fail "$ctx: no run from the GitHub Actions app on this commit"
+    else
+      st=$(printf '%s' "$run" | jq -r '.status // ""')
+      concl=$(printf '%s' "$run" | jq -r '.conclusion // ""')
+      if [ "$st" = completed ] && [ "$concl" = success ]; then pass "$ctx: success"
+      else fail "$ctx: ${concl:-$st}"
+      fi
+    fi
+  else
+    st=$(printf '%s' "$STATUSES" | jq -r --arg c "$ctx" 'first(.[] | select(.context == $c) | .state) // "missing"')
+    if [ "$st" = success ]; then pass "$ctx: success"; else fail "$ctx: $st"; fi
+  fi
+done <<EOF
+$(printf '%s' "$CHECKS_JSON" | jq -c '.[]')
+EOF
+
+RED=$(tg_api_get "repos/$REPO/issues?labels=main-red&state=open&per_page=100" | jq -r '[ .[] | select(.pull_request == null) | "#\(.number)" ] | join(" ")')
+if [ -z "$RED" ]; then
+  pass "main is green (no open main-red issue)"
+elif has_label fixes-main; then
+  pass "main is red ($RED), and this PR is labelled fixes-main"
+else
+  fail "main is red ($RED): only PRs labelled fixes-main may merge"
+fi
+
+if has_label guarded; then
+  OWNER=""
+  tg_api_try GET "repos/$REPO/actions/variables/OWNER_LOGIN"
+  [ "$TG_RC" = 0 ] && OWNER=$(printf '%s' "$TG_OUT" | jq -r '.value // ""')
+  [ -n "$OWNER" ] || OWNER="${REPO%%/*}"
+  if ! has_label owner-approved; then
+    fail "guarded: owner-approved is missing (needs $OWNER's yes)"
+  else
+    EVENTS=$(tg_api_get_all "repos/$REPO/issues/$PR/events?per_page=100" '.')
+    last=$(printf '%s' "$EVENTS" | jq -r '[ .[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "owner-approved") ] | last // {} | "\(.event // "none")|\(.actor.login // "")"')
+    ev="${last%%|*}"
+    who="${last#*|}"
+    if [ "$ev" = labeled ] && [ "$(tg_lower "$who")" = "$(tg_lower "$OWNER")" ]; then
+      pass "guarded: owner-approved added by $OWNER"
+    else
+      fail "guarded: owner-approved was last ${ev} by ${who:-nobody}, not by the owner $OWNER"
+    fi
+  fi
+else
+  pass "not guarded"
+fi
+
+if [ "$FAILS" -gt 0 ]; then
+  printf '\nNot merging: %d check(s) not green.\n' "$FAILS"
+  exit "$TEAM_EXIT_FAIL"
+fi
+if [ "$DRY" = 1 ]; then
+  printf '\nAll green. --dry-run: not merging.\n'
+  exit 0
+fi
+
+BODY=$(jq -cn --arg sha "$SHA" --arg t "$TITLE (#$PR)" '{merge_method: "squash", sha: $sha, commit_title: $t, commit_message: ""}')
+tg_api_try PUT "repos/$REPO/pulls/$PR/merge" "$BODY"
+[ "$TG_RC" = 0 ] || team_die "$TEAM_EXIT_FAIL" "merge failed: $(tg_printable "$TG_ERR" | head -n 1)"
+printf '\nMerged PR #%s (squash of %s).\n' "$PR" "$(printf '%s' "$SHA" | cut -c1-12)"
+
+REF_PATH=$(jq -rn --arg b "$HEAD_REF" '$b | split("/") | map(@uri) | join("/")')
+tg_api_try DELETE "repos/$REPO/git/refs/heads/$REF_PATH"
+if [ "$TG_RC" = 0 ]; then
+  printf 'Deleted branch %s.\n' "$HEAD_REF"
+elif [ "$TG_HTTP" = 404 ] || [ "$TG_HTTP" = 422 ]; then
+  printf 'Branch %s was already deleted.\n' "$HEAD_REF"
+else
+  team_warn "merged, but deleting branch $HEAD_REF failed: $(tg_printable "$TG_ERR" | head -n 1)"
+fi
