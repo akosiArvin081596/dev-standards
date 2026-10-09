@@ -1,4 +1,5 @@
 # shellcheck shell=bash disable=SC2034  # variables here are used by run.sh and run-groups.sh
+# shellcheck source-path=SCRIPTDIR
 # Helpers for tests/commands/github/run.sh. Sourced, never executed.
 # Everything runs in a mktemp -d sandbox: stub gh and security first on PATH, a fake
 # TEAM_CONFIG_DIR and HOME, fake accounts (octo-owner, octo-other, optional octo-agent).
@@ -45,7 +46,7 @@ setup_sandbox() {
 
   # Shared network guard, installed last so its fakes come first on PATH: every
   # ssh/scp/sftp/rsync call is logged and refused. No test may run without it.
-  # shellcheck source=../../lib/net-guard.sh
+  # shellcheck source=SCRIPTDIR/../../lib/net-guard.sh
   . "$REPO/tests/lib/net-guard.sh"
   NET_GUARD_REAL_HOME="$REAL_HOME"
   net_guard_install "$T/net-guard"

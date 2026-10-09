@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # shellcheck disable=SC2329,SC2317  # test groups and helpers are called indirectly ("t_$g", from run-groups.sh)
 # Tests for the GitHub team-* commands (plugins/team/bin, docs/rules.md §10, §13).
 # Run: /bin/bash tests/commands/github/run.sh [group...]

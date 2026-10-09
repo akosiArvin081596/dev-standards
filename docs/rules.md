@@ -41,7 +41,7 @@ Required workflows never use `paths:` filters. The `ci / ci` check comes from a 
 - `guarded`, `high-risk`, `tests-changed`: added by workflows only.
 - `owner-approved`: counts only when the latest `labeled` event for it came from the owner login. Removed by `gates` on every new push.
 - Agents may add (via `team-gh`): `needs-info`, `fixes-main`, `bug`, `feature`, `client-request`, `health`. Never `owner-approved`, and never remove `guarded`, `high-risk`, `tests-changed`, `owner-approved`.
-- Owner login: repo variable `OWNER_LOGIN` if set, else `github.repository_owner`.
+- Owner login: repo variable `OWNER_LOGIN` (always set by `team-bootstrap-repo`: defaults.conf `OWNER_LOGIN`, else the repo owner), else `github.repository_owner`. The production environment reviewer is the same login. `owner-approved` also counts only when its latest `labeled` event is newer than the head commit's first check suite.
 
 ## 4. Exit codes (every `team-*` command, `scripts/ci/*`, server scripts, Makefile targets)
 
@@ -147,24 +147,24 @@ Every command: `#!/usr/bin/env bash`, `set -euo pipefail`, `--help` (exit 0), re
 |---|---|---|
 | `team-gh` | `team-gh <gh args…>` | runs `gh` as the project's account (`GH_TOKEN="$(gh auth token -u <login>)"`); reads pass; writes only: `pr create`, `pr edit` (title/body/allowed labels), `pr comment`, `pr review --comment`, `pr merge --auto --squash [--delete-branch]`, `issue create`, `issue comment`, `issue edit --add-label <allowed>`; `pr edit <n> --add-label owner-approved` only in that exact form and always as the OWNER account. Refuses release PRs (checks online), `api` writes, settings/secrets/rulesets/workflows/releases (exit 4). With an agent line in accounts.conf, acts as the agent login (except the owner-approved label). |
 | `team-post-check` | `team-post-check <sha> <context> <state> <description> [--target-url URL]` | context ∈ `ai-review ai-security ai-qa`; state ∈ `pending success failure error`; sha = 40 hex; refuses release PRs (4) |
-| `team-bootstrap-repo` | `team-bootstrap-repo <owner/repo> [--profile project|standards|template] [--create [--visibility public|private]] [--apply]` | `--create` generates the repo from the template first; then §2–3, repo variable `OWNER_LOGIN` (always), rulesets, settings, environments, variables, secrets, agent invite; plan by default |
-| `team-verify-repo` | `team-verify-repo <owner/repo> [--profile …]` | pass/fail table; exit 1 on any fail; warns on disabled scheduled workflows |
+| `team-bootstrap-repo` | `team-bootstrap-repo <owner/repo> [--profile project|standards|template] [--timezone <IANA>] [--create [--visibility public|private]] [--apply]` | `--create` generates the repo from the template first; then §2–3, repo variable `OWNER_LOGIN` (always), rulesets, settings, environments, variables, secrets, agent invite; plan by default |
+| `team-verify-repo` | `team-verify-repo <owner/repo> [--profile …]` (also checks `OWNER_LOGIN`) | pass/fail table; exit 1 on any fail; warns on disabled scheduled workflows |
 | `team-new-worktree` | `team-new-worktree <issue|pr> [--type T] [--slug S] [--no-setup]` (with both `--type` and `--slug` no issue lookup is made) | branch from `origin/main --no-track`; port under `locks/ports.lock`; env file; DB; `.team/evidence` → symlink to the main checkout's `.team/evidence`; `make setup`; snapshot or seed; prints `key=value` summary (`path branch port db app_url`) |
 | `team-remove-worktree` | `team-remove-worktree <path|issue> [--force]` | stops the app, drops only the registry-recorded DB, frees the port, removes the worktree (keeps `.team/evidence` in the main checkout) |
-| `team-conflict-check` | `team-conflict-check <issue>…` | reads each issue's "Likely files"; prints groups that must run one after another |
+| `team-conflict-check` | `team-conflict-check <issue>… [--json]` | reads each issue's "Likely files"; prints groups that must run one after another |
 | `team-hooks` | `team-hooks [--check]` | the only way to set `core.hooksPath`; chains to an existing path |
 | `team-app` | `team-app up|down|status [--timeout S]` | `make dev` in its own process group, pidfile `.team/app.pid`, waits for `HEALTH_PATH` |
 | `team-db-pull` | `team-db-pull [--fresh]` | restore cached sanitized dump (or `SEED_CMD` if none) into the worktree DB, then `MIGRATE_CMD` |
 | `team-sync` | `team-sync [--init] [--to <tag>] [--check]` | managed files + lock + workflow pins from a dev-standards release; `--init` deletes `template-ci.yml` |
 | `team-store-token` | `team-store-token` | hidden prompt → keychain `team-release-please-token` → sets `RELEASE_PLEASE_TOKEN` on dev-standards; refuses inside Claude Code |
 | `team-staging-login` | `team-staging-login <project>` | keychain → clipboard, never printed; refuses inside Claude Code (`CLAUDECODE`) |
-| `team-worktree-report` | `team-worktree-report [--root DIR]…` | read-only list of all worktrees, merged (PR state) / stale |
+| `team-worktree-report` | `team-worktree-report [--root DIR]… [--depth N] [--stale-days N] [--offline]` | read-only list of all worktrees, merged (PR state) / stale |
 | `team-check-fences` | `team-check-fences [--hook PATH]` | feeds simulated tool calls to the fence; pass/fail table |
 | `team-discover` | `team-discover` | runs `server/discover` over `ssh <VPS_ALIAS>`; read-only |
 | `team-provision` | `team-provision <staging|production> [--apply]` | §12 |
 | `team-flag` | `team-flag <staging|production> <name> on|off` | production: owner only (fence denies it in Claude Code) |
 | `team-refresh-staging` | `team-refresh-staging [--apply]` | sanitized dump → staging DB → staging migrations |
-| `team-merge-if-green` | `team-merge-if-green <pr>` | private fallback: verifies every required check, then squash-merges |
+| `team-merge-if-green` | `team-merge-if-green <pr> [--profile …] [--dry-run]` | private fallback: verifies every required check, then squash-merges |
 | `team-deploy` | `team-deploy <staging|production> [--sha SHA] [--apply]` | private fallback; production refused inside Claude Code (I run it in a terminal) |
 
 ## 11. Server (`plugins/team/server/`, Linux bash, run as root via sudo)
@@ -231,7 +231,9 @@ Installed root-owned to `/usr/local/lib/team/`. Scripts: `discover`, `provision`
 - Runner: `ubuntu-24.04`. Third-party actions pinned by full SHA with the version in a comment, using the newest release at least 7 days old (same rule as the Dependabot cooldown).
 
 ### `scripts/ci/` (bash, run from the standards checkout; `$TEAM_STANDARDS_DIR` = its path)
-`common.sh`, `package.sh <artifact-dir> <out.tar.gz>`, `make-target.sh <target>` (exit 3 → notice + success), `test-guard.sh`, `pii-guard.sh`, `context-check.sh`, `gitleaks.sh git|dir`, `semgrep.sh`, `stop-the-line.sh`, `main-red.sh open|close`, `guarded-paths.sh`, `pr-title.sh` (title from `PR_TITLE` env), `deploy.sh <env> <artifact>`, `smoke.sh <url>`, `incident.sh check`, `anonymize-lint.sh`, `conf.sh get <file> <key>`.
+`common.sh` (sets `LC_ALL=C`), `package.sh <artifact-dir> <out.tar.gz>`, `make-target.sh <target>` (exit 3 → notice + success), `test-guard.sh`, `pii-guard.sh`, `context-check.sh`, `gitleaks.sh git|dir`, `semgrep.sh`, `stop-the-line.sh`, `main-red.sh open|close`, `guarded-paths.sh`, `pr-title.sh` (title from `PR_TITLE` env), `deploy.sh <env> <artifact>`, `smoke.sh <url>`, `incident.sh check`, `anonymize-lint.sh`, `conf.sh get <file> <key>`.
+
+Extra flags: `context-check.sh [--root D] [--standards-dir D] [--tags-from F] [--allow-unreleased-lock] [--standards-self]`, `gitleaks.sh verify --tarball F`, `deploy.sh … [--sha S] [--rollback S] [--health]`, `smoke.sh <url> [--noindex]`. `make-target.sh` treats a target as not configured only when make exits 2 with both the `Error 3` line and the "not configured" text. Runners: `tests/ci/self-test.sh` (the `self-test` job; `SELF_TEST_SUITES` limits suites), `tests/ci/sync-fixture.sh` (re-run whenever `managed/` changes), `tests/lib/net-guard.sh` (every test runner installs it first).
 
 ### `config/`
 `required-checks.json`, `labels.json`, `guarded-globs.txt`, `destructive-migration-patterns.txt`, `test-globs.txt`, `test-markers.txt`, `assertion-patterns.txt`, `pii-patterns.txt`, `pr-title-types.txt`, `tool-versions.env`.
@@ -255,7 +257,7 @@ The PR body ends with `Fixes #<issue>` (or `Refs #<issue>` for a logging-only `n
 
 ## 16. Mac bash rules (hooks, `bin/`, `lib/`, tests)
 
-bash 3.2 + BSD tools: no associative arrays, `mapfile`/`readarray`, `${v,,}`/`${v^^}`, `|&`, `&>>`, `sed -i` without a suffix argument, `grep -P`, GNU-only `date`/`stat`/`readlink -f`/`timeout`. Expand possibly-empty arrays as `${a[@]+"${a[@]}"}`. Test with `/bin/bash` explicitly. Makefiles: Make 3.81 (no `.ONESHELL`, `.RECIPEPREFIX`, `undefine`, grouped targets). Every removal guards its variables: `rm -rf "${DIR:?}"/…`. Never `pkill`/`killall`; stop only PIDs you recorded, after checking their cwd.
+bash 3.2 + BSD tools: no associative arrays, `mapfile`/`readarray`, `${v,,}`/`${v^^}`, `|&`, `&>>`, `sed -i` without a suffix argument, `grep -P`, GNU-only `date`/`stat`/`readlink -f`/`timeout`. Expand possibly-empty arrays as `${a[@]+"${a[@]}"}`. Under this Mac's UTF-8 locale bash 3.2 lets `[a-z]` match capitals (set `LC_COLLATE=C`/`LC_ALL=C` before matching) and reads a non-ASCII character right after `$var` as part of the name (write `${var}→`). Test with `/bin/bash` explicitly. Makefiles: Make 3.81 (no `.ONESHELL`, `.RECIPEPREFIX`, `undefine`, grouped targets). Every removal guards its variables: `rm -rf "${DIR:?}"/…`. Never `pkill`/`killall`; stop only PIDs you recorded, after checking their cwd.
 
 ## 17. Ownership during the build (one writer per folder)
 
