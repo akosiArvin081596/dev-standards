@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# deploy-receive — SSH forced command for one environment's deploy key (docs/rules.md §11).
+# Runs as the environment's user. Accepts only SSH_ORIGINAL_COMMAND = "deploy <sha>" (release
+# tarball on stdin), "rollback <sha>" or "health".
+set -Eeuo pipefail
+TEAM_PROG=deploy-receive
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: deploy-receive <project> <staging|production>
+  (installed as the forced command of the deploy key; the action comes from SSH_ORIGINAL_COMMAND)
+
+  deploy <sha>    release tarball (tar.gz) on stdin: unpack into releases/<sha>, link shared/ and
+                  .env, back up the database first (production), run MIGRATE_CMD, switch current
+                  atomically, reload the services, check HEALTH_PATH; switch back if it fails.
+  rollback <sha>  switch to releases/<sha> if the server still has it (exit 7 if not), reload,
+                  check health; switch back if it fails.
+  health          check HEALTH_PATH and print the status.
+
+<sha> is 7-40 lowercase hex. Anything else is refused (exit 4). Keeps the last 5 releases.
+Exit codes: 0 ok, 1 failed (previous release restored), 2 usage, 4 refused, 5 not provisioned,
+7 release not on the server (rebuild needed).
+EOF
+}
+
+case ${1:-} in -h|--help) usage; exit 0 ;; esac
+(($# == 2)) || team_usage_error "expected <project> <env>"
+PROJECT=$1 ENV_NAME=$2
+team_check_project_env "$PROJECT" "$ENV_NAME"
+
+CONF=$(team_conf_file "$PROJECT" "$ENV_NAME")
+[[ -r $CONF ]] || team_die "$TEAM_EXIT_PREREQ" "$PROJECT $ENV_NAME is not provisioned on this server"
+APP_USER=$(team_conf_get "$CONF" APP_USER)
+APP_DIR=$(team_conf_get "$CONF" APP_DIR)
+PORT=$(team_conf_get "$CONF" PORT)
+HEALTH_PATH=$(team_conf_get "$CONF" HEALTH_PATH /health)
+MIGRATE_CMD=$(team_conf_get "$CONF" MIGRATE_CMD)
+UNITS=$(team_conf_get "$CONF" UNITS)
+WEB_MODE=$(team_conf_get "$CONF" WEB_MODE proxy)
+HOST=$(team_conf_get "$CONF" HOST)
+SHARED_PATHS=$(team_conf_get "$CONF" SHARED_PATHS)
+
+[[ $(id -un) == "$APP_USER" ]] || team_die "$TEAM_EXIT_REFUSED" "must run as $APP_USER (it is the deploy key's forced command)"
+[[ -d $APP_DIR/releases ]] || team_die "$TEAM_EXIT_PREREQ" "$APP_DIR/releases is missing; re-run provision"
+
+REQ=${SSH_ORIGINAL_COMMAND-}
+ACTION="" SHA=""
+if [[ $REQ =~ ^(deploy|rollback)\ ([0-9a-f]{7,40})$ ]]; then
+  ACTION=${BASH_REMATCH[1]} SHA=${BASH_REMATCH[2]}
+elif [[ $REQ == health ]]; then
+  ACTION=health
+else
+  team_die "$TEAM_EXIT_REFUSED" "refused: only 'deploy <sha>', 'rollback <sha>' and 'health' are allowed"
+fi
+
+RETRIES=${TEAM_HEALTH_RETRIES:-15}
+DELAY=${TEAM_HEALTH_DELAY:-2}
+[[ $RETRIES =~ ^[0-9]+$ && $RETRIES -ge 1 ]] || RETRIES=15
+[[ $DELAY =~ ^[0-9]+$ ]] || DELAY=2
+SYSTEMCTL=$(command -v systemctl || printf '/usr/bin/systemctl')
+CURRENT=$APP_DIR/current
+if [[ $WEB_MODE == proxy ]]; then umask 027; else umask 022; fi
+
+log_event() { printf '%s %s %s %s\n' "$(team_utc_now)" "$1" "${2:--}" "$3" >> "$APP_DIR/deploys.log" 2>/dev/null || true; }
+
+current_release() { [[ -L $CURRENT ]] && readlink "$CURRENT" || true; }
+
+switch_to() { # <release dir> : atomic symlink swap
+  local tmp=$APP_DIR/.current.$$
+  ln -sfn "$1" "$tmp"
+  mv -T "$tmp" "$CURRENT"
+}
+
+health_once() {
+  case $WEB_MODE in
+    proxy) curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$PORT$HEALTH_PATH" 2>/dev/null ;;
+    *) curl -fsS -o /dev/null --max-time 5 -L --max-redirs 3 \
+         --resolve "$HOST:80:127.0.0.1" --resolve "$HOST:443:127.0.0.1" "http://$HOST$HEALTH_PATH" 2>/dev/null ;;
+  esac
+}
+check_health() { # [tries]
+  local tries=${1:-$RETRIES} i
+  for ((i = 1; i <= tries; i++)); do
+    health_once && return 0
+    (( i < tries )) && sleep "$DELAY"
+  done
+  return 1
+}
+
+reload_services() {
+  local u svc ver
+  if ! team_systemd_running; then
+    # Only in containers/tests: there is no service manager to reload.
+    team_say "[skip] systemd is not running: service reload is a no-op"
+    return 0
+  fi
+  for u in $UNITS; do
+    sudo -n "$SYSTEMCTL" reload-or-restart "$u" || { team_say "[fail] could not reload $u"; return 1; }
+  done
+  if [[ $WEB_MODE == php-fpm ]]; then
+    for svc in /etc/php/*/fpm/pool.d/team-"$PROJECT"-"$ENV_NAME".conf; do
+      [[ -e $svc ]] || continue
+      ver=${svc#/etc/php/}; ver=${ver%%/*}
+      sudo -n "$SYSTEMCTL" reload "php$ver-fpm.service" || { team_say "[fail] could not reload php$ver-fpm"; return 1; }
+    done
+  fi
+  return 0
+}
+
+# real_parents <release dir> <relative path> : every parent folder of the path inside the release is a
+# real directory (a symlinked parent from the tarball is replaced), so nothing below can reach outside
+real_parents() {
+  local rel=$1 acc="" part
+  local -a parts
+  IFS='/' read -r -a parts <<< "$2"
+  for part in "${parts[@]:0:${#parts[@]}-1}"; do
+    acc+="${acc:+/}$part"
+    if [[ -L $rel/$acc ]]; then rm -f -- "${rel:?}/$acc"; fi
+    mkdir -p -- "$rel/$acc"
+  done
+}
+
+link_shared() { # <release dir>
+  local rel=$1 p src dst
+  for p in $SHARED_PATHS; do
+    team_valid_relpath "$p" || team_die "$TEAM_EXIT_FAIL" "bad SHARED_PATHS entry '$p'"
+    real_parents "$rel" "$p"
+    src=$APP_DIR/shared/$p dst=$rel/$p
+    if [[ ! -e $src ]]; then
+      mkdir -p "$(dirname "$src")"
+      if [[ -e $dst && ! -L $dst ]]; then mv "$dst" "$src"   # the first release seeds shared/
+      else mkdir -p "$src"; fi
+    fi
+    if [[ -e $dst || -L $dst ]]; then rm -rf "${dst:?}"; fi
+    mkdir -p "$(dirname "$dst")"
+    ln -sfn "$src" "$dst"
+  done
+  rm -f "${rel:?}/.env"
+  ln -s "$APP_DIR/shared/.env" "$rel/.env"
+}
+
+prune_releases() {
+  local cur n=0 r
+  cur=$(current_release)
+  while IFS= read -r r; do
+    [[ -n $r ]] || continue
+    n=$((n + 1))
+    (( n <= TEAM_KEEP_RELEASES )) && continue
+    [[ $r == "$cur" ]] && continue
+    rm -rf "${r:?}"
+    team_say "[remove] old release $(basename "$r")"
+  done < <(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+}
+
+# find_release <sha> : exact name, else a unique prefix match
+find_release() {
+  local m=()
+  if [[ -d $APP_DIR/releases/$1 ]]; then printf '%s' "$APP_DIR/releases/$1"; return 0; fi
+  for r in "$APP_DIR/releases/$1"*; do [[ -d $r ]] && m+=("$r"); done
+  ((${#m[@]} == 1)) || return 1
+  printf '%s' "${m[0]}"
+}
+
+# go_live <release dir> <previous release dir|""> : switch, reload, health; switch back on failure
+go_live() {
+  local rel=$1 prev=$2
+  switch_to "$rel"
+  team_say "[ok] current → $(basename "$rel")"
+  if reload_services && check_health; then
+    touch "$rel"
+    return 0
+  fi
+  if [[ -n $prev && -d $prev ]]; then
+    switch_to "$prev"
+    team_say "[fail] health check failed for $(basename "$rel"); switched back to $(basename "$prev")"
+    reload_services || true
+    if check_health 3; then team_say "[ok] $(basename "$prev") is healthy again"
+    else team_say "[warn] $(basename "$prev") is not healthy either"; fi
+  else
+    rm -f "$CURRENT"
+    team_say "[fail] health check failed for $(basename "$rel"); no previous release to switch back to"
+    reload_services || true
+  fi
+  return 1
+}
+
+# Cleanup on exit: a half-unpacked tarball, or a release that never went live.
+INCOMING="" REL_CLEANUP=""
+cleanup() {
+  [[ -n $INCOMING && -d $INCOMING ]] && rm -rf "${INCOMING:?}"
+  [[ -n $REL_CLEANUP && -d $REL_CLEANUP && $REL_CLEANUP != "$(current_release)" ]] && rm -rf "${REL_CLEANUP:?}"
+  return 0
+}
+trap cleanup EXIT
+
+exec 8>>"$APP_DIR/.deploy.lock"
+flock -w 300 8 || team_die "$TEAM_EXIT_FAIL" "another deploy is running"
+
+case $ACTION in
+  health)
+    cur=$(current_release)
+    if [[ -z $cur ]]; then team_say "unhealthy: no release deployed yet"; exit 1; fi
+    if check_health 3; then team_say "healthy: current=$(basename "$cur")"; exit 0; fi
+    team_say "unhealthy: current=$(basename "$cur") ($HEALTH_PATH did not answer 2xx/3xx)"
+    exit 1
+    ;;
+
+  rollback)
+    rel=$(find_release "$SHA") || { log_event rollback "$SHA" missing; team_die "$TEAM_EXIT_NO_RELEASE" "release $SHA is not on the server: rebuild needed"; }
+    cur=$(current_release)
+    if [[ $rel == "$cur" ]]; then
+      team_say "[ok] $(basename "$rel") is already current"
+      check_health || { team_say "[fail] health check failed"; exit 1; }
+      exit 0
+    fi
+    if go_live "$rel" "$cur"; then
+      log_event rollback "$(basename "$rel")" ok
+      team_say "[ok] rolled back to $(basename "$rel")"
+      exit 0
+    fi
+    log_event rollback "$(basename "$rel")" failed
+    team_die "$TEAM_EXIT_FAIL" "rollback to $(basename "$rel") failed its health check; previous release restored"
+    ;;
+
+  deploy)
+    rel=$APP_DIR/releases/$SHA
+    cur=$(current_release)
+    if [[ $rel == "$cur" ]]; then
+      cat > /dev/null
+      team_say "[ok] $SHA is already current"
+      check_health || { team_say "[fail] health check failed"; exit 1; }
+      exit 0
+    fi
+    INCOMING=$(mktemp -d "$APP_DIR/releases/.incoming-XXXXXX")
+    tar -xzf - -C "$INCOMING" --no-same-owner || team_die "$TEAM_EXIT_FAIL" "could not unpack the release tarball"
+    [[ -n $(ls -A "$INCOMING") ]] || team_die "$TEAM_EXIT_FAIL" "the release tarball is empty"
+    link_shared "$INCOMING"
+    [[ -e $rel || -L $rel ]] && rm -rf "${rel:?}"
+    mv -T "$INCOMING" "$rel"
+    INCOMING="" REL_CLEANUP=$rel
+    team_say "[ok] unpacked $SHA"
+
+    if [[ $ENV_NAME == production ]]; then
+      sudo -n "$TEAM_LIB_DIR/backup" "$PROJECT" --pre-deploy \
+        || { log_event deploy "$SHA" backup-failed; team_die "$TEAM_EXIT_FAIL" "pre-deploy backup failed; nothing changed"; }
+    fi
+
+    if ! team_run_migrate "$rel" "$APP_DIR/shared/.env" "$MIGRATE_CMD"; then
+      log_event deploy "$SHA" migrate-failed
+      team_die "$TEAM_EXIT_FAIL" "MIGRATE_CMD failed; current release unchanged"
+    fi
+
+    if go_live "$rel" "$cur"; then
+      REL_CLEANUP=""
+      log_event deploy "$SHA" ok
+      prune_releases
+      team_say "[ok] deployed $SHA"
+      exit 0
+    fi
+    log_event deploy "$SHA" health-failed
+    team_die "$TEAM_EXIT_FAIL" "deploy of $SHA failed its health check"
+    ;;
+esac

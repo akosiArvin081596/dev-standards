@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# refresh-staging — replace a project's staging database with the latest sanitized snapshot, then
+# run staging's migrations (docs/rules.md §11). Plan by default; changes only with --apply.
+# shellcheck disable=SC2016  # SQL backticks and the runuser script are literal on purpose
+set -Eeuo pipefail
+TEAM_PROG=refresh-staging
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: refresh-staging <project> [--apply]
+
+Restores /var/lib/team/<project>/snapshots/latest (a sanitized dump that passed the PII check)
+into the staging database: stops staging's services, drops and recreates the staging database
+(only the one provision created for staging, never production's), restores the dump as the staging
+database user, runs staging's MIGRATE_CMD as the staging user in staging's current release, and
+starts the services again. Prints the plan unless --apply. Run as root.
+
+Exit codes: 0 ok, 1 failure, 2 usage, 3 no snapshot yet, 4 refused, 5 not provisioned.
+EOF
+}
+
+PROJECT=""
+for a in "$@"; do
+  case $a in
+    -h|--help) usage; exit 0 ;;
+    --apply) TEAM_APPLY=1 ;;
+    -*) team_usage_error "unknown option '$a'" ;;
+    *) [[ -z $PROJECT ]] || team_usage_error "only one project"; PROJECT=$a ;;
+  esac
+done
+[[ -n $PROJECT ]] || team_usage_error "expected <project>"
+team_valid_project "$PROJECT" || team_usage_error "bad project name '$PROJECT'"
+team_require_root
+trap team_err_trap ERR
+
+S_CONF=$(team_conf_file "$PROJECT" staging)
+P_CONF=$(team_conf_file "$PROJECT" production)
+[[ -r $S_CONF ]] || team_die "$TEAM_EXIT_PREREQ" "$PROJECT staging is not provisioned on this server"
+[[ -r $P_CONF ]] || team_die "$TEAM_EXIT_PREREQ" "$PROJECT production is not provisioned (snapshots come from production)"
+DB_ENGINE=$(team_conf_get "$S_CONF" DB_ENGINE none)
+DB_NAME=$(team_conf_get "$S_CONF" DB_NAME)
+DB_USER=$(team_conf_get "$S_CONF" DB_USER)
+APP_USER=$(team_conf_get "$S_CONF" APP_USER)
+APP_DIR=$(team_conf_get "$S_CONF" APP_DIR)
+UNITS=$(team_conf_get "$S_CONF" UNITS)
+MIGRATE_CMD=$(team_conf_get "$S_CONF" MIGRATE_CMD)
+P_ENGINE=$(team_conf_get "$P_CONF" DB_ENGINE none)
+P_DB=$(team_conf_get "$P_CONF" DB_NAME)
+
+[[ $DB_ENGINE != none ]] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "$PROJECT has no database (DB_ENGINE=none)"
+[[ $DB_ENGINE == "$P_ENGINE" ]] || team_die "$TEAM_EXIT_REFUSED" "staging ($DB_ENGINE) and production ($P_ENGINE) use different engines"
+if ! team_valid_ident "$DB_NAME" || ! team_valid_ident "$DB_USER"; then team_die "$TEAM_EXIT_FAIL" "bad DB_NAME/DB_USER in $S_CONF"; fi
+read -r -a UNIT_LIST <<< "$UNITS"
+# Safety: only staging's own, pack-created database; never production's.
+[[ $DB_NAME == *_staging && $DB_NAME != "$P_DB" ]] || team_die "$TEAM_EXIT_REFUSED" "refusing: $DB_NAME does not look like this project's staging database"
+team_ledger_has "$PROJECT" staging db "$DB_NAME" || team_die "$TEAM_EXIT_REFUSED" "refusing: $DB_NAME was not created by the team pack"
+
+SNAP_DIR=$TEAM_VAR_ROOT/$PROJECT/snapshots
+[[ -L $SNAP_DIR/latest ]] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no sanitized snapshot yet (production's first nightly run hasn't happened)"
+SNAP=$(readlink "$SNAP_DIR/latest")
+[[ $SNAP =~ ^sanitized-[0-9]{8}T[0-9]{6}Z\.sql\.gz$ && -f $SNAP_DIR/$SNAP ]] || team_die "$TEAM_EXIT_FAIL" "the latest snapshot link is broken"
+
+applying() { [[ $TEAM_APPLY == 1 ]]; }
+team_say "refresh-staging $PROJECT ($([[ $TEAM_APPLY == 1 ]] && echo apply || echo plan)) $(team_utc_now)"
+
+STOP_UNITS=0
+if [[ -n $UNITS ]]; then
+  if team_systemd_running; then
+    team_plan update "stop staging services during the refresh, start them again after: $UNITS"
+    STOP_UNITS=1
+  else
+    team_plan skip "systemd not running: staging services not stopped/started"
+  fi
+fi
+team_plan update "replace staging database $DB_NAME with $SNAP (sanitized; restored as $DB_USER)"
+if [[ -L $APP_DIR/current ]]; then team_plan update "run staging migrations as $APP_USER in $(readlink "$APP_DIR/current")"
+else team_plan skip "staging has no release yet: migrations not run"; fi
+
+# Services stopped for the refresh are started again however the script ends.
+STOPPED=0 WORK=""
+finish() {
+  local rc=$?
+  if (( STOPPED )); then
+    if systemctl start "${UNIT_LIST[@]}"; then team_say "[ok] started staging services"
+    else team_warn "could not start staging services: $UNITS"; fi
+  fi
+  [[ -n $WORK && -d $WORK ]] && rm -rf "${WORK:?}"
+  exit "$rc"
+}
+
+if applying; then
+  team_flock "$PROJECT-db" 1800
+  gzip -t "$SNAP_DIR/$SNAP" || team_die "$TEAM_EXIT_FAIL" "$SNAP is not a valid gzip file"
+  WORK=$(mktemp -d)
+  trap finish EXIT
+  if (( STOP_UNITS )); then
+    systemctl stop "${UNIT_LIST[@]}"
+    STOPPED=1
+    team_say "[ok] stopped staging services"
+  fi
+  case $DB_ENGINE in
+    postgres) printf 'DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' "$DB_NAME" | team_db_exec postgres "" ;;
+    *) printf 'DROP DATABASE IF EXISTS `%s`;\n' "$DB_NAME" | team_db_exec "$DB_ENGINE" "" ;;
+  esac
+  team_db_create_app "$DB_ENGINE" "$DB_NAME" "$DB_USER"
+  if ! gunzip -c "$SNAP_DIR/$SNAP" | team_db_restore "$DB_ENGINE" "$DB_NAME" "$DB_USER" > /dev/null 2> "$WORK/restore.log"; then
+    tail -n 10 "$WORK/restore.log" | sed 's/^/  /' >&2
+    team_die "$TEAM_EXIT_FAIL" "restoring $SNAP into $DB_NAME failed"
+  fi
+  team_say "[ok] $DB_NAME now holds $SNAP"
+  if [[ -L $APP_DIR/current ]]; then
+    runuser -u "$APP_USER" -- bash -c 'set -euo pipefail; . "$1"; team_run_migrate "$2" "$3" "$4"' _ \
+      "$TEAM_SELF_DIR/lib.sh" "$APP_DIR/current" "$APP_DIR/shared/.env" "$MIGRATE_CMD" \
+      || team_die "$TEAM_EXIT_FAIL" "staging migrations failed (the database holds the snapshot)"
+    team_say "[ok] staging migrations ran"
+  fi
+  team_say "Done: staging refreshed from $SNAP."
+else
+  team_say "Plan only. Nothing changed. Re-run with --apply to refresh staging."
+fi

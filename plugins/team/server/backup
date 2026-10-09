@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# backup — compressed, timestamped dumps of a project's production database, with retention and a
+# restore test (docs/rules.md §11). The off-server copy is the pack's one open item (marked below).
+set -Eeuo pipefail
+TEAM_PROG=backup
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: backup <project> [--verify | --pre-deploy]
+
+  (no option)   nightly backup: /var/lib/team/<project>/backups/backup-<utc>.sql.gz (keep 14)
+  --pre-deploy  the same, named backup-<utc>-pre-deploy.sql.gz (keep 5); deploy-receive runs it
+                through its narrow sudo rule before migrating production
+  --verify      restore the newest backup into a temporary database, check it has tables, drop it
+
+Dumps never lock tables (pg_dump; mysqldump --single-transaction --skip-lock-tables). Backups are
+root-only (700 directory, 600 files). Off-server copies go to OFFSITE_BACKUP_TARGET in
+/etc/team/backup.conf once that exists. Run as root.
+
+Exit codes: 0 ok (or DB_ENGINE=none), 1 failure, 2 usage, 5 not provisioned.
+EOF
+}
+
+MODE=nightly
+PROJECT=""
+for a in "$@"; do
+  case $a in
+    -h|--help) usage; exit 0 ;;
+    --verify) MODE=verify ;;
+    --pre-deploy) MODE=pre-deploy ;;
+    -*) team_usage_error "unknown option '$a'" ;;
+    *) [[ -z $PROJECT ]] || team_usage_error "only one project"; PROJECT=$a ;;
+  esac
+done
+[[ -n $PROJECT ]] || team_usage_error "expected <project>"
+team_valid_project "$PROJECT" || team_usage_error "bad project name '$PROJECT'"
+team_require_root
+
+CONF=$(team_conf_file "$PROJECT" production)
+[[ -r $CONF ]] || team_die "$TEAM_EXIT_PREREQ" "$PROJECT production is not provisioned on this server"
+DB_ENGINE=$(team_conf_get "$CONF" DB_ENGINE none)
+DB_NAME=$(team_conf_get "$CONF" DB_NAME)
+if [[ $DB_ENGINE == none ]]; then team_say "[skip] $PROJECT has no database (DB_ENGINE=none)"; exit 0; fi
+team_valid_ident "$DB_NAME" || team_die "$TEAM_EXIT_FAIL" "bad DB_NAME in $CONF"
+DIR=$TEAM_VAR_ROOT/$PROJECT/backups
+
+team_flock "$PROJECT-db" 1800
+install -d -m 711 -o root -g root "$TEAM_VAR_ROOT/$PROJECT"
+install -d -m 700 -o root -g root "$DIR"
+trap team_err_trap ERR
+
+TMPDB="" PARTIAL=""
+cleanup() {
+  local rc=$?
+  if [[ -n $TMPDB ]]; then team_tmpdb_drop "$DB_ENGINE" "$PROJECT" "$TMPDB" >/dev/null 2>&1 || team_warn "could not drop $TMPDB"; fi
+  [[ -n $PARTIAL && -e $PARTIAL ]] && rm -f -- "$PARTIAL"
+  exit "$rc"
+}
+trap cleanup EXIT
+
+# keep <glob> <count> : delete all but the newest <count> files matching <glob> in $DIR
+keep() {
+  local n=0 f
+  while IFS= read -r f; do
+    n=$((n + 1))
+    (( n <= $2 )) && continue
+    rm -f -- "${DIR:?}/$f"
+    team_say "[remove] old backup $f"
+  done < <(find "$DIR" -maxdepth 1 -type f -name "$1" -printf '%f\n' | sort -r)
+}
+
+if [[ $MODE == verify ]]; then
+  team_tmpdb_cleanup "$PROJECT"
+  newest=$(find "$DIR" -maxdepth 1 -type f -name 'backup-*.sql.gz' -printf '%f\n' | sort -r | head -n 1)
+  [[ -n $newest ]] || team_die "$TEAM_EXIT_FAIL" "no backup in $DIR to verify"
+  gzip -t "$DIR/$newest" || team_die "$TEAM_EXIT_FAIL" "$newest is not a valid gzip file"
+  TMPDB=$(team_tmpdb_create "$DB_ENGINE" "$PROJECT" verify)
+  if ! gunzip -c "$DIR/$newest" | team_db_restore "$DB_ENGINE" "$TMPDB" >/dev/null 2>"$DIR/.verify.log"; then
+    tail -n 10 "$DIR/.verify.log" | sed 's/^/  /' >&2
+    rm -f -- "$DIR/.verify.log"
+    team_die "$TEAM_EXIT_FAIL" "restore test FAILED: $newest did not restore cleanly"
+  fi
+  rm -f -- "$DIR/.verify.log"
+  tables=$(team_db_table_count "$DB_ENGINE" "$TMPDB")
+  team_tmpdb_drop "$DB_ENGINE" "$PROJECT" "$TMPDB" >/dev/null
+  TMPDB=""
+  [[ $tables =~ ^[0-9]+$ && $tables -gt 0 ]] || team_die "$TEAM_EXIT_FAIL" "restore test FAILED: $newest restored no tables"
+  team_say "[ok] verify: $newest restored into a temporary database ($tables tables), then dropped"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------- dump
+stamp=$(team_utc_stamp)
+suffix=""; [[ $MODE == pre-deploy ]] && suffix=-pre-deploy
+while [[ -e $DIR/backup-$stamp$suffix.sql.gz ]]; do sleep 1; stamp=$(team_utc_stamp); done
+name=backup-$stamp$suffix.sql.gz
+
+size=$(team_db_size_bytes "$DB_ENGINE" "$DB_NAME" || echo 0)
+free=$(( $(df -Pk "$DIR" | awk 'NR == 2 { print $4 }') * 1024 ))
+if [[ $size =~ ^[0-9]+$ ]] && (( free < size )); then
+  team_die "$TEAM_EXIT_FAIL" "not enough disk space in $DIR for a backup of $DB_NAME"
+fi
+
+PARTIAL=$DIR/.$name.partial
+( umask 077; team_db_dump "$DB_ENGINE" "$DB_NAME" backup | gzip -6 > "$PARTIAL" ) \
+  || team_die "$TEAM_EXIT_FAIL" "could not dump $DB_NAME"
+gzip -t "$PARTIAL" || team_die "$TEAM_EXIT_FAIL" "the new backup is not a valid gzip file"
+chmod 600 "$PARTIAL"
+mv -fT "$PARTIAL" "$DIR/$name"
+PARTIAL=""
+team_say "[ok] backup $DIR/$name ($(du -h "$DIR/$name" | cut -f1))"
+
+if [[ $MODE == pre-deploy ]]; then keep 'backup-*-pre-deploy.sql.gz' "$TEAM_KEEP_PREDEPLOY"
+else keep 'backup-*Z.sql.gz' "$TEAM_KEEP_BACKUPS"; fi
+
+# ---------------------------------------------------------------------------- off-server copy
+OFFSITE=$(team_conf_get "$TEAM_ETC_DIR/backup.conf" OFFSITE_BACKUP_TARGET)
+if [[ -z $OFFSITE ]]; then
+  team_say "[todo] off-server backup target not configured"
+else
+  # TODO(offsite-backup): encrypt "$DIR/$name" with age (recipient from /etc/team/backup.conf) and
+  # upload it to "$OFFSITE", once the owner has chosen the storage. Until then nothing leaves the server.
+  team_say "[todo] OFFSITE_BACKUP_TARGET is set, but the encrypted upload is not built yet; the backup stays on this server"
+fi

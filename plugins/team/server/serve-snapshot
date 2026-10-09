@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# serve-snapshot — SSH forced command of a project's restricted db-pull key (docs/rules.md §11).
+# Runs as the production user. Streams only the newest sanitized snapshot; never backups or raw dumps.
+set -Eeuo pipefail
+TEAM_PROG=serve-snapshot
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: serve-snapshot <project>
+  (installed as the forced command of the db-pull key; the request comes from SSH_ORIGINAL_COMMAND)
+
+  latest       stream the newest sanitized dump (sanitized-<utc>.sql.gz) to stdout
+  latest-name  print its file name
+
+Anything else is refused (exit 4). Exit 3 when production has no sanitized snapshot yet.
+EOF
+}
+
+case ${1:-} in -h|--help) usage; exit 0 ;; esac
+(($# == 1)) || team_usage_error "expected <project>"
+PROJECT=$1
+team_valid_project "$PROJECT" || team_usage_error "bad project name '$PROJECT'"
+me=$(id -un)
+[[ $me == "$PROJECT-production" || $me == root ]] || team_die "$TEAM_EXIT_REFUSED" "must run as $PROJECT-production"
+
+REQ=${SSH_ORIGINAL_COMMAND-}
+case $REQ in
+  latest|latest-name) ;;
+  *) team_die "$TEAM_EXIT_REFUSED" "refused: only 'latest' and 'latest-name' are allowed" ;;
+esac
+
+DIR=$TEAM_VAR_ROOT/$PROJECT/snapshots
+[[ -L $DIR/latest ]] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no sanitized snapshot yet (production's first nightly run hasn't happened)"
+name=$(readlink "$DIR/latest")
+[[ $name =~ ^sanitized-[0-9]{8}T[0-9]{6}Z\.sql\.gz$ ]] || team_die "$TEAM_EXIT_FAIL" "unexpected snapshot link target"
+[[ -f $DIR/$name && ! -L $DIR/$name ]] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "the latest snapshot file is missing"
+
+case $REQ in
+  latest-name) printf '%s\n' "$name" ;;
+  latest) exec cat -- "$DIR/$name" ;;
+esac

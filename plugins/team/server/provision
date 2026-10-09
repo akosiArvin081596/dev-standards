@@ -1,0 +1,1009 @@
+#!/usr/bin/env bash
+# provision — set up one project environment (<project>-<env>) on this server from a bundle that
+# team-provision sends (docs/rules.md §12). Plan by default; changes only with --apply.
+# shellcheck disable=SC2016  # nginx and systemd \$variables in single quotes are literal on purpose
+set -Eeuo pipefail
+TEAM_PROG=provision
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: provision --bundle <dir> [--apply]
+
+Sets up one environment of a project on this server, from <dir>/inputs.conf and <dir>/ops/:
+  OS user and /srv/team/<project>/<env>/{releases,shared,current}; shared/.env from the template;
+  app port (9100-9899); database and least-privilege database user; nginx vhost (proxy, php-fpm or
+  static), TLS with certbot, basic auth + noindex on staging; systemd units from ops/services.conf
+  and logrotate; the deploy key (forced command deploy-receive) and the narrow sudo rule;
+  production only: nightly snapshot + backup and weekly backup --verify timers, and the db-pull
+  key (forced command serve-snapshot). Installs the server scripts under /usr/local/lib/team/.
+
+Prints a plan ([create] [update] [remove] [ok] [skip] lines) and changes nothing unless --apply.
+Re-running applies changes made in ops/ and is otherwise a no-op. Refuses (exit 4) to reuse an OS
+user, database, database user or nginx file the pack did not create. Run as root (sudo).
+The last line is "TEAM-RESULT ok" or "TEAM-RESULT fail <reason>".
+
+inputs.conf keys: PROJECT ENV HOST BASIC_AUTH_USER BASIC_AUTH_PASSWORD (staging) DEPLOY_PUBKEY
+  DBPULL_PUBKEY (production) TIMEZONE LOW_TRAFFIC_HOUR ACME_EMAIL, and TLS=skip (tests only).
+
+Exit codes: 0 ok, 1 failure, 2 usage, 4 refused, 5 missing prerequisite, 6 manual step needed.
+EOF
+}
+
+for a in "$@"; do case $a in -h|--help) usage; exit 0 ;; esac; done
+
+WORK=""
+RESULT_ARMED=1
+# shellcheck disable=SC2329  # invoked by the EXIT trap
+on_exit() {
+  local rc=$?
+  [[ -n $WORK && -d $WORK ]] && rm -rf "${WORK:?}"
+  if [[ $RESULT_ARMED == 1 ]]; then
+    if (( rc == 0 )); then printf 'TEAM-RESULT ok\n'
+    else printf 'TEAM-RESULT fail %s\n' "$(printf '%s' "${TEAM_FAIL_REASON:-exit $rc}" | tr '\n' ' ')"; fi
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
+trap team_err_trap ERR
+
+BUNDLE=""
+while (($#)); do
+  case $1 in
+    --bundle) (($# >= 2)) || team_usage_error "--bundle needs a directory"; BUNDLE=$2; shift 2 ;;
+    --bundle=*) BUNDLE=${1#*=}; shift ;;
+    --apply) TEAM_APPLY=1; shift ;;
+    *) team_usage_error "unknown argument '$1'" ;;
+  esac
+done
+[[ -n $BUNDLE ]] || team_usage_error "--bundle <dir> is required"
+[[ -d $BUNDLE ]] || team_usage_error "bundle directory not found: $BUNDLE"
+
+applying() { [[ $TEAM_APPLY == 1 ]]; }
+refuse() { team_die "$TEAM_EXIT_REFUSED" "refusing: $*"; }
+
+team_require_root
+team_os_check
+team_require_cmd openssl install useradd getent runuser ss flock visudo curl
+WORK=$(mktemp -d)
+team_flock provision 600
+
+# ============================================================================ inputs
+INPUTS=$BUNDLE/inputs.conf
+OPS=$BUNDLE/ops
+[[ -r $INPUTS ]] || team_die "$TEAM_EXIT_PREREQ" "missing $INPUTS"
+[[ -r $OPS/project.conf ]] || team_die "$TEAM_EXIT_PREREQ" "missing $OPS/project.conf"
+PCONF=$OPS/project.conf
+
+PROJECT=$(team_conf_get "$INPUTS" PROJECT)
+ENV_NAME=$(team_conf_get "$INPUTS" ENV)
+HOST=$(team_conf_get "$INPUTS" HOST)
+BASIC_AUTH_USER=$(team_conf_get "$INPUTS" BASIC_AUTH_USER)
+BASIC_AUTH_PASSWORD=$(team_conf_get "$INPUTS" BASIC_AUTH_PASSWORD)
+DEPLOY_PUBKEY=$(team_conf_get "$INPUTS" DEPLOY_PUBKEY)
+DBPULL_PUBKEY=$(team_conf_get "$INPUTS" DBPULL_PUBKEY)
+TIMEZONE=$(team_conf_get "$INPUTS" TIMEZONE "$(team_conf_get "$PCONF" PROJECT_TIMEZONE UTC)")
+LOW_TRAFFIC_HOUR=$(team_conf_get "$INPUTS" LOW_TRAFFIC_HOUR "$(team_conf_get "$PCONF" LOW_TRAFFIC_HOUR 3)")
+ACME_EMAIL=$(team_conf_get "$INPUTS" ACME_EMAIL)
+TLS=$(team_conf_get "$INPUTS" TLS on)
+
+PROJECT_NAME_CONF=$(team_conf_get "$PCONF" PROJECT_NAME)
+DB_ENGINE=$(team_conf_get "$PCONF" DB_ENGINE none)
+WEB_MODE=$(team_conf_get "$PCONF" WEB_MODE proxy)
+HEALTH_PATH=$(team_conf_get "$PCONF" HEALTH_PATH /health)
+MIGRATE_CMD=$(team_conf_get "$PCONF" MIGRATE_CMD)
+SHARED_PATHS=$(team_conf_get "$PCONF" SHARED_PATHS)
+STATIC_ROOT=$(team_conf_get "$PCONF" STATIC_ROOT public)
+
+# ---------------------------------------------------------------------------- validation
+team_check_project_env "$PROJECT" "$ENV_NAME"
+[[ -z $PROJECT_NAME_CONF || $PROJECT_NAME_CONF == "$PROJECT" ]] \
+  || team_usage_error "PROJECT ($PROJECT) does not match PROJECT_NAME in ops/project.conf ($PROJECT_NAME_CONF)"
+[[ $HOST =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ && ${#HOST} -le 253 ]] \
+  || team_usage_error "HOST must be a lowercase DNS name (got '$HOST')"
+case $DB_ENGINE in postgres|mysql|mariadb|none) ;; *) team_usage_error "DB_ENGINE must be postgres, mysql, mariadb or none" ;; esac
+case $WEB_MODE in proxy|php-fpm|static) ;; *) team_usage_error "WEB_MODE must be proxy, php-fpm or static" ;; esac
+[[ $HEALTH_PATH =~ ^/[A-Za-z0-9._~/-]*$ ]] || team_usage_error "HEALTH_PATH must be a plain path such as /health"
+[[ $STATIC_ROOT == . ]] || team_valid_relpath "$STATIC_ROOT" || team_usage_error "STATIC_ROOT must be a relative path inside the release"
+for p in $SHARED_PATHS; do team_valid_relpath "$p" || team_usage_error "SHARED_PATHS entry '$p' must be a relative path"; done
+[[ $TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || team_usage_error "TIMEZONE must be an IANA name"
+[[ -e /usr/share/zoneinfo/$TIMEZONE ]] || team_die "$TEAM_EXIT_PREREQ" "unknown timezone $TIMEZONE (is tzdata installed?)"
+if ! [[ $LOW_TRAFFIC_HOUR =~ ^[0-9]{1,2}$ ]] || (( 10#$LOW_TRAFFIC_HOUR > 23 )); then team_usage_error "LOW_TRAFFIC_HOUR must be 0-23"; fi
+LOW_TRAFFIC_HOUR=$(printf '%02d' "$((10#$LOW_TRAFFIC_HOUR))")
+case $TLS in on|yes|true) TLS=on ;; skip|off|no) TLS=skip ;; *) team_usage_error "TLS must be on or skip" ;; esac
+[[ -z $ACME_EMAIL || $ACME_EMAIL =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || team_usage_error "ACME_EMAIL is not an email address"
+[[ $MIGRATE_CMD != *$'\n'* ]] || team_usage_error "MIGRATE_CMD must be one line"
+
+# parse_pubkey <value> : prints "<type> <base64>" (the comment is replaced by ours)
+parse_pubkey() {
+  local t k rest
+  read -r t k rest <<< "$1"
+  : "$rest"
+  [[ $t =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$ ]] || return 1
+  [[ $k =~ ^[A-Za-z0-9+/]+=*$ ]] || return 1
+  printf '%s %s' "$t" "$k"
+}
+[[ -n $DEPLOY_PUBKEY ]] || team_usage_error "DEPLOY_PUBKEY is missing in inputs.conf"
+DEPLOY_KEY=$(parse_pubkey "$DEPLOY_PUBKEY") || team_usage_error "DEPLOY_PUBKEY is not an OpenSSH public key"
+DBPULL_KEY=""
+if [[ $ENV_NAME == production ]]; then
+  [[ -n $DBPULL_PUBKEY ]] || team_usage_error "DBPULL_PUBKEY is missing in inputs.conf (production)"
+  DBPULL_KEY=$(parse_pubkey "$DBPULL_PUBKEY") || team_usage_error "DBPULL_PUBKEY is not an OpenSSH public key"
+fi
+if [[ $ENV_NAME == staging ]]; then
+  [[ $BASIC_AUTH_USER =~ ^[A-Za-z0-9._-]{1,64}$ ]] || team_usage_error "BASIC_AUTH_USER is missing or has odd characters (staging)"
+  [[ -n $BASIC_AUTH_PASSWORD ]] || team_usage_error "BASIC_AUTH_PASSWORD is missing (staging)"
+fi
+
+# services.conf → SVC_NAMES / SVC_TYPES / SVC_CMDS
+SVC_NAMES=(); SVC_TYPES=(); SVC_CMDS=()
+if [[ -r $OPS/services.conf ]]; then
+  n_line=0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n_line=$((n_line + 1))
+    line=$(team_trim "${line%$'\r'}")
+    [[ -z $line || $line == '#'* ]] && continue
+    IFS='|' read -r s_name s_type s_cmd <<< "$line"
+    s_name=$(team_trim "$s_name"); s_type=$(team_trim "$s_type"); s_cmd=$(team_trim "$s_cmd")
+    [[ $s_name =~ ^[a-z][a-z0-9-]{0,30}$ ]] || team_usage_error "ops/services.conf line $n_line: bad name '$s_name'"
+    case $s_type in web|worker|scheduler) ;; *) team_usage_error "ops/services.conf line $n_line: type must be web, worker or scheduler" ;; esac
+    [[ -n $s_cmd ]] || team_usage_error "ops/services.conf line $n_line: command is empty"
+    for x in "${SVC_NAMES[@]}"; do [[ $x != "$s_name" ]] || team_usage_error "ops/services.conf: duplicate name $s_name"; done
+    SVC_NAMES+=("$s_name"); SVC_TYPES+=("$s_type"); SVC_CMDS+=("$s_cmd")
+  done < "$OPS/services.conf"
+fi
+web_count=0
+for t in "${SVC_TYPES[@]}"; do [[ $t == web ]] && web_count=$((web_count + 1)); done
+(( web_count <= 1 )) || team_usage_error "ops/services.conf: at most one web service (they share PORT)"
+
+# ---------------------------------------------------------------------------- derived names
+APP_USER=$(team_app_user "$PROJECT" "$ENV_NAME")
+APP_DIR=$(team_app_dir "$PROJECT" "$ENV_NAME")
+DB_NAME=$(team_db_ident "$PROJECT" "$ENV_NAME")
+DB_USER=$DB_NAME
+CONF_FILE=$(team_conf_file "$PROJECT" "$ENV_NAME")
+SALT_FILE=$(team_salt_file "$PROJECT")
+DBPASS_FILE=$(team_dbpass_file "$PROJECT" "$ENV_NAME")
+SITE=team-$PROJECT-$ENV_NAME
+NGINX_AVAIL=/etc/nginx/sites-available/$SITE.conf
+NGINX_ENABLED=/etc/nginx/sites-enabled/$SITE.conf
+HTPASSWD=$TEAM_NGINX_AUTH_DIR/$PROJECT-staging.htpasswd
+SUDOERS=/etc/sudoers.d/$SITE
+LOGROTATE=/etc/logrotate.d/$SITE
+LOG_DIR=$TEAM_LOG_DIR/$PROJECT-$ENV_NAME
+CERT_NAME=$SITE
+CERT_DIR=/etc/letsencrypt/live/$CERT_NAME
+UNIT_DIR=/etc/systemd/system
+SYSTEMCTL=$(command -v systemctl || printf '/usr/bin/systemctl')
+[[ $DB_ENGINE == none ]] && { DB_NAME=""; DB_USER=""; }
+
+UNITS=()
+for n in "${SVC_NAMES[@]}"; do UNITS+=("$SITE-$n.service"); done
+
+PHP_VER="" POOL_FILE="" PHP_SOCK=""
+if [[ $WEB_MODE == php-fpm ]]; then
+  PHP_VER=$(team_php_fpm_version)
+  [[ -n $PHP_VER ]] || team_die "$TEAM_EXIT_PREREQ" "WEB_MODE=php-fpm but php-fpm is not installed (apt-get install php-fpm)"
+  POOL_FILE=/etc/php/$PHP_VER/fpm/pool.d/$SITE.conf
+  PHP_SOCK=/run/php/$SITE.sock
+fi
+
+if [[ $DB_ENGINE != none ]]; then
+  team_db_ready "$DB_ENGINE" || team_die "$TEAM_EXIT_PREREQ" "DB_ENGINE=$DB_ENGINE but its server is not installed or not answering as admin"
+fi
+
+WEB_MANUAL=""
+if ! command -v nginx >/dev/null 2>&1; then
+  WEB_MANUAL="nginx is not installed"
+elif ! grep -Eqs '^[[:space:]]*include[[:space:]]+/etc/nginx/sites-enabled/' /etc/nginx/nginx.conf; then
+  WEB_MANUAL="nginx does not include /etc/nginx/sites-enabled/"
+fi
+
+ledger_has() { team_ledger_has "$PROJECT" "$ENV_NAME" "$@"; }
+ledger_add() { team_ledger_add "$PROJECT" "$ENV_NAME" "$@"; }
+
+# ============================================================================ preflight (no changes)
+for r in $TEAM_RESERVED_USERS; do [[ $APP_USER != "$r" ]] || refuse "$APP_USER is a reserved user name"; done
+if getent passwd "$APP_USER" >/dev/null && ! ledger_has user "$APP_USER"; then
+  refuse "OS user $APP_USER already exists and was not created by the team pack"
+fi
+if getent group "$APP_USER" >/dev/null && ! ledger_has user "$APP_USER"; then
+  refuse "group $APP_USER already exists and was not created by the team pack"
+fi
+if [[ -e $APP_DIR || -L $APP_DIR ]] && ! ledger_has dir "$APP_DIR"; then
+  refuse "$APP_DIR already exists and was not created by the team pack"
+fi
+if [[ $DB_ENGINE != none ]]; then
+  if team_db_exists "$DB_ENGINE" "$DB_NAME" && ! ledger_has db "$DB_NAME"; then
+    refuse "database $DB_NAME already exists and was not created by the team pack"
+  fi
+  if team_dbuser_exists "$DB_ENGINE" "$DB_USER" && ! ledger_has dbuser "$DB_USER"; then
+    refuse "database user $DB_USER already exists and was not created by the team pack"
+  fi
+fi
+check_foreign_file() { # <kind> <path>
+  if [[ -e $2 || -L $2 ]] && ! ledger_has "$1" "$2"; then refuse "$2 already exists and was not created by the team pack"; fi
+}
+check_foreign_file nginx "$NGINX_AVAIL"
+check_foreign_file nginx-link "$NGINX_ENABLED"
+[[ $ENV_NAME == staging ]] && check_foreign_file htpasswd "$HTPASSWD"
+[[ -n $POOL_FILE ]] && check_foreign_file pool "$POOL_FILE"
+check_foreign_file sudoers "$SUDOERS"
+check_foreign_file logrotate "$LOGROTATE"
+for u in "${UNITS[@]}"; do check_foreign_file unit "$UNIT_DIR/$u"; done
+if [[ $ENV_NAME == production ]]; then
+  for j in snapshot backup backup-verify; do
+    check_foreign_file timer "$UNIT_DIR/team-$PROJECT-$j.timer"
+    check_foreign_file timer "$UNIT_DIR/team-$PROJECT-$j.service"
+  done
+fi
+if [[ -z $WEB_MANUAL ]]; then
+  other_server_names() {
+    local f
+    for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+      [[ -e $f ]] || continue
+      [[ $(readlink -f "$f") == "$(readlink -f "$NGINX_AVAIL" 2>/dev/null || true)" ]] && continue
+      sed 's/#.*//' "$f" | grep -oE '(^|[[:space:];{])server_name[[:space:]]+[^;]*' | sed -E 's/.*server_name[[:space:]]+//' || true
+    done | tr -s ' \t' '\n' | sed '/^$/d'
+  }
+  if other_server_names | grep -Fxq -- "$HOST"; then
+    refuse "another nginx site already serves $HOST"
+  fi
+fi
+
+team_say "provision $PROJECT $ENV_NAME ($([[ $TEAM_APPLY == 1 ]] && echo apply || echo plan)) on $(team_conf_get /etc/os-release PRETTY_NAME unknown), $(team_utc_now)"
+
+# ============================================================================ helpers
+# file_state <path> <wanted file> <mode> <owner> <group> → create | update | ok
+file_state() {
+  if [[ ! -e $1 && ! -L $1 ]]; then echo create; return; fi
+  if [[ -L $1 ]] || ! cmp -s "$1" "$2"; then echo update; return; fi
+  if [[ $(stat -c '%a %U %G' "$1") != "$3 $4 $5" ]]; then echo update; return; fi
+  echo ok
+}
+# install_file <path> <src> <mode> <owner> <group> : atomic replace
+install_file() {
+  local tmp
+  tmp="$(dirname "$1")/.$(basename "$1").team-new.$$"
+  install -m "$3" -o "$4" -g "$5" "$2" "$tmp"
+  mv -fT "$tmp" "$1"
+  return 0
+}
+# plan_file <path> <wanted file> <mode> <owner> <group> <label> : the plan line only; sets CHANGED
+CHANGED=0
+plan_file() {
+  local state
+  state=$(file_state "$1" "$2" "$3" "$4" "$5")
+  CHANGED=0
+  if [[ $state == ok ]]; then team_plan ok "$6"; return 0; fi
+  team_plan "$state" "$6"
+  CHANGED=1
+  return 0
+}
+# managed_file <ledger kind> <path> <wanted file> <mode> <owner> <group> <label> : plan, and install
+# with --apply; sets CHANGED
+managed_file() {
+  plan_file "$2" "$3" "$4" "$5" "$6" "$7"
+  if [[ $CHANGED == 1 ]] && applying; then
+    [[ -n $1 ]] && ledger_add "$1" "$2"
+    install_file "$2" "$3" "$4" "$5" "$6"
+  fi
+  return 0
+}
+# install_checked <ledger kind> <path> <src> <mode> <owner> <group> <check command...> : install,
+# run the check, and on failure put the previous file back (or remove the new one); returns 1
+install_checked() {
+  local kind=$1 path=$2 src=$3 mode=$4 owner=$5 group=$6 prev=""
+  shift 6
+  if [[ -e $path ]]; then prev=$WORK/prev.$RANDOM$RANDOM; cp -p "$path" "$prev"; fi
+  [[ -n $kind ]] && ledger_add "$kind" "$path"
+  install_file "$path" "$src" "$mode" "$owner" "$group"
+  if "$@" > "$WORK/check.log" 2>&1; then return 0; fi
+  if [[ -n $prev ]]; then install_file "$path" "$prev" "$mode" "$owner" "$group"; else rm -f -- "$path"; fi
+  sed 's/^/  | /' "$WORK/check.log" >&2
+  return 1
+}
+# ensure_dir <path> <mode> <owner> <group> [ledger kind]
+ensure_dir() {
+  if [[ ! -d $1 ]]; then
+    team_plan create "directory $1 ($3:$4 $2)"
+    if applying; then
+      [[ -n ${5:-} ]] && ledger_add "$5" "$1"
+      install -d -m "$2" -o "$3" -g "$4" "$1"
+    fi
+  elif [[ $(stat -c '%a %U %G' "$1") != "$2 $3 $4" ]]; then
+    team_plan update "directory $1 → $3:$4 $2"
+    if applying; then chown "$3:$4" "$1"; chmod "$2" "$1"; fi
+  else
+    team_plan ok "directory $1"
+  fi
+  return 0
+}
+# remove_managed <ledger kind> <path> <label> : only files this environment's ledger lists
+remove_managed() {
+  ledger_has "$1" "$2" || return 0
+  if [[ -e $2 || -L $2 ]]; then
+    team_plan remove "$3"
+    applying && rm -f -- "$2"
+  fi
+  applying && team_ledger_remove "$PROJECT" "$ENV_NAME" "$1" "$2"
+  return 0
+}
+
+# ============================================================================ 1. server scripts
+step_scripts() {
+  local f src dst changed=() state pii="" kind=update
+  ensure_dir "$TEAM_LIB_DIR" 755 root root
+  for f in $TEAM_SCRIPTS; do
+    src=$TEAM_SELF_DIR/$f dst=$TEAM_LIB_DIR/$f
+    [[ -r $src ]] || team_die "$TEAM_EXIT_PREREQ" "the bundle is missing $f"
+    if [[ $src -ef $dst ]]; then state=$(file_state "$dst" "$dst" 755 root root); else state=$(file_state "$dst" "$src" 755 root root); fi
+    if [[ $state != ok ]]; then
+      changed+=("$f")
+      [[ $state == create && ${#changed[@]} == 1 ]] && kind=create
+      [[ $state == update ]] && kind=update
+      if applying && ! [[ $src -ef $dst ]]; then install_file "$dst" "$src" 755 root root; fi
+      if applying && [[ $src -ef $dst ]]; then chown root:root "$dst"; chmod 755 "$dst"; fi
+    fi
+  done
+  if ((${#changed[@]})); then team_plan "$kind" "server scripts in $TEAM_LIB_DIR (root:root 755): ${changed[*]}"
+  else team_plan ok "server scripts in $TEAM_LIB_DIR"; fi
+  for f in "$BUNDLE/pii-patterns.txt" "$BUNDLE/config/pii-patterns.txt"; do [[ -r $f ]] && { pii=$f; break; }; done
+  if [[ -n $pii && ! $pii -ef $TEAM_PII_FILE ]]; then
+    managed_file "" "$TEAM_PII_FILE" "$pii" 644 root root "PII column patterns $TEAM_PII_FILE"
+  fi
+  return 0
+}
+
+# ============================================================================ 2. shared folders
+step_base_dirs() {
+  ensure_dir "$TEAM_ETC_DIR" 755 root root
+  ensure_dir "$TEAM_PROJECTS_DIR" 755 root root
+  ensure_dir "$TEAM_LOG_DIR" 755 root root
+  ensure_dir "$TEAM_VAR_ROOT" 755 root root
+  ensure_dir "$TEAM_VAR_ROOT/$PROJECT" 711 root root
+  ensure_dir "$TEAM_SRV_ROOT" 755 root root
+  ensure_dir "$TEAM_SRV_ROOT/$PROJECT" 755 root root
+  return 0
+}
+
+# ============================================================================ 3. OS user and folders
+step_user() {
+  if getent passwd "$APP_USER" >/dev/null; then
+    team_plan ok "OS user $APP_USER"
+  else
+    team_plan create "OS user $APP_USER (system user, home $APP_DIR, SSH key login only)"
+    if applying; then
+      ledger_add user "$APP_USER"
+      useradd --system --user-group --home-dir "$APP_DIR" --no-create-home --shell /bin/bash \
+        --password '*' --comment "team $PROJECT $ENV_NAME" "$APP_USER"
+    fi
+  fi
+  return 0
+}
+
+step_app_dirs() {
+  local mode=750 owner=$APP_USER
+  # nginx (www-data) reads files directly in static and php-fpm modes
+  [[ $WEB_MODE == proxy ]] || mode=755
+  ensure_dir "$APP_DIR" "$mode" "$owner" "$owner" dir
+  ensure_dir "$APP_DIR/releases" 755 "$owner" "$owner"
+  ensure_dir "$APP_DIR/shared" 750 "$owner" "$owner"
+  ensure_dir "$APP_DIR/.ssh" 755 root root
+  ensure_dir "$LOG_DIR" 750 root "$owner"
+  if [[ -L $APP_DIR/current ]]; then team_plan ok "current → $(basename "$(readlink "$APP_DIR/current")")"
+  else team_plan skip "current: created by the first deploy"; fi
+  if [[ $ENV_NAME == production ]]; then
+    ensure_dir "$TEAM_VAR_ROOT/$PROJECT/backups" 700 root root
+    ensure_dir "$TEAM_VAR_ROOT/$PROJECT/snapshots" 750 root "$owner"
+  fi
+  return 0
+}
+
+# ============================================================================ 4. port and project record
+PORT=""
+choose_port() {
+  local existing p used assigned
+  existing=$(team_conf_get "$CONF_FILE" PORT)
+  if [[ $existing =~ ^[0-9]+$ ]] && (( existing >= TEAM_PORT_MIN && existing <= TEAM_PORT_MAX )); then
+    PORT=$existing; team_plan ok "app port $PORT"; return 0
+  fi
+  used=$(ss -ltnH 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u)
+  assigned=$(find "$TEAM_PROJECTS_DIR" -maxdepth 1 -name '*.conf' -exec sed -n 's/^PORT=\([0-9]*\).*/\1/p' {} + 2>/dev/null | sort -u || true)
+  for ((p = TEAM_PORT_MIN; p <= TEAM_PORT_MAX; p++)); do
+    if ! grep -qx "$p" <<< "$used" && ! grep -qx "$p" <<< "$assigned"; then PORT=$p; break; fi
+  done
+  [[ -n $PORT ]] || team_die "$TEAM_EXIT_FAIL" "no free port in $TEAM_PORT_MIN-$TEAM_PORT_MAX"
+  team_plan create "app port $PORT (first free in $TEAM_PORT_MIN-$TEAM_PORT_MAX)"
+  return 0
+}
+
+step_conf() {
+  local f=$WORK/project.conf group=$APP_USER
+  {
+    printf '# team pack: %s %s (written by provision; do not edit, re-run provision instead)\n' "$PROJECT" "$ENV_NAME"
+    printf 'PROJECT=%s\nENV=%s\nAPP_USER=%s\nAPP_DIR=%s\nPORT=%s\n' "$PROJECT" "$ENV_NAME" "$APP_USER" "$APP_DIR" "$PORT"
+    printf 'HEALTH_PATH=%s\nMIGRATE_CMD=%s\nDB_ENGINE=%s\nDB_NAME=%s\nDB_USER=%s\n' "$HEALTH_PATH" "$MIGRATE_CMD" "$DB_ENGINE" "$DB_NAME" "$DB_USER"
+    printf 'UNITS=%s\nWEB_MODE=%s\nHOST=%s\nTIMEZONE=%s\nLOW_TRAFFIC_HOUR=%s\n' "${UNITS[*]}" "$WEB_MODE" "$HOST" "$TIMEZONE" "$LOW_TRAFFIC_HOUR"
+    printf 'SHARED_PATHS=%s\nSTATIC_ROOT=%s\n' "$SHARED_PATHS" "$STATIC_ROOT"
+  } > "$f"
+  managed_file "" "$CONF_FILE" "$f" 640 root "$group" "project record $CONF_FILE"
+  return 0
+}
+
+step_salt() {
+  if [[ -s $SALT_FILE ]]; then team_plan ok "anonymization salt $SALT_FILE"; return 0; fi
+  team_plan create "anonymization salt $SALT_FILE (root 600, created once)"
+  if applying; then
+    (umask 077; openssl rand -hex 32 > "$WORK/salt")
+    install -m 600 -o root -g root "$WORK/salt" "$SALT_FILE"
+  fi
+  return 0
+}
+
+step_backup_conf() {
+  [[ $ENV_NAME == production ]] || return 0
+  if [[ -e $TEAM_ETC_DIR/backup.conf ]]; then team_plan ok "$TEAM_ETC_DIR/backup.conf"; return 0; fi
+  team_plan create "$TEAM_ETC_DIR/backup.conf (OFFSITE_BACKUP_TARGET empty until a target is chosen)"
+  if applying; then
+    printf '# team pack: backup settings for every project on this server (edit by hand).\n# OFFSITE_BACKUP_TARGET: where encrypted copies of backups go. Empty = not configured.\nOFFSITE_BACKUP_TARGET=\n' > "$WORK/backup.conf"
+    install -m 600 -o root -g root "$WORK/backup.conf" "$TEAM_ETC_DIR/backup.conf"
+  fi
+  return 0
+}
+
+# ============================================================================ 5. database
+DB_HOST="" DB_PORT="" DB_PASSWORD=""
+step_database() {
+  if [[ $DB_ENGINE == none ]]; then team_plan skip "database (DB_ENGINE=none)"; return 0; fi
+  DB_HOST=127.0.0.1
+  DB_PORT=$(team_db_port "$DB_ENGINE")
+  [[ -r $DBPASS_FILE ]] && DB_PASSWORD=$(cat "$DBPASS_FILE")
+  if team_dbuser_exists "$DB_ENGINE" "$DB_USER"; then
+    team_plan ok "database user $DB_USER ($DB_ENGINE)"
+    [[ -n $DB_PASSWORD ]] || team_warn "no stored password for $DB_USER ($DBPASS_FILE); new env keys that need {{DB_PASSWORD}} get an empty value"
+  else
+    team_plan create "database user $DB_USER ($DB_ENGINE, no server-wide privileges; password generated, never printed)"
+    if applying; then
+      ledger_add dbuser "$DB_USER"
+      DB_PASSWORD=$(openssl rand -hex 24)
+      (umask 077; printf '%s\n' "$DB_PASSWORD" > "$WORK/dbpass")
+      install -m 600 -o root -g root "$WORK/dbpass" "$DBPASS_FILE"
+      team_db_create_user "$DB_ENGINE" "$DB_USER" "$DB_PASSWORD"
+    fi
+  fi
+  if team_db_exists "$DB_ENGINE" "$DB_NAME"; then
+    team_plan ok "database $DB_NAME (only $DB_USER may connect)"
+    applying && team_db_grant_app "$DB_ENGINE" "$DB_NAME" "$DB_USER"
+  else
+    team_plan create "database $DB_NAME owned by $DB_USER (no access for other database users)"
+    if applying; then
+      ledger_add db "$DB_NAME"
+      team_db_create_app "$DB_ENGINE" "$DB_NAME" "$DB_USER"
+    fi
+  fi
+  return 0
+}
+
+# ============================================================================ 6. env file
+APP_URL=""
+render_env_line() {
+  local line=$1
+  line=${line//'{{PORT}}'/$PORT}
+  line=${line//'{{APP_URL}}'/$APP_URL}
+  line=${line//'{{APP_TIMEZONE}}'/$TIMEZONE}
+  line=${line//'{{DB_HOST}}'/$DB_HOST}
+  line=${line//'{{DB_PORT}}'/$DB_PORT}
+  line=${line//'{{DB_NAME}}'/$DB_NAME}
+  line=${line//'{{DB_USER}}'/$DB_USER}
+  line=${line//'{{DB_PASSWORD}}'/$DB_PASSWORD}
+  while [[ $line == *'{{RANDOM_SECRET}}'* ]]; do
+    line=${line/'{{RANDOM_SECRET}}'/$(openssl rand -hex 32)}
+  done
+  printf '%s\n' "$line"
+}
+step_env() {
+  local tmpl=$OPS/env/$ENV_NAME.env.tmpl env_file=$APP_DIR/shared/.env line key missing=() have
+  APP_URL="https://$HOST"; [[ $TLS == skip ]] && APP_URL="http://$HOST"
+  if [[ ! -r $tmpl ]]; then
+    team_warn "ops/env/$ENV_NAME.env.tmpl is missing; using the built-in minimal template"
+    tmpl=$WORK/minimal.env.tmpl
+    printf '%s\n' 'PORT={{PORT}}' 'APP_URL={{APP_URL}}' 'APP_TIMEZONE={{APP_TIMEZONE}}' > "$tmpl"
+    [[ $DB_ENGINE == none ]] || printf '%s\n' 'DB_HOST={{DB_HOST}}' 'DB_PORT={{DB_PORT}}' 'DB_NAME={{DB_NAME}}' 'DB_USER={{DB_USER}}' 'DB_PASSWORD={{DB_PASSWORD}}' >> "$tmpl"
+  fi
+  if grep -Eo '\{\{[A-Za-z0-9_]+\}\}' "$tmpl" | grep -Evx '\{\{(PORT|APP_URL|APP_TIMEZONE|DB_HOST|DB_PORT|DB_NAME|DB_USER|DB_PASSWORD|RANDOM_SECRET)\}\}' >/dev/null; then
+    team_warn "the env template has unknown {{…}} placeholders; they are left as written"
+  fi
+  if [[ ! -e $env_file ]]; then
+    team_plan create "env file $env_file (600; $(team_env_keys "$tmpl" | wc -l | tr -d ' ') keys; secrets generated now, never printed)"
+    if applying; then
+      (umask 077
+       while IFS= read -r line || [[ -n $line ]]; do render_env_line "${line%$'\r'}"; done < "$tmpl" > "$WORK/env")
+      install -m 600 -o "$APP_USER" -g "$APP_USER" "$WORK/env" "$env_file"
+    fi
+    return 0
+  fi
+  have=$(team_env_keys "$env_file")
+  while IFS= read -r key; do
+    [[ -n $key ]] || continue
+    grep -Fxq -- "$key" <<< "$have" || missing+=("$key")
+  done < <(team_env_keys "$tmpl")
+  if ((${#missing[@]})); then
+    team_plan update "env file $env_file: append new template keys ${missing[*]} (existing values kept)"
+    if applying; then
+      (umask 077
+       while IFS= read -r line || [[ -n $line ]]; do
+         line=${line%$'\r'}
+         [[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+         for key in "${missing[@]}"; do [[ $key == "${BASH_REMATCH[2]}" ]] && render_env_line "$line"; done
+       done < "$tmpl" > "$WORK/env-append")
+      [[ -z $(tail -c 1 "$env_file") ]] || printf '\n' >> "$env_file"
+      cat "$WORK/env-append" >> "$env_file"
+    fi
+  else
+    team_plan ok "env file $env_file (existing values kept)"
+  fi
+  if [[ $(stat -c '%a %U %G' "$env_file") != "600 $APP_USER $APP_USER" ]]; then
+    team_plan update "env file $env_file → $APP_USER 600"
+    if applying; then chown "$APP_USER:$APP_USER" "$env_file"; chmod 600 "$env_file"; fi
+  fi
+  return 0
+}
+
+# ============================================================================ 7. web server
+step_htpasswd() {
+  [[ $ENV_NAME == staging ]] || return 0
+  local group=root mode=644 cur salt want
+  if getent group www-data >/dev/null; then group=www-data; mode=640; fi
+  ensure_dir "$TEAM_NGINX_AUTH_DIR" 755 root root
+  if [[ -r $HTPASSWD ]]; then
+    cur=$(head -n 1 "$HTPASSWD")
+    if [[ ${cur%%:*} == "$BASIC_AUTH_USER" && $cur =~ :\$apr1\$([^$]+)\$ ]]; then
+      salt=${BASH_REMATCH[1]}
+      want=$(printf '%s\n' "$BASIC_AUTH_PASSWORD" | openssl passwd -apr1 -salt "$salt" -stdin)
+      if [[ $cur == "$BASIC_AUTH_USER:$want" && $(stat -c '%a %U %G' "$HTPASSWD") == "$mode root $group" ]]; then
+        team_plan ok "staging basic auth $HTPASSWD (user $BASIC_AUTH_USER)"
+        return 0
+      fi
+    fi
+    team_plan update "staging basic auth $HTPASSWD (user $BASIC_AUTH_USER, apr1)"
+  else
+    team_plan create "staging basic auth $HTPASSWD (user $BASIC_AUTH_USER, apr1)"
+  fi
+  if applying; then
+    ledger_add htpasswd "$HTPASSWD"
+    printf '%s:%s\n' "$BASIC_AUTH_USER" "$(printf '%s\n' "$BASIC_AUTH_PASSWORD" | openssl passwd -apr1 -stdin)" > "$WORK/htpasswd"
+    install_file "$HTPASSWD" "$WORK/htpasswd" "$mode" root "$group"
+  fi
+  return 0
+}
+
+step_php_pool() {
+  if [[ $WEB_MODE != php-fpm ]]; then
+    local old
+    while IFS= read -r old; do [[ -n $old ]] && remove_managed pool "$old" "php-fpm pool $old (WEB_MODE is no longer php-fpm)"; done < <(team_ledger_list "$PROJECT" "$ENV_NAME" pool)
+    return 0
+  fi
+  cat > "$WORK/pool.conf" <<EOF
+; team pack: $PROJECT $ENV_NAME (written by provision; do not edit, re-run provision instead)
+[$SITE]
+user = $APP_USER
+group = $APP_USER
+listen = $PHP_SOCK
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 30s
+pm.max_requests = 500
+chdir = /
+catch_workers_output = yes
+php_admin_value[date.timezone] = UTC
+EOF
+  plan_file "$POOL_FILE" "$WORK/pool.conf" 644 root root "php-fpm $PHP_VER pool $POOL_FILE (runs as $APP_USER)"
+  if applying && [[ $CHANGED == 1 ]]; then
+    install_checked pool "$POOL_FILE" "$WORK/pool.conf" 644 root root "php-fpm$PHP_VER" -t \
+      || team_die "$TEAM_EXIT_FAIL" "php-fpm$PHP_VER -t failed with the new pool; the previous pool was restored"
+    team_service_reload "php$PHP_VER-fpm"
+  fi
+  return 0
+}
+
+# render_vhost <out file> <tls 0|1>
+render_vhost() {
+  local out=$1 tls=$2 v6="" conn root_line="" robots="" auth="" backend health_backend site_v=${SITE//-/_}
+  [[ -s /proc/net/if_inet6 ]] && v6=1
+  conn="\$${site_v}_connection"
+  if [[ $ENV_NAME == staging ]]; then
+    robots='    add_header X-Robots-Tag "noindex, nofollow" always;'
+    auth=$(printf '    auth_basic "Staging";\n    auth_basic_user_file %s;' "$HTPASSWD")
+  fi
+  case $WEB_MODE in
+    proxy)
+      backend=$(cat <<EOF
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection $conn;
+        proxy_read_timeout 60s;
+EOF
+)
+      health_backend=$backend
+      ;;
+    static)
+      root_line="    root $APP_DIR/current$([[ $STATIC_ROOT == . ]] || printf '/%s' "$STATIC_ROOT");"
+      backend='        try_files $uri $uri/ =404;'
+      health_backend='        try_files $uri =404;'
+      ;;
+    php-fpm)
+      root_line="    root $APP_DIR/current$([[ $STATIC_ROOT == . ]] || printf '/%s' "$STATIC_ROOT");"$'\n'"    index index.php index.html;"
+      backend='        try_files $uri $uri/ /index.php?$query_string;'
+      health_backend=$(cat <<EOF
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$realpath_root/index.php;
+        fastcgi_param SCRIPT_NAME /index.php;
+        fastcgi_param DOCUMENT_ROOT \$realpath_root;
+        fastcgi_pass unix:$PHP_SOCK;
+EOF
+)
+      ;;
+  esac
+  {
+    printf '# team pack: %s %s (written by provision; do not edit, re-run provision instead)\n' "$PROJECT" "$ENV_NAME"
+    if [[ $WEB_MODE == proxy ]]; then
+      printf 'map $http_upgrade %s {\n    default upgrade;\n    %s close;\n}\n\n' "$conn" "''"
+    fi
+    if [[ $tls == 1 ]]; then
+      printf 'server {\n    listen 80;\n'
+      [[ -n $v6 ]] && printf '    listen [::]:80;\n'
+      printf '    server_name %s;\n' "$HOST"
+      [[ -n $robots ]] && printf '%s\n' "$robots"
+      printf '    location ^~ /.well-known/acme-challenge/ {\n        root %s;\n        default_type text/plain;\n    }\n' "$TEAM_ACME_ROOT"
+      printf '    location / {\n        return 301 https://$host$request_uri;\n    }\n}\n\n'
+      printf 'server {\n    listen 443 ssl;\n'
+      [[ -n $v6 ]] && printf '    listen [::]:443 ssl;\n'
+      printf '    server_name %s;\n' "$HOST"
+      printf '    ssl_certificate %s/fullchain.pem;\n    ssl_certificate_key %s/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n' "$CERT_DIR" "$CERT_DIR"
+    else
+      printf 'server {\n    listen 80;\n'
+      [[ -n $v6 ]] && printf '    listen [::]:80;\n'
+      printf '    server_name %s;\n' "$HOST"
+    fi
+    printf '    access_log /var/log/nginx/%s.access.log;\n    error_log /var/log/nginx/%s.error.log;\n    client_max_body_size 25m;\n' "$SITE" "$SITE"
+    [[ -n $root_line ]] && printf '%s\n' "$root_line"
+    [[ -n $robots ]] && printf '%s\n' "$robots"
+    [[ -n $auth ]] && printf '%s\n' "$auth"
+    printf '\n    location ^~ /.well-known/acme-challenge/ {\n        root %s;\n        default_type text/plain;\n        auth_basic off;\n    }\n' "$TEAM_ACME_ROOT"
+    printf '\n    # health check: no login, even on staging\n    location = %s {\n        auth_basic off;\n%s\n    }\n' "$HEALTH_PATH" "$health_backend"
+    printf '\n    location / {\n%s\n    }\n' "$backend"
+    if [[ $WEB_MODE == php-fpm ]]; then
+      printf '\n    location ~ \\.php$ {\n        include snippets/fastcgi-php.conf;\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        fastcgi_param DOCUMENT_ROOT $realpath_root;\n        fastcgi_pass unix:%s;\n    }\n' "$PHP_SOCK"
+    fi
+    printf '}\n'
+  } > "$out"
+  return 0
+}
+
+# shellcheck disable=SC2329  # called through install_checked
+vhost_link_and_test() {
+  [[ -L $NGINX_ENABLED ]] || ln -sfn "$NGINX_AVAIL" "$NGINX_ENABLED"
+  nginx -t
+}
+# apply_vhost <rendered file> : install, enable, nginx -t, reload; the previous file is restored
+# (and a new link removed) if nginx -t fails
+apply_vhost() {
+  local had_link=0
+  [[ -L $NGINX_ENABLED ]] && had_link=1
+  ledger_add nginx-link "$NGINX_ENABLED"
+  if ! install_checked nginx "$NGINX_AVAIL" "$1" 644 root root vhost_link_and_test; then
+    [[ $had_link == 1 ]] || rm -f -- "$NGINX_ENABLED"
+    team_die "$TEAM_EXIT_FAIL" "nginx -t failed with the new vhost; the previous configuration was restored"
+  fi
+  team_service_reload nginx
+  return 0
+}
+
+# acme_ready : nginx serves this host's ACME challenge folder (a reload takes effect a moment after
+# it is requested; certbot must not race it)
+acme_ready() {
+  local dir=$TEAM_ACME_ROOT/.well-known/acme-challenge probe i
+  install -d -m 755 -o root -g root "$TEAM_ACME_ROOT/.well-known" "$dir"
+  probe=team-probe-$(openssl rand -hex 8)
+  printf 'ok\n' > "$dir/$probe"
+  chmod 644 "$dir/$probe"
+  for ((i = 0; i < 40; i++)); do
+    if curl -fsS -o /dev/null --max-time 2 -H "Host: $HOST" "http://127.0.0.1/.well-known/acme-challenge/$probe" 2>/dev/null; then
+      rm -f -- "$dir/$probe"
+      return 0
+    fi
+    sleep 0.25
+  done
+  rm -f -- "$dir/$probe"
+  return 1
+}
+
+step_nginx() {
+  local tls_final=0 need_cert=0
+  if [[ -n $WEB_MANUAL ]]; then
+    render_vhost "$WORK/vhost" 0
+    team_plan skip "web server: $WEB_MANUAL. Add this config by hand (nginx syntax; adapt for your web server):"
+    sed 's/^/    | /' "$WORK/vhost"
+    return 0
+  fi
+  if [[ $TLS == on ]]; then
+    tls_final=1
+    [[ -r $CERT_DIR/fullchain.pem && -r $CERT_DIR/privkey.pem ]] || need_cert=1
+  fi
+  ensure_dir "$TEAM_ACME_ROOT" 755 root root
+  if applying && ! nginx -t >"$WORK/nginx-pre.log" 2>&1; then
+    sed 's/^/  nginx: /' "$WORK/nginx-pre.log" >&2
+    team_die "$TEAM_EXIT_FAIL" "nginx -t already fails before any change; fix the existing configuration first"
+  fi
+  if [[ $TLS == skip ]]; then
+    team_plan skip "TLS (TLS=skip in inputs.conf): HTTP only"
+  elif (( need_cert )); then
+    team_plan create "TLS certificate $CERT_NAME for $HOST (certbot webroot, non-interactive)"
+    if applying; then
+      if ! command -v certbot >/dev/null 2>&1; then
+        team_plan create "package certbot"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q certbot >/dev/null
+      fi
+      render_vhost "$WORK/vhost-http" 0
+      apply_vhost "$WORK/vhost-http"
+      acme_ready || team_die "$TEAM_EXIT_FAIL" "nginx is not serving the ACME challenge path for $HOST (is nginx running?)"
+      local -a certbot_args=(certonly --webroot -w "$TEAM_ACME_ROOT" -d "$HOST" --cert-name "$CERT_NAME"
+        --non-interactive --agree-tos --keep-until-expiring --deploy-hook "systemctl reload nginx")
+      if [[ -n $ACME_EMAIL ]]; then certbot_args+=(-m "$ACME_EMAIL"); else certbot_args+=(--register-unsafely-without-email); fi
+      certbot "${certbot_args[@]}" || team_die "$TEAM_EXIT_FAIL" "certbot could not get a certificate for $HOST (does its DNS point at this server?)"
+    fi
+  else
+    team_plan ok "TLS certificate $CERT_NAME"
+  fi
+  render_vhost "$WORK/vhost" "$tls_final"
+  plan_file "$NGINX_AVAIL" "$WORK/vhost" 644 root root "nginx vhost $NGINX_AVAIL ($WEB_MODE$([[ $ENV_NAME == staging ]] && printf ', basic auth + noindex')$([[ $tls_final == 1 ]] && printf ', HTTPS'))"
+  if [[ $CHANGED == 1 ]]; then
+    applying && apply_vhost "$WORK/vhost"
+  elif [[ ! -L $NGINX_ENABLED ]]; then
+    team_plan create "nginx link $NGINX_ENABLED"
+    if applying; then
+      ledger_add nginx-link "$NGINX_ENABLED"
+      ln -sfn "$NGINX_AVAIL" "$NGINX_ENABLED"
+      apply_vhost "$NGINX_AVAIL"
+    fi
+  fi
+  return 0
+}
+
+# ============================================================================ 8. services
+# systemd_escape_cmd <command> : safe inside ExecStart=/bin/bash -c "…"
+systemd_escape_cmd() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//%/%%}; s=${s//\$/\$\$}
+  printf '%s' "$s"
+}
+db_unit() {
+  case $DB_ENGINE in postgres) printf ' postgresql.service' ;; mariadb) printf ' mariadb.service' ;; mysql) printf ' mysql.service' ;; esac
+}
+UNITS_CHANGED=()
+step_units() {
+  local i unit file
+  UNITS_CHANGED=()
+  for i in "${!SVC_NAMES[@]}"; do
+    unit=${UNITS[$i]}
+    file=$WORK/$unit
+    {
+      printf '# team pack: %s %s service "%s" (from ops/services.conf; written by provision, do not edit)\n' "$PROJECT" "$ENV_NAME" "${SVC_NAMES[$i]}"
+      printf '[Unit]\nDescription=team %s %s %s (%s)\nAfter=network-online.target%s\nWants=network-online.target\n\n' \
+        "$PROJECT" "$ENV_NAME" "${SVC_NAMES[$i]}" "${SVC_TYPES[$i]}" "$(db_unit)"
+      printf '[Service]\nType=simple\nUser=%s\nGroup=%s\nWorkingDirectory=%s/current\n' "$APP_USER" "$APP_USER" "$APP_DIR"
+      printf 'Environment=TZ=UTC\n'
+      [[ ${SVC_TYPES[$i]} == web ]] && printf 'Environment=PORT=%s\n' "$PORT"
+      printf 'EnvironmentFile=%s/shared/.env\n' "$APP_DIR"
+      printf 'ExecStart=/bin/bash -c "%s"\n' "$(systemd_escape_cmd "${SVC_CMDS[$i]}")"
+      printf 'Restart=always\nRestartSec=3\nNoNewPrivileges=yes\nPrivateTmp=yes\n'
+      printf 'StandardOutput=append:%s/%s.log\nStandardError=inherit\n\n' "$LOG_DIR" "${SVC_NAMES[$i]}"
+      printf '[Install]\nWantedBy=multi-user.target\n'
+    } > "$file"
+    managed_file unit "$UNIT_DIR/$unit" "$file" 644 root root "systemd unit $unit (${SVC_TYPES[$i]}: ${SVC_CMDS[$i]})"
+    [[ $CHANGED == 1 ]] && UNITS_CHANGED+=("$unit")
+  done
+  # services removed from ops/services.conf
+  local old keep removed=()
+  while IFS= read -r old; do
+    [[ -n $old ]] || continue
+    keep=0
+    for unit in "${UNITS[@]}"; do [[ $old == "$UNIT_DIR/$unit" ]] && keep=1; done
+    (( keep )) && continue
+    if applying && team_systemd_running && [[ -e $old ]]; then systemctl disable --now "$(basename "$old")" >/dev/null 2>&1 || true; fi
+    remove_managed unit "$old" "systemd unit $(basename "$old") (no longer in ops/services.conf)"
+    removed+=("$old")
+  done < <(team_ledger_list "$PROJECT" "$ENV_NAME" unit)
+  if ((${#UNITS[@]} == 0)); then team_plan skip "no long-running services in ops/services.conf"; fi
+  if ! team_systemd_running; then
+    ((${#UNITS[@]} == 0)) || team_plan skip "systemd not running: unit files only, not enabled or started"
+    return 0
+  fi
+  if applying && (( ${#UNITS_CHANGED[@]} + ${#removed[@]} > 0 )); then systemctl daemon-reload; fi
+  for unit in "${UNITS[@]}"; do
+    if [[ $(systemctl is-enabled "$unit" 2>/dev/null || true) == enabled ]]; then
+      team_plan ok "enabled $unit"
+    else
+      team_plan update "enable $unit"
+      applying && systemctl enable "$unit" >/dev/null
+    fi
+  done
+  if [[ -L $APP_DIR/current ]]; then
+    for unit in "${UNITS_CHANGED[@]}"; do
+      team_plan update "restart $unit (unit changed)"
+      if applying && ! systemctl restart "$unit"; then
+        team_warn "$unit did not restart cleanly; see: journalctl -u $unit (the next deploy's health check decides)"
+      fi
+    done
+  elif ((${#UNITS[@]})); then
+    team_plan skip "services start with the first deploy (no release yet)"
+  fi
+  return 0
+}
+
+step_logrotate() {
+  cat > "$WORK/logrotate" <<EOF
+# team pack: $PROJECT $ENV_NAME (written by provision; do not edit)
+$LOG_DIR/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+  return 0
+}
+EOF
+  managed_file logrotate "$LOGROTATE" "$WORK/logrotate" 644 root root "logrotate $LOGROTATE"
+}
+
+# ============================================================================ 9. keys and sudo
+step_keys() {
+  {
+    printf 'command="%s/deploy-receive %s %s",restrict %s team-deploy-%s-%s\n' "$TEAM_LIB_DIR" "$PROJECT" "$ENV_NAME" "$DEPLOY_KEY" "$PROJECT" "$ENV_NAME"
+    [[ -n $DBPULL_KEY ]] && printf 'command="%s/serve-snapshot %s",restrict %s team-dbpull-%s\n' "$TEAM_LIB_DIR" "$PROJECT" "$DBPULL_KEY" "$PROJECT"
+  } > "$WORK/authorized_keys"
+  managed_file "" "$APP_DIR/.ssh/authorized_keys" "$WORK/authorized_keys" 644 root root \
+    "authorized_keys for $APP_USER: deploy key → deploy-receive$([[ -n $DBPULL_KEY ]] && printf '; db-pull key → serve-snapshot') (root-owned, forced commands)"
+  return 0
+}
+
+step_sudoers() {
+  local cmds=() u i out=$WORK/sudoers
+  for u in "${UNITS[@]}"; do cmds+=("$SYSTEMCTL reload-or-restart $u" "$SYSTEMCTL restart $u"); done
+  [[ $WEB_MODE == php-fpm ]] && cmds+=("$SYSTEMCTL reload php$PHP_VER-fpm.service")
+  [[ $ENV_NAME == production ]] && cmds+=("$TEAM_LIB_DIR/backup $PROJECT --pre-deploy")
+  if ((${#cmds[@]} == 0)); then
+    remove_managed sudoers "$SUDOERS" "sudo rule $SUDOERS (nothing left to allow)"
+    team_plan skip "sudo rule (no services to reload)"
+    return 0
+  fi
+  {
+    printf '# team pack: %s %s — exactly what deploy-receive may run as root (written by provision; do not edit)\n' "$PROJECT" "$ENV_NAME"
+    printf '%s ALL=(root) NOPASSWD: ' "$APP_USER"
+    for i in "${!cmds[@]}"; do
+      ((i == 0)) || printf ', \\\n    '
+      printf '%s' "${cmds[$i]}"
+    done
+    printf '\n'
+  } > "$out"
+  chmod 440 "$out"
+  visudo -cf "$out" >/dev/null || team_die "$TEAM_EXIT_FAIL" "the generated sudo rule does not pass visudo -c"
+  plan_file "$SUDOERS" "$out" 440 root root "sudo rule $SUDOERS (${#cmds[@]} exact commands, validated with visudo -c)"
+  if applying && [[ $CHANGED == 1 ]]; then
+    install_checked sudoers "$SUDOERS" "$out" 440 root root visudo -c \
+      || team_die "$TEAM_EXIT_FAIL" "sudoers did not validate with the new $SUDOERS; the previous rule was restored"
+  fi
+  return 0
+}
+
+# ============================================================================ 10. production timers
+CAL="" CAL_NOTE=""
+# calendar_spec <weekday|""> <HH> <MM> : OnCalendar in the project's timezone, or converted to
+# server time when this systemd can't take a timezone (DST caveat noted).
+calendar_spec() {
+  local dow=$1 hh=$2 mm=$3 base ref u d h m
+  base="${dow:+$dow }*-*-* $hh:$mm:00"
+  CAL_NOTE=""
+  if [[ ${TEAM_TIMER_TZ_CONVERT:-0} != 1 ]] && command -v systemd-analyze >/dev/null 2>&1 \
+     && systemd-analyze calendar "$base $TIMEZONE" >/dev/null 2>&1; then
+    CAL="$base $TIMEZONE"
+    return 0
+  fi
+  ref=$(TZ=$TIMEZONE date +%F)
+  if [[ -n $dow ]]; then
+    u=$(TZ=$TIMEZONE date -d "$ref" +%u)
+    ref=$(date -d "$ref +$(( (7 - u) % 7 )) days" +%F)
+  fi
+  read -r d h m <<< "$(date -d "TZ=\"$TIMEZONE\" $ref $hh:$mm" '+%a %H %M')"
+  CAL="${dow:+$d }*-*-* $h:$m:00"
+  CAL_NOTE="converted from ${dow:+$dow }$hh:$mm $TIMEZONE to server time on $(date -u +%F); a daylight-saving change in either zone shifts it by an hour until provision is re-run"
+}
+step_timers() {
+  [[ $ENV_NAME == production ]] || return 0
+  local job desc args dow mm name changed_timers=()
+  for job in backup snapshot backup-verify; do
+    case $job in
+      backup)        desc="nightly production backup";             args="$PROJECT";          dow="";    mm=00 ;;
+      snapshot)      desc="nightly sanitized snapshot";            args="$PROJECT";          dow="";    mm=20 ;;
+      backup-verify) desc="weekly restore test of the newest backup"; args="$PROJECT --verify"; dow=Sun; mm=40 ;;
+    esac
+    name=team-$PROJECT-$job
+    calendar_spec "$dow" "$LOW_TRAFFIC_HOUR" "$mm"
+    {
+      printf '# team pack: %s %s (written by provision; do not edit)\n' "$PROJECT" "$desc"
+      printf '[Unit]\nDescription=team %s: %s\nAfter=network-online.target%s\n\n' "$PROJECT" "$desc" "$(db_unit)"
+      printf '[Service]\nType=oneshot\nExecStart=%s/%s %s\nNice=10\nIOSchedulingClass=idle\n' "$TEAM_LIB_DIR" "${job%-verify}" "$args"
+    } > "$WORK/$name.service"
+    {
+      printf '# team pack: %s %s at %s:%s %s (low-traffic hour; written by provision, do not edit)\n' "$PROJECT" "$desc" "$LOW_TRAFFIC_HOUR" "$mm" "$TIMEZONE"
+      [[ -n $CAL_NOTE ]] && printf '# NOTE: %s\n' "$CAL_NOTE"
+      printf '[Unit]\nDescription=team %s: %s\n\n[Timer]\nOnCalendar=%s\nPersistent=false\nAccuracySec=1min\n\n[Install]\nWantedBy=timers.target\n' "$PROJECT" "$desc" "$CAL"
+    } > "$WORK/$name.timer"
+    managed_file timer "$UNIT_DIR/$name.service" "$WORK/$name.service" 644 root root "systemd service $name.service ($TEAM_LIB_DIR/${job%-verify} $args)"
+    [[ $CHANGED == 1 ]] && changed_timers+=("$name.timer")
+    managed_file timer "$UNIT_DIR/$name.timer" "$WORK/$name.timer" 644 root root "timer $name.timer (OnCalendar=$CAL)"
+    [[ $CHANGED == 1 ]] && changed_timers+=("$name.timer")
+    [[ -n $CAL_NOTE ]] && team_plan note "$name.timer: $CAL_NOTE"
+  done
+  if ! team_systemd_running; then team_plan skip "systemd not running: timer files only, not enabled"; return 0; fi
+  applying && ((${#changed_timers[@]})) && systemctl daemon-reload
+  for job in backup snapshot backup-verify; do
+    name=team-$PROJECT-$job.timer
+    if [[ $(systemctl is-enabled "$name" 2>/dev/null || true) == enabled ]] && systemctl is-active -q "$name"; then
+      if printf '%s\n' "${changed_timers[@]}" | grep -Fxq "$name"; then
+        team_plan update "restart $name (schedule changed)"
+        applying && systemctl restart "$name"
+      else
+        team_plan ok "enabled $name"
+      fi
+    else
+      team_plan update "enable and start $name"
+      applying && systemctl enable --now "$name" >/dev/null
+    fi
+  done
+  return 0
+}
+
+# ============================================================================ run
+step_scripts
+step_base_dirs
+step_user
+step_app_dirs
+choose_port
+step_conf
+step_salt
+step_backup_conf
+step_database
+step_env
+step_htpasswd
+step_php_pool
+step_nginx
+step_units
+step_logrotate
+step_keys
+step_sudoers
+step_timers
+
+if applying; then
+  if (( TEAM_CHANGES == 0 )); then team_say "No changes: $PROJECT $ENV_NAME is up to date."
+  else team_say "Applied $TEAM_CHANGES change(s) to $PROJECT $ENV_NAME."; fi
+else
+  team_say "Plan: $TEAM_CHANGES change(s). Nothing changed. Re-run with --apply to make them."
+fi
+if [[ -n $WEB_MANUAL ]]; then
+  team_die "$TEAM_EXIT_OWNER" "$WEB_MANUAL: add the printed web server config by hand"
+fi
+exit 0

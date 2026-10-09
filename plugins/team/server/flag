@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# flag — switch a feature flag in one environment's database and log who did it (docs/rules.md §11).
+set -Eeuo pipefail
+TEAM_PROG=flag
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: flag <project> <staging|production> <name> on|off [--by <who>]
+
+Upserts feature_flags(name, enabled, updated_at, updated_by) in that environment's database, with
+updated_at in UTC, and appends "utc_ts project env name on|off by" to /var/log/team/flags.log.
+<who> defaults to the sudo user. Run as root.
+
+Exit codes: 0 ok, 1 failure (e.g. no feature_flags table yet), 2 usage, 3 no database, 5 not provisioned.
+EOF
+}
+
+BY="" ARGS=()
+while (($#)); do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --by) (($# >= 2)) || team_usage_error "--by needs a value"; BY=$2; shift 2 ;;
+    --by=*) BY=${1#*=}; shift ;;
+    -*) team_usage_error "unknown option '$1'" ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+((${#ARGS[@]} == 4)) || team_usage_error "expected <project> <env> <name> on|off"
+PROJECT=${ARGS[0]} ENV_NAME=${ARGS[1]} NAME=${ARGS[2]} STATE=${ARGS[3]}
+team_check_project_env "$PROJECT" "$ENV_NAME"
+[[ $NAME =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]] || team_usage_error "flag name must match [a-z0-9][a-z0-9_.-]{0,63}"
+case $STATE in on) VALUE=TRUE ;; off) VALUE=FALSE ;; *) team_usage_error "state must be on or off" ;; esac
+[[ -n $BY ]] || BY=${SUDO_USER:-$(id -un)}
+[[ $BY =~ ^[A-Za-z0-9._@-]{1,64}$ ]] || team_usage_error "--by must match [A-Za-z0-9._@-]{1,64}"
+team_require_root
+trap team_err_trap ERR
+
+CONF=$(team_conf_file "$PROJECT" "$ENV_NAME")
+[[ -r $CONF ]] || team_die "$TEAM_EXIT_PREREQ" "$PROJECT $ENV_NAME is not provisioned on this server"
+DB_ENGINE=$(team_conf_get "$CONF" DB_ENGINE none)
+DB_NAME=$(team_conf_get "$CONF" DB_NAME)
+[[ $DB_ENGINE != none ]] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "$PROJECT has no database (DB_ENGINE=none)"
+team_valid_ident "$DB_NAME" || team_die "$TEAM_EXIT_FAIL" "bad DB_NAME in $CONF"
+
+if [[ $DB_ENGINE == postgres ]]; then
+  has=$(team_db_query postgres "$DB_NAME" "SELECT to_regclass('feature_flags') IS NOT NULL")
+  [[ $has == t ]] || team_die "$TEAM_EXIT_FAIL" "no feature_flags table in $DB_NAME (has the app's migration run?)"
+else
+  has=$(team_db_query "$DB_ENGINE" "" "SELECT count(*) FROM information_schema.tables WHERE table_schema = '$DB_NAME' AND table_name = 'feature_flags'")
+  [[ $has == 1 ]] || team_die "$TEAM_EXIT_FAIL" "no feature_flags table in $DB_NAME (has the app's migration run?)"
+fi
+
+TS=$(team_utc_now)
+SQL_TS=$(date -u -d "$TS" '+%Y-%m-%d %H:%M:%S')
+if [[ $DB_ENGINE == postgres ]]; then
+  team_db_exec postgres "$DB_NAME" <<SQL
+SET TIME ZONE 'UTC';
+BEGIN;
+UPDATE feature_flags SET enabled = $VALUE, updated_at = '$SQL_TS', updated_by = '$BY' WHERE name = '$NAME';
+INSERT INTO feature_flags (name, enabled, updated_at, updated_by)
+  SELECT '$NAME', $VALUE, '$SQL_TS', '$BY' WHERE NOT EXISTS (SELECT 1 FROM feature_flags WHERE name = '$NAME');
+COMMIT;
+SQL
+else
+  team_db_exec "$DB_ENGINE" "$DB_NAME" <<SQL
+SET time_zone = '+00:00';
+START TRANSACTION;
+UPDATE feature_flags SET enabled = $VALUE, updated_at = '$SQL_TS', updated_by = '$BY' WHERE name = '$NAME';
+INSERT INTO feature_flags (name, enabled, updated_at, updated_by)
+  SELECT '$NAME', $VALUE, '$SQL_TS', '$BY' FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM feature_flags WHERE name = '$NAME');
+COMMIT;
+SQL
+fi
+
+install -d -m 755 -o root -g root "$TEAM_LOG_DIR"
+[[ -e $TEAM_LOG_DIR/flags.log ]] || install -m 640 -o root -g root /dev/null "$TEAM_LOG_DIR/flags.log"
+printf '%s %s %s %s %s %s\n' "$TS" "$PROJECT" "$ENV_NAME" "$NAME" "$STATE" "$BY" >> "$TEAM_LOG_DIR/flags.log"
+team_say "[ok] flag $NAME is $STATE in $PROJECT $ENV_NAME (by $BY, $TS)"

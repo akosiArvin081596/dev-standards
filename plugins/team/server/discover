@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# discover — read-only inventory of this server for /team:new-project (docs/rules.md §11).
+# Changes nothing. Prints "KEY: value" lines in "== section" blocks. Works without root; with root
+# (sudo) it also sees process names on ports and user crontabs.
+set -Eeuo pipefail
+TEAM_PROG=discover
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: discover
+
+Read-only report of this server: OS and version, web servers, database engines, runtimes, existing
+sites (server names), users (uid >= 1000 and names the pack would clash with), team pack projects,
+disk, RAM, listening ports, firewall, systemd timers and cron. Changes nothing.
+Cron commands are not printed (they may hold secrets): only files, users and entry counts.
+EOF
+}
+case ${1:-} in -h|--help) usage; exit 0 ;; "") ;; *) team_usage_error "discover takes no arguments" ;; esac
+
+kv() { local v; v=$(team_trim "${2:-}"); printf '%s: %s\n' "$1" "${v:-unknown}"; }
+section() { printf '\n== %s\n' "$1"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+first_line() { "$@" 2>&1 | head -n 1 || true; }
+
+# ---------------------------------------------------------------------------- system
+section system
+kv OS "$(team_conf_get /etc/os-release PRETTY_NAME unknown)"
+kv OS_ID "$(team_conf_get /etc/os-release ID unknown)"
+kv OS_VERSION "$(team_conf_get /etc/os-release VERSION_ID unknown)"
+if [[ -z $(team_os_check) ]]; then kv OS_SUPPORTED yes
+else kv OS_SUPPORTED "no (supported: Ubuntu 24.04 and newer LTS)"; fi
+kv KERNEL "$(uname -r)"
+kv ARCH "$(uname -m)"
+tz=""
+have timedatectl && team_systemd_running && tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+[[ -n $tz ]] || tz=$(cat /etc/timezone 2>/dev/null || true)
+[[ -n $tz ]] || tz=$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##' || true)
+kv SERVER_TIMEZONE "${tz:-UTC} (never changed by the pack)"
+kv TIME_UTC "$(team_utc_now)"
+if team_systemd_running; then kv SYSTEMD "running ($(systemctl --version 2>/dev/null | head -n 1 | awk '{print $2}'))"
+else kv SYSTEMD "not running"; fi
+if have systemd-analyze && systemd-analyze calendar '*-*-* 03:00:00 Asia/Manila' >/dev/null 2>&1; then
+  kv TIMER_TIMEZONES "supported (OnCalendar with a timezone)"
+else
+  kv TIMER_TIMEZONES "not supported (timers are converted to server time)"
+fi
+kv UPTIME "$(uptime -p 2>/dev/null || true)"
+
+# ---------------------------------------------------------------------------- web servers
+section "web servers"
+if have nginx; then
+  v=$(nginx -v 2>&1 | sed 's#.*nginx/##')
+  st=installed; pgrep -x nginx >/dev/null 2>&1 && st=running
+  kv NGINX "$v ($st)"
+  if grep -Eqs '^[[:space:]]*include[[:space:]]+/etc/nginx/sites-enabled/' /etc/nginx/nginx.conf; then kv NGINX_SITES_ENABLED yes
+  else kv NGINX_SITES_ENABLED "no (provision would print the vhost instead)"; fi
+else kv NGINX "not installed"; fi
+if have apache2; then
+  st=installed; pgrep -x apache2 >/dev/null 2>&1 && st=running
+  kv APACHE "$(apache2 -v 2>/dev/null | sed -n 's#^Server version: ##p') ($st)"
+else kv APACHE "not installed"; fi
+if have caddy; then
+  st=installed; pgrep -x caddy >/dev/null 2>&1 && st=running
+  kv CADDY "$(first_line caddy version) ($st)"
+else kv CADDY "not installed"; fi
+if have certbot; then kv CERTBOT "$(first_line certbot --version)"; else kv CERTBOT "not installed"; fi
+php=$(team_php_fpm_version)
+if [[ -n $php ]]; then kv PHP_FPM "$php"; else kv PHP_FPM "not installed"; fi
+
+# ---------------------------------------------------------------------------- databases
+section databases
+if have psql || have pg_config || [[ -d /usr/lib/postgresql ]]; then
+  vers=$(find /usr/lib/postgresql -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null || true)
+  st=installed; pgrep -x postgres >/dev/null 2>&1 && st=running
+  vers=$(team_trim "$vers")
+  kv POSTGRES "${vers:-$(first_line psql --version)} ($st)"
+else kv POSTGRES "not installed"; fi
+my_v=""
+have mysqld && my_v=$(first_line mysqld --version)
+have mariadbd && my_v=$(first_line mariadbd --version)
+if [[ -z $my_v ]] && have mysql; then my_v=$(first_line mysql --version); fi
+if [[ $my_v == *[Mm]aria[Dd][Bb]* ]]; then
+  st=installed; pgrep -x 'mariadbd|mysqld' >/dev/null 2>&1 && st=running
+  kv MARIADB "$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+-MariaDB' <<< "$my_v" | head -n 1 || true) ($st)"
+  kv MYSQL "not installed"
+elif [[ -n $my_v ]]; then
+  st=installed; pgrep -x mysqld >/dev/null 2>&1 && st=running
+  kv MYSQL "$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<< "$my_v" | head -n 1 || true) ($st)"
+  kv MARIADB "not installed"
+else
+  kv MYSQL "not installed"; kv MARIADB "not installed"
+fi
+if have redis-server; then kv REDIS "$(first_line redis-server --version | awk '{print $3}')"; fi
+
+# ---------------------------------------------------------------------------- runtimes
+section runtimes
+for rt in node php python3 ruby go java; do
+  key=$(tr '[:lower:]' '[:upper:]' <<< "$rt")
+  if ! have "$rt"; then kv "$key" "not installed"; continue; fi
+  case $rt in
+    node) kv NODE "$(first_line node --version)" ;;
+    php) kv PHP "$(first_line php -r 'echo PHP_VERSION;')" ;;
+    python3) kv PYTHON3 "$(first_line python3 --version | awk '{print $2}')" ;;
+    ruby) kv RUBY "$(first_line ruby --version | awk '{print $2}')" ;;
+    go) kv GO "$(first_line go version | awk '{print $3}')" ;;
+    java) kv JAVA "$(first_line java -version)" ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------- sites
+section sites
+found=0
+for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+  [[ -e $f ]] || continue
+  names=$(sed 's/#.*//' "$f" 2>/dev/null | grep -oE '(^|[[:space:];{])server_name[[:space:]]+[^;]*' | sed -E 's/.*server_name[[:space:]]+//' | tr -s ' \t\n' ' ' | sed 's/ $//' || true)
+  kv NGINX_SITE "$f: ${names:-(no server_name)}"
+  found=1
+done
+for f in /etc/apache2/sites-enabled/*; do
+  [[ -e $f ]] || continue
+  names=$(grep -hoiE '^[[:space:]]*(ServerName|ServerAlias)[[:space:]]+.*' "$f" 2>/dev/null | awk '{ $1 = ""; print }' | tr -s ' \n' ' ' | sed 's/^ //; s/ $//')
+  kv APACHE_SITE "$f: ${names:-(no ServerName)}"
+  found=1
+done
+if [[ -r /etc/caddy/Caddyfile ]]; then
+  kv CADDY_SITES "$(grep -oE '^[^#[:space:]{][^{]*\{' /etc/caddy/Caddyfile | tr -d '{' | tr -s ' \n' ' ' | sed 's/ $//')"
+  found=1
+fi
+(( found )) || kv SITES none
+
+# ---------------------------------------------------------------------------- users
+section users
+while IFS=: read -r name _ uid _ _ home shell; do
+  (( uid >= 1000 && uid != 65534 )) && kv USER "$name uid=$uid home=$home shell=$shell"
+done < <(getent passwd)
+present=""
+for r in $TEAM_RESERVED_USERS; do getent passwd "$r" >/dev/null && present+="$r "; done
+kv RESERVED_USERS_PRESENT "$(team_trim "${present:-none}") (the pack never reuses or changes these)"
+pack=""
+for f in "$TEAM_PROJECTS_DIR"/*.conf; do [[ -e $f ]] && pack+="$(basename "$f" .conf) "; done
+kv TEAM_PROJECTS "${pack:-none}"
+
+# ---------------------------------------------------------------------------- resources
+section resources
+while read -r fs size used avail pct mnt; do
+  kv DISK "$mnt size=$size used=$used avail=$avail use=$pct fs=$fs"
+done < <(df -hP -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | tail -n +2 || true)
+if [[ -r /proc/meminfo ]]; then
+  mem() { awk -v k="$1:" '$1 == k { printf "%.1f GiB", $2 / 1048576 }' /proc/meminfo; }
+  kv RAM_TOTAL "$(mem MemTotal)"
+  kv RAM_AVAILABLE "$(mem MemAvailable)"
+  kv SWAP_TOTAL "$(mem SwapTotal)"
+fi
+kv CPUS "$(nproc 2>/dev/null || true)"
+
+# ---------------------------------------------------------------------------- ports
+section "listening ports"
+if have ss; then
+  while read -r _ _ _ local _ proc; do
+    p=$(sed -nE 's/.*\(\("([^"]+)".*/\1/p' <<< "${proc:-}")
+    kv LISTEN "$local${p:+ ($p)}"
+  done < <(ss -ltnpH 2>/dev/null | sort -u || true)
+else kv LISTEN "ss not installed"; fi
+
+# ---------------------------------------------------------------------------- firewall
+section firewall
+if have ufw; then kv UFW "$( (ufw status 2>/dev/null || echo 'installed (status needs root)') | head -n 1)"; else kv UFW "not installed"; fi
+if have nft; then
+  n=$(nft list ruleset 2>/dev/null | grep -c . || true)
+  kv NFTABLES "installed (${n:-0} ruleset lines$([[ $(id -u) -eq 0 ]] || printf '; needs root to read'))"
+else kv NFTABLES "not installed"; fi
+if have iptables; then
+  n=$(iptables -S 2>/dev/null | grep -vc '^-P' || true)
+  kv IPTABLES "installed (${n:-0} rules beyond default policies$([[ $(id -u) -eq 0 ]] || printf '; needs root to read'))"
+else kv IPTABLES "not installed"; fi
+kv FAIL2BAN "$( (have fail2ban-client && (pgrep -f fail2ban-server >/dev/null && echo running || echo installed)) || echo 'not installed')"
+kv NOTE "the pack never adds or changes a firewall"
+
+# ---------------------------------------------------------------------------- timers and cron
+section timers
+if team_systemd_running; then
+  while read -r line; do
+    [[ -n $line ]] && kv TIMER "$line"
+  done < <(systemctl list-timers --all --no-pager --no-legend 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\.timer$/) { print $i; break } }')
+else
+  for f in /etc/systemd/system/*.timer /lib/systemd/system/*.timer; do [[ -e $f ]] && kv TIMER_FILE "$f"; done
+fi
+section cron
+count_entries() { grep -cvE '^[[:space:]]*(#|$|[A-Za-z_][A-Za-z0-9_]*=)' "$1" 2>/dev/null || true; }
+[[ -r /etc/crontab ]] && kv CRON "/etc/crontab ($(count_entries /etc/crontab) entries)"
+for f in /etc/cron.d/*; do [[ -f $f ]] && kv CRON "$f ($(count_entries "$f") entries)"; done
+for d in hourly daily weekly monthly; do
+  if [[ -d /etc/cron.$d ]]; then
+    v=$(find "/etc/cron.$d" -maxdepth 1 -type f ! -name '.placeholder' -printf '%f ' 2>/dev/null)
+    kv "CRON_${d^^}" "${v:-none}"
+  fi
+done
+if [[ -d /var/spool/cron/crontabs ]]; then
+  if [[ -r /var/spool/cron/crontabs ]]; then
+    for f in /var/spool/cron/crontabs/*; do [[ -f $f ]] && kv CRON_USER "$(basename "$f") ($(count_entries "$f") entries)"; done
+  else
+    kv CRON_USER "(needs root to list)"
+  fi
+fi
+exit 0

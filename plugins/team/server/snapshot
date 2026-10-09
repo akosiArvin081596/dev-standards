@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# snapshot — the nightly sanitized copy of production's database (docs/rules.md §8, §11).
+# Dump without locking tables → restore into a temporary database → anonymize with ops/anonymize of
+# production's current release (deterministic, salted) → check that no personal data is left →
+# store sanitized-<utc>.sql.gz (keep 7). Refuses to store anything that fails the check.
+# shellcheck disable=SC2016  # SQL backticks and sed patterns in single quotes are literal on purpose
+set -Eeuo pipefail
+TEAM_PROG=snapshot
+TEAM_SELF_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# shellcheck source=lib.sh
+. "$TEAM_SELF_DIR/lib.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: snapshot <project>
+
+Makes a sanitized copy of <project>'s production database in /var/lib/team/<project>/snapshots/
+(sanitized-<utc>.sql.gz, `latest` symlink, last 7 kept). Run as root; the nightly timer runs it.
+
+Steps: dump production without locking tables; restore into a temporary database; apply
+/srv/team/<project>/production/current/ops/anonymize (rule / ignore / devlogin lines, salted with
+/etc/team/projects/<project>.salt so the same input always gets the same fake value); then refuse
+to store (exit 4) if
+  (a) a column whose name looks personal (email, phone, name, address, birth, token, password, …)
+      has neither a rule nor an ignore line,
+  (b) any value looks like an email outside example.invalid / example.com / example.org /
+      example.net / *.test (the devlogin email is allowed), or
+  (c) any value looks like a PH mobile number ((+63|0)9xxxxxxxxx).
+The temporary database and the raw dumps are always removed.
+
+Exit codes: 0 stored (or DB_ENGINE=none), 1 failure, 2 usage, 4 refused by the check,
+5 not provisioned / no salt.
+EOF
+}
+
+case ${1:-} in -h|--help) usage; exit 0 ;; esac
+(($# == 1)) || team_usage_error "expected <project>"
+PROJECT=$1
+team_valid_project "$PROJECT" || team_usage_error "bad project name '$PROJECT'"
+team_require_root
+
+CONF=$(team_conf_file "$PROJECT" production)
+[[ -r $CONF ]] || team_die "$TEAM_EXIT_PREREQ" "$PROJECT production is not provisioned on this server"
+DB_ENGINE=$(team_conf_get "$CONF" DB_ENGINE none)
+DB_NAME=$(team_conf_get "$CONF" DB_NAME)
+APP_USER=$(team_conf_get "$CONF" APP_USER)
+APP_DIR=$(team_conf_get "$CONF" APP_DIR)
+if [[ $DB_ENGINE == none ]]; then team_say "[skip] $PROJECT has no database (DB_ENGINE=none)"; exit 0; fi
+team_valid_ident "$DB_NAME" || team_die "$TEAM_EXIT_FAIL" "bad DB_NAME in $CONF"
+SALT_FILE=$(team_salt_file "$PROJECT")
+[[ -r $SALT_FILE ]] || team_die "$TEAM_EXIT_PREREQ" "missing anonymization salt $SALT_FILE (re-run provision)"
+SALT=$(tr -d '[:space:]' < "$SALT_FILE")
+[[ $SALT =~ ^[0-9a-f]{16,128}$ ]] || team_die "$TEAM_EXIT_FAIL" "the salt in $SALT_FILE is not hex"
+RULES=$APP_DIR/current/ops/anonymize
+SNAP_DIR=$TEAM_VAR_ROOT/$PROJECT/snapshots
+
+team_flock "$PROJECT-db" 3600
+install -d -m 711 -o root -g root "$TEAM_VAR_ROOT/$PROJECT"
+install -d -m 750 -o root -g "$APP_USER" "$SNAP_DIR"
+team_tmpdb_cleanup "$PROJECT"
+
+WORK=$(mktemp -d "$TEAM_VAR_ROOT/$PROJECT/.snapshot-XXXXXX")
+TMPDB=""
+cleanup() {
+  local rc=$?
+  if [[ -n $TMPDB ]]; then team_tmpdb_drop "$DB_ENGINE" "$PROJECT" "$TMPDB" >/dev/null 2>&1 || team_warn "could not drop $TMPDB"; fi
+  [[ -n ${WORK:-} && -d $WORK ]] && rm -rf "${WORK:?}"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap team_err_trap ERR
+started=$(date +%s)
+
+# ============================================================================ the rules
+# shellcheck disable=SC2034  # the name lists are used through pick's nameref
+FIRST_NAMES=(Avery Blake Casey Dakota Emerson Finley Gray Harper Indigo Jules Kendall Logan Marlow Noor
+  Oakley Peyton Quinn Remy Sage Tatum Umi Vesper Wren Xander Yara Zuri Arden Briar Corin Darby Ellis Fable)
+# shellcheck disable=SC2034
+LAST_NAMES=(Ashdown Brightwater Copperfield Dunmore Eastwood Fairbanks Greenleaf Hollowell Ironwood Juniper
+  Kingsley Larkspur Merriweather Northcott Oakhurst Pembrook Quillfeather Ravenscroft Silverton Thornbury
+  Underhill Valemont Whitlock Yarrow Zephyr Ambleside Blackwood Crestfield Driftwood Elmstead Foxglove Glenmoor)
+# shellcheck disable=SC2034
+STREETS=(Maple Cedar Willow Birch Aspen Juniper Laurel Magnolia Hawthorn Linden Poplar Sycamore Alder Chestnut Hazel Rowan)
+LOREM='Lorem ipsum dolor sit amet, consectetur adipiscing elit.'
+STRATEGIES=" email name first_name last_name phone address text null redact hash "
+# Built-in: the pack's own flags table (rules.md feature-flag contract) holds no personal data.
+BUILTIN_IGNORES=("feature_flags|name")
+
+R_T=() R_C=() R_S=() R_A=()
+I_T=() I_C=()
+D_T=() D_K=() D_V=() D_SETS=()
+DEV_EMAILS=()
+IDENT_RE='^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$'
+COL_RE='^[A-Za-z_][A-Za-z0-9_]*$'
+VALUE_RE="^[^'\\\\]*\$"   # no quote or backslash, so values are safe SQL literals
+
+bad_rule() { team_die "$TEAM_EXIT_FAIL" "ops/anonymize line $1: $2 (nothing stored)"; }
+parse_rules() {
+  local n=0 line kind t c s a k v sets pair pc pv
+  local -a f
+  if [[ ! -r $RULES ]]; then
+    team_warn "no ops/anonymize in production's current release ($RULES): no rules applied; the checks still run"
+    return 0
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=$(team_trim "${line%$'\r'}")
+    [[ -z $line || $line == '#'* ]] && continue
+    IFS='|' read -r -a f <<< "$line"
+    kind=$(team_trim "${f[0]}")
+    case $kind in
+      rule)
+        ((${#f[@]} >= 4)) || bad_rule "$n" "expected rule|<table>|<column>|<strategy>[|<arg>]"
+        t=$(team_trim "${f[1]}") c=$(team_trim "${f[2]}") s=$(team_trim "${f[3]}") a=$(team_trim "${f[4]:-}")
+        [[ $t =~ $IDENT_RE && $c =~ $COL_RE ]] || bad_rule "$n" "bad table or column name"
+        [[ $STRATEGIES == *" $s "* ]] || bad_rule "$n" "unknown strategy '$s'"
+        [[ $a =~ $VALUE_RE ]] || bad_rule "$n" "the argument may not contain quotes or backslashes"
+        R_T+=("$t") R_C+=("$c") R_S+=("$s") R_A+=("$a")
+        ;;
+      ignore)
+        ((${#f[@]} >= 3)) || bad_rule "$n" "expected ignore|<table>|<column>|<reason>"
+        t=$(team_trim "${f[1]}") c=$(team_trim "${f[2]}")
+        [[ ($t == '*' || $t =~ $IDENT_RE) && $c =~ $COL_RE ]] || bad_rule "$n" "bad table or column name"
+        I_T+=("$t") I_C+=("$c")
+        ;;
+      devlogin)
+        ((${#f[@]} >= 5)) || bad_rule "$n" "expected devlogin|<table>|<key column>|<key value>|<col>=<value>[;…]"
+        t=$(team_trim "${f[1]}") k=$(team_trim "${f[2]}") v=$(team_trim "${f[3]}") sets=$(team_trim "${f[4]}")
+        [[ $t =~ $IDENT_RE && $k =~ $COL_RE ]] || bad_rule "$n" "bad table or key column name"
+        [[ $v =~ $VALUE_RE && $sets =~ $VALUE_RE ]] || bad_rule "$n" "values may not contain quotes or backslashes"
+        IFS=';' read -r -a pairs <<< "$sets"
+        for pair in "${pairs[@]}"; do
+          pc=$(team_trim "${pair%%=*}") pv=${pair#*=}
+          [[ $pair == *=* && $pc =~ $COL_RE ]] || bad_rule "$n" "bad <col>=<value> pair"
+          [[ $pv =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] && DEV_EMAILS+=("${pv,,}")
+        done
+        D_T+=("$t") D_K+=("$k") D_V+=("$v") D_SETS+=("$sets")
+        ;;
+      *) bad_rule "$n" "unknown directive '$kind' (expected rule, ignore or devlogin)" ;;
+    esac
+  done < "$RULES"
+}
+
+# ============================================================================ SQL building
+qi() { if [[ $DB_ENGINE == postgres ]]; then printf '"%s"' "$1"; else printf '`%s`' "$1"; fi; }
+qtable() { # <schema|table> → quoted reference
+  local schema=${1%%|*} table=${1#*|}
+  if [[ $DB_ENGINE == postgres ]]; then printf '"%s"."%s"' "$schema" "$table"; else printf '`%s`' "$table"; fi
+}
+sql_list() { # values… → 'a', 'b'
+  local out="" v
+  for v in "$@"; do out+="${out:+, }'$v'"; done
+  printf '%s' "$out"
+}
+# pick <list-name> <hex offset> <hex digits> <hash expr> : element of a fixed list chosen by hash
+pick() {
+  local -n arr=$1
+  local off=$2 bits=$(( $3 * 4 )) h=$4 n=${#arr[@]}
+  if [[ $DB_ENGINE == postgres ]]; then
+    printf "(ARRAY[%s])[1 + ('x' || substr(%s, %s, %s))::bit(%s)::int %% %s]" "$(sql_list "${arr[@]}")" "$h" "$off" "$3" "$bits" "$n"
+  else
+    printf "ELT(1 + CONV(SUBSTR(%s, %s, %s), 16, 10) %% %s, %s)" "$h" "$off" "$3" "$n" "$(sql_list "${arr[@]}")"
+  fi
+}
+# anon_expr <strategy> <arg> <quoted column> : deterministic replacement expression
+anon_expr() {
+  local s=$1 a=$2 col=$3 h e
+  if [[ $DB_ENGINE == postgres ]]; then h="md5('$SALT' || ($col)::text)"; else h="MD5(CONCAT('$SALT', $col))"; fi
+  case $s in
+    email)
+      if [[ $DB_ENGINE == postgres ]]; then e="'u' || substr($h, 1, 10) || '@example.invalid'"
+      else e="CONCAT('u', SUBSTR($h, 1, 10), '@example.invalid')"; fi ;;
+    first_name) e=$(pick FIRST_NAMES 1 2 "$h") ;;
+    last_name) e=$(pick LAST_NAMES 3 2 "$h") ;;
+    name)
+      if [[ $DB_ENGINE == postgres ]]; then e="$(pick FIRST_NAMES 1 2 "$h") || ' ' || $(pick LAST_NAMES 3 2 "$h")"
+      else e="CONCAT($(pick FIRST_NAMES 1 2 "$h"), ' ', $(pick LAST_NAMES 3 2 "$h"))"; fi ;;
+    phone)
+      if [[ $DB_ENGINE == postgres ]]; then e="'+1555' || lpad((('x' || substr($h, 1, 7))::bit(28)::int % 10000000)::text, 7, '0')"
+      else e="CONCAT('+1555', LPAD(CONV(SUBSTR($h, 1, 7), 16, 10) % 10000000, 7, '0'))"; fi ;;
+    address)
+      if [[ $DB_ENGINE == postgres ]]; then e="(1 + ('x' || substr($h, 3, 4))::bit(16)::int % 9999)::text || ' ' || $(pick STREETS 7 2 "$h") || ' Street'"
+      else e="CONCAT(1 + CONV(SUBSTR($h, 3, 4), 16, 10) % 9999, ' ', $(pick STREETS 7 2 "$h"), ' Street')"; fi ;;
+    text) e="'$LOREM'" ;;
+    null) printf 'NULL'; return 0 ;;
+    redact) e="'${a:-REDACTED}'" ;;
+    hash) e=$h ;;
+  esac
+  printf 'CASE WHEN %s IS NULL THEN NULL ELSE %s END' "$col" "$e"
+}
+
+# ============================================================================ dump and restore
+parse_rules
+team_say "snapshot $PROJECT ($DB_ENGINE) $(team_utc_now)"
+
+team_db_dump "$DB_ENGINE" "$DB_NAME" raw > "$WORK/raw.sql" || team_die "$TEAM_EXIT_FAIL" "could not dump $DB_NAME"
+team_say "[ok] dumped production without locking tables ($(du -h "$WORK/raw.sql" | cut -f1))"
+TMPDB=$(team_tmpdb_create "$DB_ENGINE" "$PROJECT" snap)
+team_db_restore "$DB_ENGINE" "$TMPDB" < "$WORK/raw.sql" > "$WORK/restore.log" 2>&1 \
+  || { sed 's/^/  /' "$WORK/restore.log" | tail -n 20 >&2; team_die "$TEAM_EXIT_FAIL" "could not restore the dump into $TMPDB"; }
+rm -f "$WORK/raw.sql"
+team_say "[ok] restored into temporary database $TMPDB; raw dump deleted"
+
+# columns of base tables: schema|table|column
+if [[ $DB_ENGINE == postgres ]]; then
+  COL_SQL="SELECT c.table_schema, c.table_name, c.column_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY c.table_schema, c.table_name, c.ordinal_position"
+  COLS=$(team_db_query postgres "$TMPDB" "$COL_SQL")
+else
+  COL_SQL="SELECT c.table_schema, c.table_name, c.column_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name WHERE t.table_type = 'BASE TABLE' AND c.table_schema = '$TMPDB' ORDER BY c.table_name, c.ordinal_position"
+  COLS=$(team_db_query "$DB_ENGINE" "" "$COL_SQL")
+fi
+declare -A TABLE_REF=() COL_REAL=()
+while IFS='|' read -r sch tab col; do
+  [[ -n $col ]] || continue
+  ref="$sch|$tab"
+  [[ -n ${TABLE_REF[${tab,,}]:-} ]] || TABLE_REF[${tab,,}]=$ref
+  TABLE_REF[${sch,,}.${tab,,}]=$ref
+  COL_REAL[$ref|${col,,}]=$col
+done <<< "$COLS"
+
+# ============================================================================ anonymize
+declare -A SETS=() HANDLED=()
+ORDER=()
+applied=0
+for i in "${!R_T[@]}"; do
+  key=${R_T[$i],,}
+  ref=${TABLE_REF[$key]:-}
+  real=""
+  [[ -n $ref ]] && real=${COL_REAL[$ref|${R_C[$i],,}]:-}
+  if [[ -z $real ]]; then team_warn "ops/anonymize: ${R_T[$i]}.${R_C[$i]} is not in the database; rule skipped"; continue; fi
+  [[ -n ${SETS[$ref]:-} ]] || ORDER+=("$ref")
+  SETS[$ref]+="${SETS[$ref]:+, }$(qi "$real") = $(anon_expr "${R_S[$i]}" "${R_A[$i]}" "$(qi "$real")")"
+  HANDLED[$ref|${real,,}]=1
+  applied=$((applied + 1))
+done
+{
+  if [[ $DB_ENGINE == postgres ]]; then
+    printf 'BEGIN;\nSET LOCAL session_replication_role = replica;\n'
+  else
+    printf 'SET FOREIGN_KEY_CHECKS = 0;\nSTART TRANSACTION;\n'
+  fi
+  for ref in "${ORDER[@]}"; do printf 'UPDATE %s SET %s;\n' "$(qtable "$ref")" "${SETS[$ref]}"; done
+  for i in "${!D_T[@]}"; do
+    ref=${TABLE_REF[${D_T[$i],,}]:-}
+    [[ -n $ref ]] || { team_warn "ops/anonymize devlogin: table ${D_T[$i]} is not in the database; skipped" >&2; continue; }
+    sets=""
+    IFS=';' read -r -a pairs <<< "${D_SETS[$i]}"
+    for pair in "${pairs[@]}"; do sets+="${sets:+, }$(qi "$(team_trim "${pair%%=*}")") = '${pair#*=}'"; done
+    printf 'UPDATE %s SET %s WHERE %s = '\''%s'\'';\n' "$(qtable "$ref")" "$sets" "$(qi "${D_K[$i]}")" "${D_V[$i]}"
+  done
+  if [[ $DB_ENGINE == postgres ]]; then printf 'COMMIT;\n'; else printf 'COMMIT;\nSET FOREIGN_KEY_CHECKS = 1;\n'; fi
+} > "$WORK/anonymize.sql"
+team_db_exec "$DB_ENGINE" "$TMPDB" < "$WORK/anonymize.sql" > "$WORK/anonymize.log" 2>&1 \
+  || { grep -v "'$SALT'" "$WORK/anonymize.log" | tail -n 5 | sed 's/^/  /' >&2; team_die "$TEAM_EXIT_FAIL" "anonymization failed (a fake value may not fit a column type or unique key); nothing stored"; }
+for i in "${!D_T[@]}"; do
+  ref=${TABLE_REF[${D_T[$i],,}]:-}
+  [[ -n $ref ]] || continue
+  cnt=$(team_db_query "$DB_ENGINE" "$TMPDB" "SELECT count(*) FROM $(qtable "$ref") WHERE $(qi "${D_K[$i]}") = '${D_V[$i]}'")
+  [[ $cnt == 0 ]] && team_warn "devlogin: no row in ${D_T[$i]} where ${D_K[$i]} = ${D_V[$i]} (the dev login was not set)"
+done
+team_say "[ok] anonymized ${#ORDER[@]} table(s): $applied rule(s), ${#D_T[@]} devlogin line(s)"
+
+# ============================================================================ check (a): personal-looking columns
+PROBLEMS=()
+mapfile -t PII_PATTERNS < <(team_pii_patterns)
+declare -A IGNORED=()
+for i in "${!I_T[@]}"; do IGNORED[${I_T[$i],,}|${I_C[$i],,}]=1; done
+for b in "${BUILTIN_IGNORES[@]}"; do IGNORED[$b]=1; done
+unhandled=0
+while IFS='|' read -r sch tab col; do
+  [[ -n $col ]] || continue
+  lc=${col,,}
+  hit=""
+  for pat in "${PII_PATTERNS[@]}"; do [[ $lc =~ $pat ]] && { hit=$pat; break; }; done
+  [[ -n $hit ]] || continue
+  ref="$sch|$tab"
+  [[ -n ${HANDLED[$ref|$lc]:-} ]] && continue
+  [[ -n ${IGNORED[${tab,,}|$lc]:-} || -n ${IGNORED[${sch,,}.${tab,,}|$lc]:-} || -n ${IGNORED[*|$lc]:-} ]] && continue
+  PROBLEMS+=("column $tab.$col looks personal (matches /$hit/) but ops/anonymize has no rule or ignore line for it")
+  unhandled=$((unhandled + 1))
+done <<< "$COLS"
+if (( unhandled == 0 )); then team_say "[ok] check: every personal-looking column has a rule or an ignore line"; fi
+
+# ============================================================================ the sanitized dump
+if [[ $DB_ENGINE == postgres ]]; then
+  team_db_dump postgres "$TMPDB" sanitized > "$WORK/sanitized.sql"
+else
+  strip='/^-- Host: /d; s/ DEFINER=`[^`]+`@`[^`]+`//g'
+  # (comment lines naming the temporary database are dropped so runs stay byte-identical)
+  team_db_dump "$DB_ENGINE" "$TMPDB" sanitized | sed -E "$strip; /^-- .*$TMPDB/d" > "$WORK/sanitized.sql"
+  # Triggers were left out of the temporary copy so the anonymizing updates could not fire them;
+  # add their definitions (schema only, no data) from production.
+  team_db_dump "$DB_ENGINE" "$DB_NAME" triggers | sed -E "$strip" >> "$WORK/sanitized.sql"
+fi
+
+# lines_to_tables <dump> <file of line numbers> : "table (n lines)" for each offending line
+lines_to_tables() {
+  # Postgres data sits in COPY … \. blocks; MySQL/MariaDB INSERTs may span lines until the closing ";".
+  awk 'NR == FNR { want[$1] = 1; next }
+       /^COPY / { t = $2; next }
+       /^\\\.$/ { t = ""; next }
+       /^INSERT INTO / { ins = $3 }
+       { tt = (ins != "" ? ins : t) }
+       (FNR in want) { print (tt == "" ? "(schema or other SQL)" : tt) }
+       { if (ins != "" && $0 ~ /;$/) ins = "" }' "$2" "$1" \
+    | sort | uniq -c | awk '{ printf "%s%s (%d line%s)", (NR > 1 ? ", " : ""), $2, $1, ($1 > 1 ? "s" : "") }'
+}
+
+# ============================================================================ check (b): real-looking emails
+EMAIL_RE='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+{ grep -noE "$EMAIL_RE" "$WORK/sanitized.sql" || true; } \
+  | awk -F: -v dev="${DEV_EMAILS[*]}" '
+      BEGIN { n = split(dev, d, " "); for (i = 1; i <= n; i++) devs[tolower(d[i])] = 1 }
+      { e = tolower($2); dom = e; sub(/.*@/, "", dom); sub(/\.+$/, "", dom)
+        if (e in devs) next
+        if (dom == "example.invalid" || dom == "example.com" || dom == "example.org" || dom == "example.net") next
+        if (dom == "test" || dom ~ /\.test$/) next
+        if (dom ~ /\.(png|jpe?g|gif|svg|webp|avif|ico|bmp|tiff?|css|js|mjs|map|json|woff2?|ttf|eot)$/) next
+        print $1 " " dom }' > "$WORK/bad-emails"
+if [[ -s $WORK/bad-emails ]]; then
+  cut -d' ' -f1 "$WORK/bad-emails" | sort -u > "$WORK/bad-email-lines"
+  doms=$(cut -d' ' -f2 "$WORK/bad-emails" | sort -u | head -n 5 | paste -sd, -)
+  PROBLEMS+=("$(wc -l < "$WORK/bad-emails" | tr -d ' ') email-like value(s) outside the allowed fake domains (domains: $doms) in: $(lines_to_tables "$WORK/sanitized.sql" "$WORK/bad-email-lines")")
+else
+  team_say "[ok] check: no email addresses outside the allowed fake domains"
+fi
+
+# ============================================================================ check (c): PH mobile numbers
+PH_RE='(^|[^0-9A-Za-z])(\+63|0)[ -]?9[0-9]{2}[ -]?[0-9]{3}[ -]?[0-9]{4}([^0-9A-Za-z]|$)'
+{ grep -nE "$PH_RE" "$WORK/sanitized.sql" || true; } | cut -d: -f1 > "$WORK/bad-phone-lines"
+if [[ -s $WORK/bad-phone-lines ]]; then
+  PROBLEMS+=("PH mobile number pattern found on $(wc -l < "$WORK/bad-phone-lines" | tr -d ' ') dump line(s) in: $(lines_to_tables "$WORK/sanitized.sql" "$WORK/bad-phone-lines")")
+else
+  team_say "[ok] check: no PH mobile numbers"
+fi
+
+if ((${#PROBLEMS[@]})); then
+  for p in "${PROBLEMS[@]}"; do team_say "[fail] check: $p"; done
+  team_die "$TEAM_EXIT_REFUSED" "REFUSED: the sanitized dump still looks like it holds personal data; nothing was stored. Add rule/ignore lines to ops/anonymize and deploy them."
+fi
+
+# ============================================================================ store
+stamp=$(team_utc_stamp)
+while [[ -e $SNAP_DIR/sanitized-$stamp.sql.gz ]]; do sleep 1; stamp=$(team_utc_stamp); done
+name=sanitized-$stamp.sql.gz
+gzip -c "$WORK/sanitized.sql" > "$SNAP_DIR/.$name.partial"
+chown "root:$APP_USER" "$SNAP_DIR/.$name.partial"
+chmod 640 "$SNAP_DIR/.$name.partial"
+mv -fT "$SNAP_DIR/.$name.partial" "$SNAP_DIR/$name"
+ln -sfn "$name" "$SNAP_DIR/.latest.tmp"
+mv -fT "$SNAP_DIR/.latest.tmp" "$SNAP_DIR/latest"
+n=0
+while IFS= read -r old; do
+  n=$((n + 1))
+  (( n <= TEAM_KEEP_SNAPSHOTS )) && continue
+  [[ $old == "$name" ]] && continue
+  rm -f -- "${SNAP_DIR:?}/$old"
+done < <(find "$SNAP_DIR" -maxdepth 1 -type f -name 'sanitized-*.sql.gz' -printf '%f\n' | sort -r)
+team_say "[ok] stored $SNAP_DIR/$name ($(du -h "$SNAP_DIR/$name" | cut -f1)); latest → $name; keeping $TEAM_KEEP_SNAPSHOTS"
+team_say "[ok] done in $(( $(date +%s) - started ))s; temporary database and raw dumps removed"
