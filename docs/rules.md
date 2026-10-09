@@ -176,9 +176,15 @@ Installed root-owned to `/usr/local/lib/team/`. Scripts: `discover`, `provision`
 | `/etc/team/projects/<project>-<env>.conf` | root:`<user>` 640 | `PROJECT ENV APP_USER APP_DIR PORT HEALTH_PATH MIGRATE_CMD DB_ENGINE DB_NAME DB_USER UNITS WEB_MODE HOST TIMEZONE LOW_TRAFFIC_HOUR SHARED_PATHS STATIC_ROOT` |
 | `/etc/team/projects/<project>.salt` | root 600 | anonymization salt |
 | `/srv/team/<project>/<env>/{releases,shared,current}` | `<user>` | `current` → `releases/<sha>`; env file `shared/.env` 600 |
-| `/var/lib/team/<project>/backups/` | root 700 | `backup-<utc>.sql.gz` |
+| `/var/lib/team/<project>/backups/` | root 700 | `backup-<utc>.sql.gz` (14 kept), `backup-<utc>-pre-deploy.sql.gz` (5 kept) |
 | `/var/lib/team/<project>/snapshots/` | root:`<project>-production` 750 | `sanitized-<utc>.sql.gz`, `latest` symlink |
 | `/var/log/team/flags.log` | root 640 | `utc_ts project env flag on|off by` |
+| `/etc/team/projects/<project>-<env>.resources` | root 600 | every resource the pack created (users, DBs, DB users, nginx/php-fpm/sudoers/unit files); only these may be reused or removed |
+| `/etc/team/projects/<project>-<env>.dbpass` | root 600 | the DB password, to fill new template keys later |
+| `/etc/team/backup.conf` | root 600 | `OFFSITE_BACKUP_TARGET` (empty = off-server copy TODO) |
+| `/etc/team/mysql-admin.cnf` | root 600 | optional, when MySQL root can't use the socket |
+| `/run/team/` | root 700 | lock files |
+| `/var/log/team/<project>-<env>/` | `<user>` | app logs (logrotate) |
 | nginx | | `/etc/nginx/sites-available/team-<project>-<env>.conf` (+ enabled link), `/etc/nginx/team/<project>-staging.htpasswd` |
 | systemd | | `team-<project>-<env>-<proc>.service`; production timers `team-<project>-snapshot.timer`, `team-<project>-backup.timer`, `team-<project>-backup-verify.timer` |
 | sudoers / logrotate | | `/etc/sudoers.d/team-<project>-<env>` (validated `visudo -cf`), `/etc/logrotate.d/team-<project>-<env>` |
@@ -187,7 +193,7 @@ Installed root-owned to `/usr/local/lib/team/`. Scripts: `discover`, `provision`
 - Ports for apps on the server: 9100–9899, first free (not listening, not in any `/etc/team/projects/*.conf`).
 - Deploy key line: `command="/usr/local/lib/team/deploy-receive <project> <env>",restrict <pubkey> team-deploy-<project>-<env>`; db-pull key (production user): `command="/usr/local/lib/team/serve-snapshot <project>",restrict <pubkey> team-dbpull-<project>`.
 - `deploy-receive` reads `SSH_ORIGINAL_COMMAND` ∈ `deploy <sha>` (tar.gz on stdin), `rollback <sha>`, `health`. sha = 7–40 hex. Exit 7 = release not on server.
-- `serve-snapshot` accepts `latest` (streams the newest sanitized dump) and `latest-name`.
+- `serve-snapshot` accepts `latest` (streams the newest sanitized dump) and `latest-name`; exit 3 = no snapshot yet (`team-db-pull` then loads the seed data). `snapshot` exits 4 when the PII check refuses. Pack OS users are system users (uid < 1000) with root-owned `authorized_keys`. Nightly jobs are staggered in the low-traffic hour: backup :00, snapshot :20, weekly verify Sunday :40.
 - Env templates: `{{PORT}} {{APP_URL}} {{APP_TIMEZONE}} {{DB_HOST}} {{DB_PORT}} {{DB_NAME}} {{DB_USER}} {{DB_PASSWORD}} {{RANDOM_SECRET}}` (a fresh 32-byte hex per occurrence, only when the env file is first created; existing values are never overwritten; new template keys are appended).
 
 ## 12. `team-provision` ↔ `server/provision`
