@@ -1,0 +1,6 @@
+# How the nightly snapshot anonymizes production data (docs/rules.md §8).
+rule|customers|email|email
+rule|customers|full_name|name
+rule|customers|phone|phone
+ignore|customers|created_at|not personal
+devlogin|customers|email|dev@example.test|full_name=Dev Login

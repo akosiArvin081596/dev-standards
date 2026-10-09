@@ -1,0 +1,14 @@
+{
+  "standards_repo": "akosiArvin081596/dev-standards",
+  "release": "unreleased",
+  "files": {
+    ".claude/hooks/plugin-check": "sha256:65e1ff8a14ffffb45dbdc31a5266375038a15b5af53a3bca08eef1a8427ea373",
+    ".claude/rules/team/team.md": "sha256:1d27a7444774942b5e4be45caff5e3eace6f766b7d9233e4a82ceaa986d5e4b5",
+    ".claude/settings.json": "sha256:41ba74de4b0cfc1960c48d3cc964fa72e2a07e1ac6349d9550a333c1ac3475fd",
+    ".github/ISSUE_TEMPLATE/bug.yml": "sha256:1d41aa512979d378fed38f3fdf64f3ff97ed45561d5c7817ca0a9ff0a36bd57e",
+    ".github/ISSUE_TEMPLATE/client-request.yml": "sha256:660bd43b959ff8968aed8aeff6333aaa48b85aa1f1e00e6eccea4865ec34d5a4",
+    ".github/ISSUE_TEMPLATE/config.yml": "sha256:8c3c2c7631793da89d57254694e899b3558a1413853becea2c445b0c4268572a",
+    ".github/ISSUE_TEMPLATE/feature.yml": "sha256:c82dff76034bdc402149b09a45a4ac0da79518ec9a4b07dfd5e5f72ecd5a727f",
+    ".github/pull_request_template.md": "sha256:c40c091b1b8c03d5a9023f56871b6bef1f44f1ffea9be7eafa58fe372742dc1b"
+  }
+}

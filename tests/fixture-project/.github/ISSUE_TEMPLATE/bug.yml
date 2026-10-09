@@ -1,0 +1,76 @@
+# Managed by dev-standards (synced by team-sync; never edit in a project).
+name: Bug
+description: Something that worked, or should work, is broken.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This repository is public.** Never include customer data, real names, emails, phone numbers, addresses, payment details, screenshots that show personal data, secrets, or server details. Refer to records by their ID in the app, or use made-up values.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and any error message (with personal data removed).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, starting from a page URL path (not a full staging or production URL).
+      placeholder: |
+        1. Sign in as the dev login
+        2. Open /orders/123
+        3. Press "Save"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: Environment (local, staging or production), device, browser and screen size.
+      placeholder: production · iPhone 15 · Safari
+    validations:
+      required: false
+  - type: input
+    id: when
+    attributes:
+      label: When
+      description: Date and time it happened, with the timezone.
+      placeholder: 2026-10-09 3:00 PM Asia/Manila
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: How we know it's fixed. One checkable statement per line.
+      placeholder: |
+        - Saving an order with an empty note no longer shows an error
+        - A regression test covers the empty-note case
+    validations:
+      required: true
+  - type: textarea
+    id: likely-files
+    attributes:
+      label: Likely files
+      description: One path or glob per line. The conflict check uses this to decide which issues can run in parallel.
+      placeholder: |
+        src/orders/**
+        tests/orders/**
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: This issue contains no customer data, real names, emails, phone numbers, secrets or server details.
+          required: true
