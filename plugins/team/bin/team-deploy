@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# team-deploy: private-repo fallback deploy from the Mac. Builds once, packages the release
+# (ARTIFACT_DIR + ops/) and streams it to the server's deploy-receive with the stored
+# deploy key and the pinned host key. Plan by default; --apply to deploy.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-deploy <staging|production> [--sha SHA] [--apply]
+
+Private-repo fallback (GitHub Free can't hold production secrets safely there). Run
+in a clean checkout of the commit to deploy (default: HEAD; --sha must equal HEAD):
+  1. make build (not configured → exit 3), which fills ARTIFACT_DIR (default .team/artifact)
+  2. packages ARTIFACT_DIR's contents plus ops/ into .team/release-<sha>.tar.gz
+  3. streams it to the server's forced command `deploy <sha>` as <project>-<env>, with
+     ~/.ssh/team-deploy-<project>-<env> and the pinned host key in
+     $TEAM_CONFIG_DIR/projects/<project>.known_hosts (StrictHostKeyChecking=yes),
+     through the VPS alias; one attempt, no retries
+Without --apply it only prints this plan. Production is refused inside Claude Code
+(exit 4): you run it in a normal terminal. Staging normally deploys from GitHub Actions.
+Exit codes: 0 ok, 1 failure, 2 usage, 3 build not configured, 4 refused,
+5 missing tool or config, 6 no local deploy key (run team-provision first),
+7 the server lacks the release.
+EOF
+}
+
+env="" sha=""
+TEAM_APPLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --apply) TEAM_APPLY=1; shift ;;
+    --sha) [ $# -ge 2 ] || team_usage_error "--sha needs a value"; sha="$2"; shift 2 ;;
+    --sha=*) sha="${1#*=}"; shift ;;
+    staging|production) [ -z "$env" ] || team_usage_error "only one environment"; env="$1"; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+[ -n "$env" ] || team_usage_error "missing environment: staging or production"
+if [ "$env" = production ] && team_in_claude_code; then
+  team_die "$TEAM_EXIT_REFUSED" "production deploys are the owner's: run it yourself in a normal terminal: team-deploy production --apply"
+fi
+
+team_require_cmd git ssh tar make
+root=$(team_canon_dir "$(team_repo_root .)")
+team_require_project_conf "$root"
+pconf="$root/ops/project.conf"
+project=$(team_project_name "$root")
+head=$(git -C "$root" rev-parse HEAD)
+if [ -n "$sha" ]; then
+  case "$sha" in *[!0-9a-f]*) team_usage_error "--sha must be 7-40 lowercase hex characters" ;; esac
+  [ "${#sha}" -ge 7 ] && [ "${#sha}" -le 40 ] || team_usage_error "--sha must be 7-40 lowercase hex characters"
+  full=$(git -C "$root" rev-parse --verify --quiet "$sha^{commit}" || true)
+  [ "$full" = "$head" ] || team_die "$TEAM_EXIT_REFUSED" "--sha $sha is not the checked-out commit; check it out first (the release is built from the working tree)"
+fi
+sha="$head"
+artifact=$(team_conf_get "$pconf" ARTIFACT_DIR ".team/artifact")
+case "$artifact" in /*|*..*) team_die "$TEAM_EXIT_NOT_CONFIGURED" "ARTIFACT_DIR must be a relative path inside the repo" ;; esac
+user="$project-$env"
+key="$HOME/.ssh/team-deploy-$project-$env"
+kh="$TEAM_CONFIG_DIR/projects/$project.known_hosts"
+tarball="$root/.team/release-$sha.tar.gz"
+alias=$(team_vps_alias)
+ip=$(team_default VPS_IP "")
+
+echo "[plan]  make build → $artifact"
+echo "[plan]  package $artifact + ops/ → .team/release-$sha.tar.gz"
+echo "[plan]  deploy $sha to $project $env as $user via $alias (pinned host key, one attempt)"
+if [ "$TEAM_APPLY" != 1 ]; then
+  team_plan_footer
+  exit 0
+fi
+
+[ -f "$key" ] || team_die "$TEAM_EXIT_OWNER" "no local deploy key $key. For a private repo, run 'team-provision production --apply' (it keeps the key on this Mac); staging deploys run in GitHub Actions."
+[ -s "$kh" ] || team_die "$TEAM_EXIT_OWNER" "no pinned host key $kh (team-provision --apply writes it)"
+[ -n "$ip" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "VPS_IP is not set in defaults.conf (the pinned host key is stored for it)"
+[ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ] \
+  || team_die "$TEAM_EXIT_REFUSED" "the checkout has uncommitted changes; a release must match commit $sha"
+
+rc=0
+team_run_make "$root" build || rc=$?
+case "$rc" in
+  0) ;;
+  3) team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: make build is not filled in for this stack yet" ;;
+  *) team_die "$TEAM_EXIT_FAIL" "make build failed" ;;
+esac
+[ -d "$root/$artifact" ] && [ -n "$(ls -A "$root/$artifact" 2>/dev/null)" ] \
+  || team_die "$TEAM_EXIT_FAIL" "make build left $artifact empty"
+[ -d "$root/ops" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no ops/ folder to ship with the release"
+
+pkg=$(mktemp -d "${TMPDIR:-/tmp}/team-deploy.XXXXXX")
+trap 'rm -rf "${pkg:?}"' EXIT
+cp -R "$root/$artifact/." "$pkg/"
+rm -rf "${pkg:?}/ops"
+cp -R "$root/ops" "$pkg/ops"
+mkdir -p "$root/.team"
+team_tar_create "$pkg" "$tarball" .
+echo "[apply] packaged .team/release-$sha.tar.gz"
+
+echo "[apply] deploying $sha to $project $env"
+rc=0
+ssh -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$kh" -o GlobalKnownHostsFile=/dev/null \
+  -o HostKeyAlias="$ip" -l "$user" "$alias" deploy "$sha" < "$tarball" || rc=$?
+case "$rc" in
+  0) echo "deployed $sha to $project $env" ;;
+  255) team_die "$TEAM_EXIT_FAIL" "ssh failed (host key mismatch or key refused?); not retried" ;;
+  7) team_die 7 "the server does not have release $sha" ;;
+  [2-6]) exit "$rc" ;;
+  *) team_die "$TEAM_EXIT_FAIL" "deploy-receive exited with status $rc" ;;
+esac

@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# team-provision: provision one environment of this project on the VPS (server/provision,
+# docs/rules.md §12), then store its secrets and variable in GitHub and the local keys.
+# Plan by default; --apply to change anything.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-provision <staging|production> [--apply] [--rotate-keys]
+
+Run in a project root. Builds a bundle (server scripts, the project's ops/, and
+inputs.conf with the deploy and db-pull public keys generated locally by ssh-keygen)
+and runs server/provision through ONE plain `ssh <VPS_ALIAS>` connection (no
+retries). The server prints a plan ([create]/[update]/[ok]/[skip]) and, with
+--apply, applies it, ending with "TEAM-RESULT ok".
+
+Without --apply: shows the server's plan and the NAMES of the secrets and variables
+it would set. Nothing changes anywhere.
+
+With --apply and TEAM-RESULT ok, it pins the server's host key and stores, piping
+every value on stdin and never printing one:
+  environment secrets  DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY
+                       DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL
+                       (+ staging: BASIC_AUTH_USER BASIC_AUTH_PASSWORD)
+  repo secret          PRODUCTION_HEALTH_URL (production)
+  repo variable        STAGING_READY=true / PRODUCTION_READY=true
+  keychain             team-staging-<project> (staging basic-auth login)
+  ~/.ssh               team-dbpull-<project> (production db-pull key, mode 600)
+Private repos (VISIBILITY=private): production values never go to GitHub; the
+production deploy key stays at ~/.ssh/team-deploy-<project>-production and the
+pinned host key at $TEAM_CONFIG_DIR/projects/<project>.known_hosts (team-deploy).
+
+Keys are not rotated on re-runs (an existing DEPLOY_SSH_KEY secret, db-pull key or
+staging login is kept) unless --rotate-keys.
+Connecting needs the owner's yes. Exit codes: 0 ok (a plan is success), 1 failure,
+2 usage, 3 not configured, 4 refused by the server, 5 missing config or tool.
+EOF
+}
+
+env="" rotate=0
+TEAM_APPLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --apply) TEAM_APPLY=1; shift ;;
+    --rotate-keys) rotate=1; shift ;;
+    staging|production) [ -z "$env" ] || team_usage_error "only one environment"; env="$1"; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+[ -n "$env" ] || team_usage_error "missing environment: staging or production"
+
+team_require_cmd git ssh ssh-keygen tar openssl jq
+root=$(team_canon_dir "$(team_repo_root .)")
+pconf="$root/ops/project.conf"
+team_require_project_conf "$root"
+[ -r "$TEAM_CONFIG_DIR/defaults.conf" ] || team_die "$TEAM_EXIT_PREREQ" "missing $TEAM_CONFIG_DIR/defaults.conf"
+[ -r "$TEAM_SERVER_DIR/provision" ] || team_die "$TEAM_EXIT_PREREQ" "missing $TEAM_SERVER_DIR/provision"
+
+project=$(team_conf_get "$pconf" PROJECT_NAME "")
+case "$project" in
+  [a-z]*) ;;
+  *) team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: PROJECT_NAME in ops/project.conf" ;;
+esac
+case "$project" in *[!a-z0-9-]*) team_die "$TEAM_EXIT_NOT_CONFIGURED" "PROJECT_NAME must match [a-z][a-z0-9-]{1,20}" ;; esac
+account=$(team_github_account "$root")
+repo=$(team_conf_get "$pconf" GITHUB_REPO "")
+[ -n "$repo" ] || repo=$(team_origin_repo "$root")
+case "$repo" in */*) ;; *) team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: GITHUB_REPO (owner/name) in ops/project.conf" ;; esac
+visibility=$(team_conf_get "$pconf" VISIBILITY "public")
+health_path=$(team_conf_get "$pconf" HEALTH_PATH "/health")
+case "$health_path" in /*) ;; *) health_path="/$health_path" ;; esac
+tz=$(team_conf_get "$pconf" PROJECT_TIMEZONE "")
+[ -n "$tz" ] || tz=$(team_default DEFAULT_TIMEZONE "")
+[ -n "$tz" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "not configured: PROJECT_TIMEZONE in ops/project.conf"
+lth=$(team_conf_get "$pconf" LOW_TRAFFIC_HOUR "3")
+case "$lth" in ''|*[!0-9]*) team_die "$TEAM_EXIT_NOT_CONFIGURED" "LOW_TRAFFIC_HOUR must be 0-23" ;; esac
+acme=$(team_default ACME_EMAIL "")
+alias=$(team_vps_alias)
+ip=$(team_default VPS_IP "")
+[ -n "$ip" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "VPS_IP is not set in $TEAM_CONFIG_DIR/defaults.conf (needed to pin the host key)"
+
+# host: per-project override, else the naming pattern
+pfile="$TEAM_CONFIG_DIR/projects/$project.conf"
+if [ "$env" = production ]; then
+  host=$(team_conf_get "$pfile" PRODUCTION_HOST "")
+  pattern=$(team_default PRODUCTION_HOST_PATTERN "")
+else
+  host=$(team_conf_get "$pfile" STAGING_HOST "")
+  pattern=$(team_default STAGING_HOST_PATTERN "")
+fi
+if [ -z "$host" ]; then
+  [ -n "$pattern" ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "no host for $env: set ${env}_HOST in $pfile or the host pattern in defaults.conf"
+  host=$(printf '%s' "$pattern" | sed "s/{app}/$project/g")
+fi
+case "$host" in *[!A-Za-z0-9.-]*|"") team_die "$TEAM_EXIT_NOT_CONFIGURED" "unexpected host name for $env" ;; esac
+user="$project-$env"
+[ "${#user}" -le 32 ] || team_die "$TEAM_EXIT_NOT_CONFIGURED" "OS user $user is longer than 32 characters; shorten PROJECT_NAME"
+
+private_prod=0
+[ "$visibility" = private ] && [ "$env" = production ] && private_prod=1
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/team-provision.XXXXXX")
+chmod 700 "$tmp"
+cleanup() { rm -rf "${tmp:?}"; }
+trap cleanup EXIT
+
+# ---- keys: reuse or generate ------------------------------------------------------------
+pub_store="$TEAM_CONFIG_DIR/projects/$project-$env.deploy.pub"
+local_deploy_key="$HOME/.ssh/team-deploy-$project-$env"
+dbpull_key="$HOME/.ssh/team-dbpull-$project"
+pubkey_of() { awk '{ print $1 " " $2; exit }' "$1"; }
+
+deploy_existing=0
+if [ "$private_prod" = 1 ]; then
+  [ -f "$local_deploy_key" ] && deploy_existing=1
+else
+  if names=$(team_gh_as "$account" secret list --env "$env" --repo "$repo" --json name 2>/dev/null); then
+    printf '%s' "$names" | jq -e 'any(.[]?; .name == "DEPLOY_SSH_KEY")' >/dev/null 2>&1 \
+      && [ -r "$pub_store" ] && deploy_existing=1
+  else
+    team_warn "could not list $env secrets of $repo (does the $env environment exist? team-bootstrap-repo creates it)"
+  fi
+fi
+gen_deploy=1
+if [ "$deploy_existing" = 1 ] && [ "$rotate" = 0 ]; then gen_deploy=0; fi
+if [ "$gen_deploy" = 1 ]; then
+  ssh-keygen -q -t ed25519 -N '' -C "team-deploy-$project-$env" -f "$tmp/deploy" >/dev/null
+  deploy_pub=$(pubkey_of "$tmp/deploy.pub")
+  echo "[keys]  deploy key: generate a new one"
+elif [ "$private_prod" = 1 ]; then
+  if [ -r "$local_deploy_key.pub" ]; then deploy_pub=$(pubkey_of "$local_deploy_key.pub"); else deploy_pub=$(ssh-keygen -y -f "$local_deploy_key" | awk '{print $1 " " $2}'); fi
+  echo "[keys]  deploy key: keep the existing one ($local_deploy_key)"
+else
+  deploy_pub=$(pubkey_of "$pub_store")
+  echo "[keys]  deploy key: keep the existing one (DEPLOY_SSH_KEY secret)"
+fi
+
+dbpull_pub="" gen_dbpull=0
+if [ "$env" = production ]; then
+  if [ -f "$dbpull_key" ] && [ "$rotate" = 0 ]; then
+    if [ -r "$dbpull_key.pub" ]; then dbpull_pub=$(pubkey_of "$dbpull_key.pub"); else dbpull_pub=$(ssh-keygen -y -f "$dbpull_key" | awk '{print $1 " " $2}'); fi
+    echo "[keys]  db-pull key: keep the existing one ($dbpull_key)"
+  else
+    ssh-keygen -q -t ed25519 -N '' -C "team-dbpull-$project" -f "$tmp/dbpull" >/dev/null
+    dbpull_pub=$(pubkey_of "$tmp/dbpull.pub")
+    gen_dbpull=1
+    echo "[keys]  db-pull key: generate a new one"
+  fi
+fi
+
+ba_user="" ba_pass="" keychain_item="team-staging-$project"
+if [ "$env" = staging ]; then
+  if [ "$rotate" = 0 ] && attrs=$(security find-generic-password -s "$keychain_item" 2>/dev/null); then
+    ba_user=$(printf '%s\n' "$attrs" | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p' | head -n 1)
+    if [ -n "$ba_user" ]; then
+      ba_pass=$(security find-generic-password -s "$keychain_item" -a "$ba_user" -w 2>/dev/null || true)
+    fi
+  fi
+  if [ -n "$ba_user" ] && [ -n "$ba_pass" ]; then
+    echo "[keys]  staging login: keep the existing one (keychain $keychain_item)"
+  else
+    ba_user="$project"
+    ba_pass=$(openssl rand -hex 16)
+    echo "[keys]  staging login: generate a new one"
+  fi
+  if ! team_is_safe_word "$ba_user" || ! team_is_safe_word "$ba_pass"; then
+    team_die "$TEAM_EXIT_FAIL" "the stored staging login has unexpected characters; re-run with --rotate-keys"
+  fi
+fi
+
+# ---- bundle -------------------------------------------------------------------------------
+bundle="$tmp/bundle"
+mkdir -p "$bundle"
+for f in "$TEAM_SERVER_DIR"/*; do
+  [ -f "$f" ] && cp "$f" "$bundle/"
+done
+if [ -d "$root/ops" ]; then cp -R "$root/ops" "$bundle/ops"; fi
+q() { printf '"%s"' "$1"; }
+( umask 077
+  {
+    echo "PROJECT=$(q "$project")"
+    echo "ENV=$(q "$env")"
+    echo "HOST=$(q "$host")"
+    echo "BASIC_AUTH_USER=$(q "$ba_user")"
+    echo "BASIC_AUTH_PASSWORD=$(q "$ba_pass")"
+    echo "DEPLOY_PUBKEY=$(q "$deploy_pub")"
+    echo "DBPULL_PUBKEY=$(q "$dbpull_pub")"
+    echo "TIMEZONE=$(q "$tz")"
+    echo "LOW_TRAFFIC_HOUR=$(q "$lth")"
+    echo "ACME_EMAIL=$(q "$acme")"
+  } > "$bundle/inputs.conf" )
+chmod 600 "$bundle/inputs.conf"
+
+# ---- one connection: plan or apply ------------------------------------------------------------
+apply_flag=""
+[ "$TEAM_APPLY" = 1 ] && apply_flag=" --apply"
+# shellcheck disable=SC2016  # expanded on the server, not here
+remote='d=$(mktemp -d) && tar -xz -C "$d" && sudo bash "$d/provision" --bundle "$d"'"$apply_flag"'; rc=$?; rm -rf "${d:?}"; exit $rc'
+echo "== server/provision $project $env on $alias ($([ "$TEAM_APPLY" = 1 ] && echo apply || echo plan)) =="
+set +e
+# shellcheck disable=SC2029  # $remote is built here on purpose; its own $vars expand remotely
+team_tar_create "$bundle" - . | ssh "$alias" "$remote" 2>&1 | TEAM_REDACT_1="$ba_pass" team_redact_stream | tee "$tmp/out"
+rcs=("${PIPESTATUS[@]}")
+set -e
+ssh_rc="${rcs[1]}"
+result=$(grep '^TEAM-RESULT ' "$tmp/out" | tail -n 1 || true)
+if [ "$ssh_rc" != 0 ] || [ "$result" != "TEAM-RESULT ok" ]; then
+  [ "$ssh_rc" = 255 ] && team_die "$TEAM_EXIT_FAIL" "ssh to $alias failed (not retried, to stay clear of fail2ban)"
+  case "$ssh_rc" in [2-6]) team_die "$ssh_rc" "server/provision stopped: ${result:-no TEAM-RESULT line}" ;; esac
+  team_die "$TEAM_EXIT_FAIL" "server/provision failed: ${result:-no TEAM-RESULT line} (exit $ssh_rc)"
+fi
+
+secret_names="DEPLOY_HOST DEPLOY_USER DEPLOY_PORT"
+[ "$gen_deploy" = 1 ] && secret_names="$secret_names DEPLOY_SSH_KEY"
+secret_names="$secret_names DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL"
+[ "$env" = staging ] && secret_names="$secret_names BASIC_AUTH_USER BASIC_AUTH_PASSWORD"
+ready_var=$(printf '%s_READY' "$env" | tr '[:lower:]' '[:upper:]')
+
+if [ "$TEAM_APPLY" != 1 ]; then
+  echo
+  echo "With --apply, after TEAM-RESULT ok, team-provision would also store (names only):"
+  if [ "$private_prod" = 1 ]; then
+    echo "  nothing in GitHub for production (private repo): deploy key → $local_deploy_key, host key → $TEAM_CONFIG_DIR/projects/$project.known_hosts"
+  else
+    echo "  environment secrets ($env) in $repo: $secret_names"
+    [ "$env" = production ] && echo "  repo secret in $repo: PRODUCTION_HEALTH_URL"
+    echo "  repo variable in $repo: $ready_var=true"
+  fi
+  [ "$env" = staging ] && echo "  keychain: $keychain_item (staging basic-auth login)"
+  [ "$gen_dbpull" = 1 ] && echo "  db-pull key: $dbpull_key"
+  team_plan_footer
+  exit 0
+fi
+
+# ---- after a successful apply: pin the host key, store values ------------------------------------
+hostkey=$(ssh "$alias" cat /etc/ssh/ssh_host_ed25519_key.pub | tr -d '\r' | head -n 1) \
+  || team_die "$TEAM_EXIT_FAIL" "could not read the server's host key (not retried); re-run with --apply to store the secrets"
+kt=$(printf '%s' "$hostkey" | awk '{print $1}')
+kb=$(printf '%s' "$hostkey" | awk '{print $2}')
+[ "$kt" = ssh-ed25519 ] || team_die "$TEAM_EXIT_FAIL" "unexpected host key type from the server"
+case "$kb" in AAAA*) ;; *) team_die "$TEAM_EXIT_FAIL" "unexpected host key from the server" ;; esac
+case "$kb" in *[!A-Za-z0-9+/=]*) team_die "$TEAM_EXIT_FAIL" "unexpected host key from the server" ;; esac
+port=$(team_vps_ssh_port "$alias")
+if [ "$port" = 22 ]; then kh_line="$ip $kt $kb"; else kh_line="[$ip]:$port $kt $kb"; fi
+
+mkdir -p "$TEAM_CONFIG_DIR/projects"
+printf '%s %s %s\n' "$ip" "$kt" "$kb" > "$TEAM_CONFIG_DIR/projects/$project.known_hosts"
+chmod 644 "$TEAM_CONFIG_DIR/projects/$project.known_hosts"
+
+failed=""
+set_secret() {   # set_secret NAME [--env ENV] < value  (never in a pipeline: keeps $failed)
+  local name="$1"; shift
+  if team_gh_as "$account" secret set "$name" "$@" --repo "$repo" >/dev/null; then
+    echo "[set]   secret $name${1:+ ($2)}"
+  else
+    failed="$failed $name"
+    team_warn "could not set secret $name"
+  fi
+}
+put_secret() {   # put_secret NAME VALUE [--env ENV] : value via a private temp file on stdin
+  local name="$1" value="$2"; shift 2
+  ( umask 077; printf '%s' "$value" > "$tmp/value" )
+  set_secret "$name" "$@" < "$tmp/value"
+  rm -f "$tmp/value"
+}
+
+install_key() {   # install_key <src> <dest> : private key + .pub, mode 600
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+  ( umask 077; cat "$1" > "$2.tmp" ) && mv "$2.tmp" "$2" && chmod 600 "$2"
+  cp "$1.pub" "$2.pub"
+  chmod 644 "$2.pub"
+  echo "[set]   key $2"
+}
+
+if [ "$private_prod" = 1 ]; then
+  [ "$gen_deploy" = 1 ] && install_key "$tmp/deploy" "$local_deploy_key"
+  echo "[skip]  GitHub: production secrets stay off GitHub for a private repo (deploy with team-deploy production)"
+else
+  put_secret DEPLOY_HOST "$ip" --env "$env"
+  put_secret DEPLOY_USER "$user" --env "$env"
+  put_secret DEPLOY_PORT "$port" --env "$env"
+  if [ "$gen_deploy" = 1 ]; then
+    set_secret DEPLOY_SSH_KEY --env "$env" < "$tmp/deploy"
+    case " $failed " in
+      *" DEPLOY_SSH_KEY "*) team_warn "the server now trusts a new deploy key that GitHub does not have: re-run with --apply --rotate-keys" ;;
+      *) ( umask 022; cp "$tmp/deploy.pub" "$pub_store" ) ;;
+    esac
+  fi
+  put_secret DEPLOY_KNOWN_HOSTS "$kh_line
+" --env "$env"
+  put_secret APP_URL "https://$host" --env "$env"
+  put_secret HEALTH_URL "https://$host$health_path" --env "$env"
+  if [ "$env" = staging ]; then
+    put_secret BASIC_AUTH_USER "$ba_user" --env "$env"
+    put_secret BASIC_AUTH_PASSWORD "$ba_pass" --env "$env"
+  fi
+  if [ "$env" = production ]; then
+    put_secret PRODUCTION_HEALTH_URL "https://$host$health_path"
+  fi
+fi
+
+if [ "$env" = staging ]; then
+  if printf 'add-generic-password -U -s "%s" -a "%s" -l "%s" -w "%s"\n' \
+      "$keychain_item" "$ba_user" "team staging login $project" "$ba_pass" | security -i >/dev/null 2>&1; then
+    echo "[set]   keychain $keychain_item"
+  else
+    failed="$failed keychain"
+    team_warn "could not store the staging login in the keychain"
+  fi
+fi
+[ "$gen_dbpull" = 1 ] && install_key "$tmp/dbpull" "$dbpull_key"
+
+if [ -n "$failed" ]; then
+  team_die "$TEAM_EXIT_FAIL" "some values were not stored:$failed (re-run team-provision $env --apply)"
+fi
+if [ "$private_prod" = 0 ]; then
+  if team_gh_as "$account" variable set "$ready_var" --body true --repo "$repo" >/dev/null; then
+    echo "[set]   variable $ready_var=true"
+  else
+    team_die "$TEAM_EXIT_FAIL" "could not set the repo variable $ready_var"
+  fi
+fi
+echo "TEAM-PROVISION ok: $project $env"

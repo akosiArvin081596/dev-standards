@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# team-refresh-staging: refresh staging's database from the newest sanitized snapshot,
+# then run staging's migrations. Plan by default; --apply to do it.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-refresh-staging [--apply]
+
+Run in a project checkout. Through one plain ssh to VPS_ALIAS (one attempt) runs
+  sudo /usr/local/lib/team/refresh-staging <project> [--apply]
+Without --apply the server prints its plan and changes nothing. With --apply it
+replaces staging's database with the newest sanitized production snapshot and runs
+staging's migrations. Connecting needs the owner's yes.
+Exit codes: 0 ok (a plan is success), 1 failure, 2 usage, 3 not configured,
+4 refused, 5 missing config.
+EOF
+}
+
+TEAM_APPLY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --apply) TEAM_APPLY=1; shift ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+
+team_require_cmd git ssh
+root=$(team_repo_root .)
+team_require_project_conf "$root"
+project=$(team_project_name "$root")
+alias=$(team_vps_alias)
+
+set -- sudo "$TEAM_REMOTE_LIB/refresh-staging" "$project"
+[ "$TEAM_APPLY" = 1 ] && set -- "$@" --apply
+rc=0
+# shellcheck disable=SC2029  # validated words, expanded here on purpose
+ssh "$alias" "$@" || rc=$?
+case "$rc" in
+  0) ;;
+  255) team_die "$TEAM_EXIT_FAIL" "ssh to $alias failed (not retried)" ;;
+  [2-7]) exit "$rc" ;;
+  *) team_die "$TEAM_EXIT_FAIL" "refresh-staging exited with status $rc" ;;
+esac
+team_plan_footer

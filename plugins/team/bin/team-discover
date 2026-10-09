@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# team-discover: read-only server report. Sends server/discover (+ the lib.sh it sources)
+# over one plain `ssh <VPS_ALIAS>` connection, runs it from a temp folder, removes it.
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-discover
+
+Sends the plugin's server/discover script and the lib.sh it sources to the VPS as a
+small tar stream over one plain `ssh <VPS_ALIAS>` (alias from defaults.conf; never by
+IP, never a forbidden alias, one attempt, no retries), runs it as the login user
+(no sudo) from a temp folder that is removed afterwards, and prints its read-only
+report: OS, web server, database engines, runtimes, sites and vhosts, users, disk,
+RAM, open ports, firewall, timers and cron. Changes nothing on the server.
+Connecting needs the owner's yes.
+Exit codes: 0 ok, 1 failure (ssh or the script), 2 usage, 3 VPS_ALIAS not set,
+4 refused alias, 5 missing config or script.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *) team_usage_error "unknown argument: $1" ;;
+  esac
+done
+
+team_require_cmd ssh tar
+for f in discover lib.sh; do
+  [ -r "$TEAM_SERVER_DIR/$f" ] || team_die "$TEAM_EXIT_PREREQ" "missing $TEAM_SERVER_DIR/$f"
+done
+alias=$(team_vps_alias)
+team_info "running server/discover on $alias (read-only)"
+# shellcheck disable=SC2016  # expanded on the server
+remote='d=$(mktemp -d) && tar -xz -C "$d" && bash "$d/discover"; rc=$?; rm -rf "${d:?}"; exit $rc'
+set +e
+# shellcheck disable=SC2029  # $remote is built here on purpose; its own $vars expand remotely
+team_tar_create "$TEAM_SERVER_DIR" - discover lib.sh | ssh "$alias" "$remote"
+rcs=("${PIPESTATUS[@]}")
+set -e
+case "${rcs[1]}" in
+  0) ;;
+  255) team_die "$TEAM_EXIT_FAIL" "ssh to $alias failed (not retried)" ;;
+  *) team_die "$TEAM_EXIT_FAIL" "server/discover exited with status ${rcs[1]}" ;;
+esac
+[ "${rcs[0]}" = 0 ] || team_die "$TEAM_EXIT_FAIL" "could not package server/discover"

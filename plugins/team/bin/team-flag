@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# team-flag: switch a feature flag on the server (staging for agents; production is the
+# owner's, from a normal terminal).
+set -euo pipefail
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-local.sh disable=SC1091
+. "$TEAM_SELF_DIR/../lib/team-local.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-flag <staging|production> <name> on|off
+
+Run in a project checkout. Sets one row of the feature_flags table on the server
+through one plain ssh to VPS_ALIAS (one attempt):
+  sudo /usr/local/lib/team/flag <project> <env> <name> <on|off> --by <login>
+The server logs who changed what and when. Production is refused inside Claude Code
+(exit 4): you run it yourself. `ops/flag <env> <name> on|off` calls this command.
+Flag names: [a-z0-9][a-z0-9_-]{0,63}.
+Exit codes: 0 ok, 1 failure, 2 usage, 3 not configured, 4 refused, 5 missing config.
+EOF
+}
+
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -*) team_usage_error "unknown option: $1" ;;
+    *) args[${#args[@]}]="$1"; shift ;;
+  esac
+done
+[ "${#args[@]}" -eq 3 ] || team_usage_error "expected: <staging|production> <name> on|off"
+env="${args[0]}" name="${args[1]}" state="${args[2]}"
+case "$env" in staging|production) ;; *) team_usage_error "environment must be staging or production" ;; esac
+case "$state" in on|off) ;; *) team_usage_error "state must be on or off" ;; esac
+case "$name" in [a-z0-9]*) ;; *) team_usage_error "flag name must match [a-z0-9][a-z0-9_-]{0,63}" ;; esac
+case "$name" in *[!a-z0-9_-]*) team_usage_error "flag name must match [a-z0-9][a-z0-9_-]{0,63}" ;; esac
+[ "${#name}" -le 64 ] || team_usage_error "flag name is longer than 64 characters"
+
+if [ "$env" = production ] && team_in_claude_code; then
+  team_die "$TEAM_EXIT_REFUSED" "production flags are the owner's: run it yourself in a normal terminal: team-flag production $name $state"
+fi
+
+team_require_cmd git ssh
+root=$(team_repo_root .)
+team_require_project_conf "$root"
+project=$(team_project_name "$root")
+login=""
+if team_in_claude_code; then login=$(team_agent_login); fi
+[ -n "$login" ] || login=$(team_github_account "$root")
+team_is_safe_word "$login" || team_die "$TEAM_EXIT_NOT_CONFIGURED" "unexpected GitHub login"
+alias=$(team_vps_alias)
+
+team_info "setting flag $name $state on $project $env (via $alias)"
+rc=0
+ssh "$alias" sudo "$TEAM_REMOTE_LIB/flag" "$project" "$env" "$name" "$state" --by "$login" || rc=$?
+case "$rc" in
+  0) ;;
+  255) team_die "$TEAM_EXIT_FAIL" "ssh to $alias failed (not retried)" ;;
+  [2-7]) exit "$rc" ;;
+  *) team_die "$TEAM_EXIT_FAIL" "server flag command exited with status $rc" ;;
+esac
