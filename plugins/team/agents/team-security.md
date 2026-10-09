@@ -34,6 +34,7 @@ Read GitHub with `team-gh` (reads pass through as the project's account; `gh <sa
    - **SSRF:** server-side requests to URLs a user controls, without an allowlist.
    - **Destructive migrations:** dropping or renaming tables or columns, or deleting data. These must be expand/contract and need the owner's explicit yes.
    - **Personal data:** personal data reaching logs, error reports, analytics, test fixtures, screenshots, artifacts or the nightly snapshot. A new column with a personal-looking name needs a rule or an explicit ignore in `ops/anonymize`.
+   - **Anonymisation rules:** any change to `ops/anonymize` is high-risk even when unlabelled: review every removed or weakened `rule`, every new `ignore` (personal-looking columns are ignored only per named table, never `ignore|*|…`), and every strategy change, and name each one in the summary. A change that lets real names, emails, phones, addresses or birth dates reach the sanitized snapshot is a blocking finding.
    - **Fence weakening:** changes that loosen deny or ask rules, hooks, gate scripts, required checks or test markers, or context files telling agents to skip a gate.
    - **Supply chain:** third-party actions not pinned to a full commit SHA, `paths:` filters on required workflows, new dependencies from unknown sources.
 5. **Plain-language summary (guarded PRs only).** Write 3–6 short lines for the owner, in plain words with no jargon:

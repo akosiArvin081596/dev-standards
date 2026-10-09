@@ -17,7 +17,8 @@ Checks every directive (docs/rules.md §8):
 Strategies: email name first_name last_name phone address text null redact hash
 (only redact takes an <arg>). Tables and columns are identifiers (a table may be
 schema-qualified); `*` is allowed only as an ignore table; a column has at most
-one rule or ignore per table; every email-looking value uses a fake domain
+one rule or ignore per table; a personal-looking column (config/pii-patterns.txt)
+is never ignored with a `*` table; every email-looking value uses a fake domain
 (example.invalid, example.com, example.org, example.net or *.test).
 Exit 0 when valid, 1 with file:line errors, 2 on usage error, 3 when the file
 doesn't exist ("not configured").
@@ -32,8 +33,12 @@ if [ ! -f "$file" ]; then
   exit "$CI_EXIT_NOT_CONFIGURED"
 fi
 
+# Personal-looking column names (config/pii-patterns.txt): such a column may not be
+# ignored for every table at once (`ignore|*|<column>`), only per named table.
+pii_re=$(ci_list "$CI_CONFIG_DIR/pii-patterns.txt" 2>/dev/null | paste -sd'|' - || true)
+
 set +e
-awk -F'|' -v file="$file" '
+awk -F'|' -v file="$file" -v pii="$pii_re" '
   function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
   function err(msg) { printf "%s:%d: %s\n", file, NR, msg; bad++ }
   function ident(s) { return s ~ /^[A-Za-z_][A-Za-z0-9_]*$/ }
@@ -72,6 +77,7 @@ awk -F'|' -v file="$file" '
       if (f[2] != "*" && !table(f[2])) err("bad table name: " f[2])
       if (!ident(f[3])) err("bad column name: " f[3])
       if (f[4] == "") err("ignore needs a reason")
+      if (f[2] == "*" && pii != "" && tolower(f[3]) ~ ("^(" pii ")$|" pii)) err("ignore|*|" f[3] ": a personal-looking column must be ignored per named table, never for every table")
       key = tolower(f[2]) "|" tolower(f[3])
       if (key in seen) err("column " f[2] "." f[3] " already has a " seen[key] " line (line " seenline[key] ")")
       else { seen[key] = "ignore"; seenline[key] = NR }
