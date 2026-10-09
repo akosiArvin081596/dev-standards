@@ -219,7 +219,8 @@ team_lock_acquire() {
   mkdir -p "$TEAM_CONFIG_DIR/locks"
   while ! mkdir "$dir" 2>/dev/null; do
     now=$(date +%s)
-    mtime=$(stat -f %m "$dir" 2>/dev/null || stat -c %Y "$dir" 2>/dev/null || echo "$now")
+    mtime=$(stat -c %Y "$dir" 2>/dev/null) || mtime=$(stat -f %m "$dir" 2>/dev/null) || mtime=$now
+    case $mtime in '' | *[!0-9]*) mtime=$now ;; esac
     if [ $((now - mtime)) -gt 120 ]; then
       team_warn "removing stale lock $dir"
       rm -rf "${dir:?}"

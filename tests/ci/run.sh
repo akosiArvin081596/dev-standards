@@ -103,7 +103,7 @@ printf 'args:' >> "$log"; for a in "$@"; do printf ' [%s]' "$a" >> "$log"; done;
 prev=""
 for a in "$@"; do
   if [ "$prev" = "-i" ]; then
-    printf 'keymode: %s\n' "$(stat -f %Lp "$a" 2>/dev/null || stat -c %a "$a")" >> "$log"
+    printf 'keymode: %s\n' "$(stat -c %a "$a" 2>/dev/null || stat -f %Lp "$a")" >> "$log"
     printf 'keyfile: %s\n' "$a" >> "$log"
   fi
   prev="$a"

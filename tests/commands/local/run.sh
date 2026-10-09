@@ -155,7 +155,7 @@ t_worktrees() {
   ok "env file: outside services in log/sandbox mode" sh -c "grep -qx 'MAIL_MODE=log' '$e' && grep -qx 'SMS_MODE=log' '$e' && grep -qx 'PAYMENTS_MODE=sandbox' '$e' && grep -qx 'WEBHOOKS_MODE=log' '$e'"
   ok "env file: replaced not duplicated, other keys kept" sh -c "[ \$(grep -c '^MAIL_MODE=' '$e') = 1 ] && grep -qx 'FOO=bar' '$e' && [ \$(grep -c '^PORT=' '$e') = 1 ]"
   ok "env file: timezone, Playwright profile, TEAM_WORKTREE" sh -c "grep -qx 'APP_TIMEZONE=Asia/Manila' '$e' && grep -qx 'PLAYWRIGHT_PROFILE_DIR=.team/playwright-profile' '$e' && grep -qx 'TEAM_WORKTREE=1' '$e'"
-  ok "env file is mode 600" [ "$(stat -f %Lp "$e")" = 600 ]
+  ok "env file is mode 600" [ "$(file_mode "$e")" = 600 ]
   ok "make setup ran" [ -e "$WT11/.team/setup-ran" ]
   ok "no snapshot: MIGRATE_CMD then SEED_CMD ran" sh -c "[ -e '$WT11/.team/migrated' ] && [ \"\$(psql -X -h 127.0.0.1 -p $PG_PORT -U postgres -d cmdtest_app_11 -Atc 'SELECT count(*) FROM seeded')\" = 1 ]"
   ok "no snapshot: says the seed data was loaded" has "$T/wt11.err" "no sanitized snapshot yet"
@@ -184,7 +184,7 @@ t_worktrees() {
 
   local down="$T/config-pgdown"
   write_config "$down"
-  sed -i '' "s/^LOCAL_PG_PORT=.*/LOCAL_PG_PORT=$(free_port 56600 56699)/" "$down/defaults.conf"
+  sed -i.bak "s/^LOCAL_PG_PORT=.*/LOCAL_PG_PORT=$(free_port 56600 56699)/" "$down/defaults.conf" && rm -f "$down/defaults.conf.bak"
   expect_rc 1 "Postgres unreachable → exit 1 with a clear message" sh -c "cd '$PROJ' && TEAM_CONFIG_DIR='$down' /bin/bash '$BIN/team-new-worktree' 17 --type fix --slug converge --no-setup"
   ok "the message names the server" has "$T/last.err" "cannot connect to Postgres on 127.0.0.1:"
   expect_rc 0 "re-run once Postgres is reachable finishes the same worktree" sh -c "cd '$PROJ' && /bin/bash '$BIN/team-new-worktree' 17 --no-setup"
@@ -294,7 +294,7 @@ t_dbpull() {
   pgq "CREATE DATABASE cmdtest_app_12_decoy" >/dev/null
   psql -X -q -h 127.0.0.1 -p "$PG_PORT" -U postgres -d cmdtest_app_12_decoy -c "CREATE TABLE keep (id int); INSERT INTO keep VALUES (7);" >/dev/null 2>&1
   cp "$WT12/.env" "$T/env12.bak"
-  sed -i '' 's/^DB_NAME=.*/DB_NAME=cmdtest_app_12_decoy/' "$WT12/.env"
+  sed -i.bak 's/^DB_NAME=.*/DB_NAME=cmdtest_app_12_decoy/' "$WT12/.env" && rm -f "$WT12/.env.bak"
   expect_rc 4 "refuses to overwrite an unrecorded, non-empty database" sh -c "cd '$WT12' && /bin/bash '$BIN/team-db-pull'"
   ok "the unrecorded database still has its data" [ "$(pgq 'SELECT id FROM keep' cmdtest_app_12_decoy)" = 7 ]
   cp "$T/env12.bak" "$WT12/.env"
@@ -361,7 +361,7 @@ t_mysql() {
   ok "database created inside the container" sh -c "MYSQL_PWD='$pw' docker exec -e MYSQL_PWD '$MY_CONTAINER' mysql -uroot -N -B -e \"SHOW DATABASES LIKE 'cmdtest_my_21'\" 2>/dev/null | grep -qx cmdtest_my_21"
   ok "recorded in databases.registry" grep -q "^mysql|127.0.0.1|$myport|cmdtest_my_21|cmdtest-my|$w|" "$TEAM_CONFIG_DIR/databases.registry"
   ok "env file points at the container port" sh -c "grep -qx 'DB_PORT=$myport' '$w/.env' && grep -qx 'DB_USER=root' '$w/.env' && grep -qx 'DB_PASSWORD=$pw' '$w/.env'"
-  ok "projects/<project>.conf holding the password is mode 600" [ "$(stat -f %Lp "$TEAM_CONFIG_DIR/projects/cmdtest-my.conf")" = 600 ]
+  ok "projects/<project>.conf holding the password is mode 600" [ "$(file_mode "$TEAM_CONFIG_DIR/projects/cmdtest-my.conf")" = 600 ]
   expect_rc 0 "re-run is idempotent" sh -c "cd '$r' && /bin/bash '$BIN/team-new-worktree' 21"
   mkdir -p "$TEAM_SNAPSHOT_CACHE/cmdtest-my"
   gzip -c "$HERE/fixtures/dump-mysql.sql" > "$TEAM_SNAPSHOT_CACHE/cmdtest-my/sanitized-20261001T030000Z.sql.gz"
@@ -420,9 +420,9 @@ t_vps() {
   expect_rc 0 "team-refresh-staging --apply" sh -c "cd '$r' && /bin/bash '$BIN/team-refresh-staging' --apply"
   ok "refresh apply: --apply sent" grep -qx "vps-test sudo /usr/local/lib/team/refresh-staging cmdtest-flag --apply" "$STUB_DIR/ssh.log"
   write_config "$bad"
-  sed -i '' 's/^VPS_ALIAS=.*/VPS_ALIAS=vps-test-root/' "$bad/defaults.conf"
+  sed -i.bak 's/^VPS_ALIAS=.*/VPS_ALIAS=vps-test-root/' "$bad/defaults.conf" && rm -f "$bad/defaults.conf.bak"
   expect_rc 4 "a forbidden alias is refused" env TEAM_CONFIG_DIR="$bad" /bin/bash "$BIN/team-discover"
-  sed -i '' 's/^VPS_ALIAS=.*/VPS_ALIAS=192.0.2.10/' "$bad/defaults.conf"
+  sed -i.bak 's/^VPS_ALIAS=.*/VPS_ALIAS=192.0.2.10/' "$bad/defaults.conf" && rm -f "$bad/defaults.conf.bak"
   expect_rc 4 "the VPS IP as alias is refused" env TEAM_CONFIG_DIR="$bad" /bin/bash "$BIN/team-discover"
   expect_rc 5 "missing defaults.conf" env TEAM_CONFIG_DIR="$T/nowhere" /bin/bash "$BIN/team-discover"
   ok "ssh only ever went to the alias" sh -c "! grep -v -x 'vps-test' '$STUB_DIR/ssh-dest.log' | grep -q ."
@@ -443,7 +443,7 @@ t_provision() {
   ok "plan: no macOS metadata files in the bundle" sh -c "! find '$STUB_DIR/bundle' -name '._*' | grep -q ."
   ok "plan: remote command matches §12 without --apply" sh -c "grep -q 'sudo bash \"\$d/provision\" --bundle \"\$d\"; rc=\$?; rm -rf \"\${d:?}\"; exit \$rc' '$STUB_DIR/provision-cmd'"
   ok "plan: inputs.conf values" sh -c "grep -qx 'PROJECT=\"cmdtest-prov\"' '$STUB_DIR/bundle/inputs.conf' && grep -qx 'ENV=\"staging\"' '$STUB_DIR/bundle/inputs.conf' && grep -qx 'HOST=\"cmdtest-prov-staging.example.test\"' '$STUB_DIR/bundle/inputs.conf' && grep -q '^DEPLOY_PUBKEY=\"ssh-ed25519 AAAA' '$STUB_DIR/bundle/inputs.conf' && grep -qx 'DBPULL_PUBKEY=\"\"' '$STUB_DIR/bundle/inputs.conf' && grep -qx 'TIMEZONE=\"Asia/Manila\"' '$STUB_DIR/bundle/inputs.conf'"
-  ok "plan: inputs.conf is mode 600" [ "$(stat -f %Lp "$STUB_DIR/bundle/inputs.conf")" = 600 ]
+  ok "plan: inputs.conf is mode 600" [ "$(file_mode "$STUB_DIR/bundle/inputs.conf")" = 600 ]
   ok "plan: lists the §12 secret names" has "$T/prov-plan.out" "environment secrets (staging) in test-owner/cmdtest-prov: DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL BASIC_AUTH_USER BASIC_AUTH_PASSWORD"
   ok "plan: lists the variable and keychain item" sh -c "grep -q 'STAGING_READY=true' '$T/prov-plan.out' && grep -q 'keychain: team-staging-cmdtest-prov' '$T/prov-plan.out'"
   ok "plan: nothing stored" sh -c "[ ! -d '$STUB_DIR/secrets' ] && [ ! -d '$STUB_DIR/variables' ] && [ ! -e '$STUB_DIR/security-i.log' ]"
@@ -493,7 +493,7 @@ t_provision() {
   ok "production: exactly the §12 production secret names" [ "$(secret_files)" = "production.APP_URL production.DEPLOY_HOST production.DEPLOY_KNOWN_HOSTS production.DEPLOY_PORT production.DEPLOY_SSH_KEY production.DEPLOY_USER production.HEALTH_URL repo.PRODUCTION_HEALTH_URL " ]
   ok "production: PRODUCTION_READY=true" [ "$(cat "$STUB_DIR/variables/PRODUCTION_READY" 2>/dev/null)" = true ]
   ok "production: host from the pattern" grep -qx 'HOST="cmdtest-prov.example.test"' "$STUB_DIR/bundle/inputs.conf"
-  ok "production: db-pull key installed, mode 600" sh -c "[ \"\$(stat -f %Lp '$HOME/.ssh/team-dbpull-cmdtest-prov')\" = 600 ]"
+  ok "production: db-pull key installed, mode 600" sh -c "[ \"\$(stat -c %a '$HOME/.ssh/team-dbpull-cmdtest-prov' 2>/dev/null || stat -f %Lp '$HOME/.ssh/team-dbpull-cmdtest-prov')\" = 600 ]"
   ok "production: db-pull key matches DBPULL_PUBKEY" [ "$(ssh-keygen -y -f "$HOME/.ssh/team-dbpull-cmdtest-prov" | cut -d' ' -f1,2)" = "$(sed -n 's/^DBPULL_PUBKEY="\(.*\)"$/\1/p' "$STUB_DIR/bundle/inputs.conf")" ]
 
   rm -rf "${STUB_DIR:?}/secrets" "${STUB_DIR:?}/variables"
@@ -504,7 +504,7 @@ t_provision() {
   make_project "$rp" cmdtest-priv postgres Makefile.pg "VISIBILITY=private"
   expect_rc 0 "private repo: production apply" sh -c "cd '$rp' && /bin/bash '$BIN/team-provision' production --apply"
   ok "private: no production values in GitHub" sh -c "[ ! -d '$STUB_DIR/secrets' ] && [ ! -e '$STUB_DIR/variables/PRODUCTION_READY' ]"
-  ok "private: deploy key kept on the Mac, mode 600" [ "$(stat -f %Lp "$HOME/.ssh/team-deploy-cmdtest-priv-production" 2>/dev/null)" = 600 ]
+  ok "private: deploy key kept on the Mac, mode 600" [ "$(file_mode "$HOME/.ssh/team-deploy-cmdtest-priv-production" 2>/dev/null)" = 600 ]
   ok "private: host key pinned in the config folder" [ -s "$TEAM_CONFIG_DIR/projects/cmdtest-priv.known_hosts" ]
   expect_rc 2 "unknown argument" sh -c "cd '$r' && /bin/bash '$BIN/team-provision' staging --force"
 }

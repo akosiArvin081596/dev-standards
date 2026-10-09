@@ -12,6 +12,9 @@ PG_NAME="" PG_PORT="" PG_OK=0
 MY_CONTAINER="team-cmdtest-my-db" MY_VOLUME="team-cmdtest-my-db-data" MY_USED=0
 RECORDED_PIDS=""
 
+# file_mode <path> : octal permission bits (GNU stat first; BSD stat rejects -c)
+file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
 pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
 skip() { SKIP=$((SKIP + 1)); printf 'SKIP  %s\n' "$*"; }
