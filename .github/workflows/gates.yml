@@ -1,0 +1,23 @@
+# dev-standards' own PR gates: every path is guarded (profile standards), and the gate
+# scripts and config come from the PR's BASE commit, so a PR can't swap in its own.
+# (pull_request runs read this YAML from the PR itself; the team-security review and the
+# owner's owner-approved cover changes to the workflow files.)
+name: gates
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  gates:
+    uses: ./.github/workflows/pr-gates.yml
+    with:
+      profile: standards
+      standards-ref: ${{ github.event.pull_request.base.sha }}
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      checks: read

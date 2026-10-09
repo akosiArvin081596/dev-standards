@@ -1,0 +1,57 @@
+# dev-standards' releases: release-please keeps a release PR open; after a release it
+# moves the major tag (v1) to the release commit. v1 never gets a GitHub Release, so it
+# stays movable under immutable releases. plugin.json's version follows every release
+# (release-please extra-files), so the plugin cache picks up each move of v1.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      HAS_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+    steps:
+      - name: No release token yet
+        if: ${{ env.HAS_TOKEN != 'true' }}
+        run: echo "::notice::the RELEASE_PLEASE_TOKEN secret is not set, so release-please is skipped. Run team-store-token once in a normal terminal."
+
+      - name: release-please
+        id: rp
+        if: ${{ env.HAS_TOKEN == 'true' }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Check out the release commit
+        if: ${{ steps.rp.outputs.release_created == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.rp.outputs.sha }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Move the major tag to this release
+        if: ${{ steps.rp.outputs.release_created == 'true' }}
+        shell: bash
+        env:
+          MAJOR: ${{ steps.rp.outputs.major }}
+          SHA: ${{ steps.rp.outputs.sha }}
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: |
+          case "$MAJOR" in ''|*[!0-9]*) echo "::error::unexpected major version: $MAJOR"; exit 1 ;; esac
+          case "$SHA" in ''|*[!0-9a-f]*) echo "::error::unexpected release sha"; exit 1 ;; esac
+          git tag -f "v$MAJOR" "$SHA"
+          git push --force origin "refs/tags/v$MAJOR"
+          echo "::notice::moved v$MAJOR to $TAG ($SHA)"

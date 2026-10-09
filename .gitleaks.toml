@@ -1,0 +1,8 @@
+# gitleaks config for dev-standards itself: the default rules, plus an allowlist
+# for test fixtures, which hold fake secrets on purpose.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "test fixtures and test suites with fake secrets"
+paths = ['''^tests/''']

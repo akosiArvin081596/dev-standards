@@ -1,0 +1,85 @@
+# dev-standards' own checks. `self-test` runs shellcheck, actionlint, the test suites,
+# the context check and `claude plugin validate`; `ci` runs the reusable ci.yml on
+# tests/fixture-project with this commit's scripts, so every change runs on GitHub and the
+# real check names (`self-test`, `ci / ci`) are known. On main, failure opens main-red.
+name: self-test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  self-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned shellcheck and actionlint
+        run: |
+          bash tests/ci/self-test.sh --install-tools "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+
+      - name: Install Claude Code for plugin validation (no login)
+        run: |
+          v=$(bash scripts/ci/conf.sh get config/tool-versions.env CLAUDE_CODE_VERSION)
+          if npm install --prefix "$RUNNER_TEMP/claude" --no-audit --no-fund --loglevel=error "@anthropic-ai/claude-code@$v"; then
+            echo "CLAUDE_BIN=$RUNNER_TEMP/claude/node_modules/.bin/claude" >> "$GITHUB_ENV"
+          else
+            echo "::notice::could not install @anthropic-ai/claude-code@$v: plugin validation will be skipped"
+          fi
+
+      - name: Self-test
+        run: bash tests/ci/self-test.sh
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      working-directory: tests/fixture-project
+      allow-unreleased-lock: true
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+
+  main-red:
+    needs: [self-test, ci]
+    if: ${{ always() && github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROJECT_TIMEZONE: ${{ vars.PROJECT_TIMEZONE }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Open or update main-red
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: bash scripts/ci/main-red.sh open
+
+      - name: Close main-red
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+        run: bash scripts/ci/main-red.sh close
