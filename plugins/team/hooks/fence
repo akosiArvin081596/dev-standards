@@ -480,6 +480,13 @@ f_kind_glob() {
         rest=${rest#*'}'}
         lpat="$pre*$rest"
         ;;
+      *'('*')'*)
+        # extglob groups and zsh glob qualifiers ((D) = dot files too) widen the match
+        pre=${lpat%%'('*}
+        rest=${lpat#*'('}
+        rest=${rest#*')'}
+        lpat="$pre*$rest"
+        ;;
       *) break ;;
     esac
   done
@@ -579,7 +586,7 @@ f_has_kind() { case " $PK " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # ============================================================ shared state
 
-T_TOOL='' T_HASCMD=0 T_CMD='' T_FILE='' T_NB='' T_PATH='' T_CWD='' T_AGENT='' T_AGENTID='' T_NUL=0
+T_URL='' T_MCPF='' T_TOOL='' T_HASCMD=0 T_CMD='' T_FILE='' T_NB='' T_PATH='' T_CWD='' T_AGENT='' T_AGENTID='' T_NUL=0
 VCWD=
 V_GITDIR=
 V_WORKTREE=
@@ -737,6 +744,45 @@ f_take_braced() {
   REPLY=$out
 }
 
+f_take_group() {
+  # P_S starts with '(': consume to the matching ')' (quotes and backslashes respected),
+  # the inside into REPLY
+  local depth=0 out='' c q
+  case $P_S in *')'*) ;; *) f_merge ;; esac
+  while f_fill; [ -n "$P_S" ]; do
+    c=${P_S:0:1}
+    case $c in
+      '(')
+        depth=$((depth + 1))
+        [ "$depth" -gt 1 ] && out=$out$c
+        P_S=${P_S:1}
+        ;;
+      ')')
+        depth=$((depth - 1))
+        P_S=${P_S:1}
+        [ "$depth" = 0 ] && break
+        out=$out$c
+        ;;
+      \\)
+        out=$out${P_S:0:2}
+        P_S=${P_S:2}
+        ;;
+      "'" | '"')
+        q=${P_S:1}
+        case $q in *"$c"*) ;; *) f_merge; q=${P_S:1} ;; esac
+        q=${q%%"$c"*}
+        out=$out$c$q$c
+        P_S=${P_S:${#q}+2}
+        ;;
+      *)
+        out=$out$c
+        P_S=${P_S:1}
+        ;;
+    esac
+  done
+  REPLY=$out
+}
+
 f_expand_simple() {
   # best-effort expansion of a parameter default: ~, $HOME, ${HOME}, $TEAM_CONFIG_DIR; others \001
   local s=$1 out='' name chunk
@@ -774,6 +820,10 @@ f_expand_simple() {
 f_expand_param() {
   # ${...} body $1: append its value (known) or \001 to W; analyse substitutions inside
   local body=$1 name op def
+  # zsh: ${(flags)...} (e evaluates), ${~...} (glob), ${=...} (split) build code from data
+  case $body in
+    '('* | '~'* | '='*) deny disguised "zsh parameter flags \${(...)}, \${~...} or \${=...}. $M_DISGUISED" ;;
+  esac
   name=${body%%[!A-Za-z0-9_]*}
   op=${body:${#name}}
   if [ -n "$name" ]; then
@@ -882,6 +932,10 @@ f_dollar() {
   local inq=$1 name
   # shellcheck disable=SC2016 # literal $( ${ patterns on purpose
   case $P_S in
+    '$='[A-Za-z_\{]* | '$~'[A-Za-z_\{]*)
+      # zsh $=name (split into words) and $~name (glob) build code from data
+      deny disguised "zsh \$=name / \$~name expansion. $M_DISGUISED"
+      ;;
     '$('*)
       P_S=${P_S:2}
       f_cmdsubst 0
@@ -1151,6 +1205,10 @@ f_parse_seq() {
         ;;
       '(')
         if [ "$WIN" = 1 ]; then
+          if [ "$W" = '=' ] && [ -z "$WF" ]; then
+            # zsh =(...) runs a command and hands over its output as a file
+            deny disguised "zsh =(...) process substitution. $M_DISGUISED"
+          fi
           case $W in
             *=)
               # array assignment: its words may hold substitutions
@@ -1160,17 +1218,21 @@ f_parse_seq() {
               WF="${WF}v"
               continue
               ;;
-            *[*?+@!]* | *']')
-              # extglob or zsh glob qualifier
-              chunk=${P_S%%')'*}
-              P_S=${P_S:${#chunk}}
-              P_S=${P_S:1}
-              W=$W$chunk')'
-              WF="${WF}g"
-              case $chunk in '('*D*) WF="${WF}D" ;; esac
-              continue
-              ;;
           esac
+          after=${P_S:1}
+          after=${after#"${after%%[! $'\t']*}"}
+          if [ "${after:0:1}" != ')' ]; then
+            # a group glued to a word: a zsh glob qualifier list or a bash extglob. zsh runs
+            # code from qualifiers 'e' (eval) and '+' (function), and (#q...) adds more
+            f_take_group
+            case $REPLY in
+              *e* | *+* | *'#'*) deny disguised "a zsh glob qualifier that runs code (e, +, #q). $M_DISGUISED" ;;
+            esac
+            W="$W($REPLY)"
+            WF="${WF}g"
+            case $REPLY in *D*) WF="${WF}D" ;; esac
+            continue
+          fi
           f_word_end
         fi
         after=${P_S:1}
@@ -1309,8 +1371,10 @@ f_parse_seq() {
         case $chunk in *$'\001'*) WF="${WF}v" ;; esac
         W=$W$chunk
         WIN=1
-        # 'case WORD in': the following words are patterns up to ')'
-        if [ "$W" = in ] && [ -z "$WF" ] && [ "${#CW[@]}" = 2 ] && [ "${CW[0]}" = case ]; then
+        # 'case WORD in': the following words are patterns up to ')'. Only a real reserved
+        # word counts: 'case', "case", \case or ca''se is an ordinary command, and the rest of
+        # the line is analysed as usual.
+        if [ "$W" = in ] && [ -z "$WF" ] && [ "${#CW[@]}" = 2 ] && [ "${CW[0]}" = case ] && [ -z "${CF[0]}" ]; then
           case ${P_S:0:1} in
             ' ' | $'\t' | $'\n' | ';' | '')
               W='' WIN=0 WF=''
@@ -1789,11 +1853,13 @@ f_args_paths() {
       f_hot "$cands" "$fl" || continue
       f_path_kinds "$cands" "$fl"
       [ -n "$PK" ] || continue
-      if f_has_kind cred && [ "$meta" = 0 ]; then
-        deny credential-read "$M_CRED"
-      fi
       if [ "$plain" = -1 ]; then
         if f_is_plain_read "$i" "$ln"; then plain=1; else plain=0; fi
+      fi
+      # a write that may also hit a credential file reports the fence file first
+      [ "$plain" = 0 ] && f_has_kind fence && deny fence-file "$M_FENCE"
+      if f_has_kind cred && [ "$meta" = 0 ]; then
+        deny credential-read "$M_CRED"
       fi
       if [ "$plain" = 0 ]; then
         f_has_kind fence && deny fence-file "$M_FENCE"
@@ -3163,7 +3229,12 @@ f_source() {
   fl=${af[j]}
   case $fl in *p*) f_decode_feed; f_disg "source of a process substitution."; return 0 ;; esac
   case $w in
-    /dev/stdin | /dev/fd/* | -) f_decode_feed; f_disg "source of standard input."; return 0 ;;
+    /dev/stdin | /dev/fd/* | -)
+      f_herestring_feed source
+      f_decode_feed
+      f_disg "source of standard input."
+      return 0
+      ;;
     *$'\001'*) f_disg "source of a dynamic path."; return 0 ;;
   esac
   f_scan_file "$w" sh
@@ -3354,9 +3425,21 @@ f_shell() {
   f_stdin_code "$sh" shell
 }
 
+f_herestring_feed() {
+  # a <<< here-string handed to a shell, an interpreter or source as its program: zsh and
+  # bash expand it differently before it runs, so it can't be judged (always denied)
+  local k=0
+  while [ "$k" -lt "${#CRIF[@]}" ]; do
+    case ${CRIF[k]} in *h*) deny disguised "a <<< here-string fed to $1 as code. $M_DISGUISED" ;; esac
+    k=$((k + 1))
+  done
+  return 0
+}
+
 f_stdin_code() {
   # the program text comes from stdin: here-doc/here-string, a redirected file, a pipe
   local prog=$1 lang=$2 k=0 t tf f rest
+  f_herestring_feed "$prog"
   if [ -n "$CHD" ]; then
     if [ "$lang" = shell ]; then f_parse_text "$CHD" 0; else f_code_check "$CHD" "$prog" inline; fi
   fi
@@ -4119,6 +4202,71 @@ f_read_tool() {
   return 0
 }
 
+M_URL="the browser may open only http://localhost[:port], http://127.0.0.1[:port], https:// pages or about:blank. Serve local content from the app instead."
+
+f_url_policy() {
+  # MCP url fields (Playwright navigation and the like)
+  local u=$1 lu auth port
+  u=${u#"${u%%[![:space:]]*}"}
+  u=${u%"${u##*[![:space:]]}"}
+  [ -n "$u" ] || return 0
+  f_lc "$u"
+  lu=$REPLY
+  case $lu in
+    about:blank) return 0 ;;
+    file:*) deny credential-read "the browser may not open local files (file: URLs). $M_URL" ;;
+    https://*)
+      auth=${lu#https://}
+      auth=${auth%%[/?#\\]*}
+      [ -n "$auth" ] || deny disguised "$M_URL"
+      return 0
+      ;;
+    http://*)
+      auth=${lu#http://}
+      auth=${auth%%[/?#\\]*}
+      case $auth in
+        localhost | 127.0.0.1) return 0 ;;
+        localhost:* | 127.0.0.1:*)
+          port=${auth#*:}
+          case $port in '' | *[!0-9]*) ;; *) return 0 ;; esac
+          ;;
+      esac
+      deny disguised "$M_URL"
+      ;;
+  esac
+  deny disguised "$M_URL"
+}
+
+f_mcp_tool() {
+  # MCP tools: url fields follow the browser policy; file-name fields (screenshots, uploads)
+  # must not name credentials or fence paths (.team/evidence/ is the place for evidence)
+  local f rest
+  [ -n "$T_URL" ] && f_url_policy "$T_URL"
+  rest=$T_MCPF
+  while [ -n "$rest" ]; do
+    f=${rest%%$'\n'*}
+    if [ "$f" = "$rest" ]; then rest=''; else rest=${rest:${#f}+1}; fi
+    [ -n "$f" ] || continue
+    case $f in
+      [Ff][Ii][Ll][Ee]://*) f=${f#*://} ;;
+    esac
+    # shellcheck disable=SC2088 # a literal ~ pattern on purpose
+    case $f in '~' | '~/'*) f=$F_HOME${f#\~} ;; esac
+    f_resolve "$f" "${T_CWD:-/}"
+    f_kind_literal "$REPLY"
+    case $FK in
+      cred) deny credential-read "$M_CRED" ;;
+      fence) deny fence-file "$M_FENCE" ;;
+      workflow) deny workflow-edit "$M_WORKFLOW" ;;
+      sshcfg) deny ssh-form "$M_SSH_FORM" ;;
+      gitcfg) deny git-config "$M_GIT_CONFIG" ;;
+      curlcfg) deny curl-github-write "$M_CURL" ;;
+      shellrc) deny disguised "$M_RC" ;;
+    esac
+  done
+  return 0
+}
+
 # ============================================================ main
 
 fence_start_watchdog
@@ -4140,6 +4288,8 @@ FENCE_IN=$(jq -rn '
       "T_CWD=" + (.cwd // "" | s | @sh),
       "T_AGENT=" + (.agent_type // "" | s | @sh),
       "T_AGENTID=" + (.agent_id // "" | tostring | @sh),
+      "T_URL=" + ($ti.url // "" | if type == "string" then . else "" end | @sh),
+      "T_MCPF=" + ([$ti.path, $ti.filename, $ti.file, ($ti.paths // [] | if type == "array" then .[] else . end), ($ti.files // [] | if type == "array" then .[] else . end)] | map(select(type == "string" and . != "")) | join("\n") | @sh),
       "T_NUL=" + (if ([$ti[]? | strings | test("\u0000")] | any) then "1" else "0" end)
     ] | join("\n")
 ' 2>/dev/null)
@@ -4165,6 +4315,7 @@ else
   case $T_TOOL in
     Write | Edit | MultiEdit | Read | Grep | Glob | LS) FENCE_TEXT=${T_FILE:-${T_PATH:-$T_TOOL}} ;;
     NotebookEdit | NotebookRead) FENCE_TEXT=${T_NB:-${T_FILE:-$T_TOOL}} ;;
+    mcp__*) FENCE_TEXT="$T_TOOL $T_URL ${T_MCPF:0:2000}" ;;
     *) FENCE_TEXT=$T_TOOL ;;
   esac
 fi
@@ -4203,6 +4354,8 @@ case $T_TOOL in
     fi
     ;;
 esac
+
+case $T_TOOL in mcp__*) f_mcp_tool ;; esac
 
 if [ "$T_HASCMD" = 1 ]; then
   f_command_tool

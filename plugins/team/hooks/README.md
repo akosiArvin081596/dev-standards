@@ -109,6 +109,17 @@ Examples are Bash commands from the main session unless noted. `vps-test`, `192.
   name is visible.
 - A dynamic push destination (`git push origin "$B"`) or an unknown repo is `push-main`
   ("write it plainly").
+- Reserved words count only when unquoted and unescaped in command position: `\case`,
+  `'case'` or `ca''se` is an ordinary command, and the rest of the line is analysed.
+- zsh (the owner's shell runs the Bash tool) constructs that build code are `disguised`:
+  glob qualifiers with `e`, `+` or `#q` (`*(e:…:)`, `*(+fn)`), `${(…)…}` flags, `${~…}`,
+  `${=…}`, `$=name`, `$~name`, `=(…)`, and `<<<` here-strings fed to a shell, an interpreter or
+  `source`. Harmless qualifiers (`(.)`, `(/)`, `(N)`, `(om[1,5])`) pass; `(D)` widens a glob to
+  dot files.
+- MCP tools: a `url` field may be only `http://localhost[:port]`, `http://127.0.0.1[:port]`,
+  `https://…` or `about:blank` (`file:` is `credential-read`, anything else `disguised`).
+  `path`/`filename`/`file`/`paths`/`files` fields must not name credentials or fence files
+  (screenshots go to `.team/evidence/`).
 
 ## Known limits
 Fences work only inside Claude Code. The fence can't see what a command does internally:
