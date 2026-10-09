@@ -146,9 +146,9 @@ Every command: `#!/usr/bin/env bash`, `set -euo pipefail`, `--help` (exit 0), re
 |---|---|---|
 | `team-gh` | `team-gh <gh args…>` | runs `gh` as the project's account (`GH_TOKEN="$(gh auth token -u <login>)"`); reads pass; writes only: `pr create`, `pr edit` (title/body/allowed labels), `pr comment`, `pr review --comment`, `pr merge --auto --squash [--delete-branch]`, `issue create`, `issue comment`, `issue edit --add-label <allowed>`; `pr edit <n> --add-label owner-approved` only in that exact form and always as the OWNER account. Refuses release PRs (checks online), `api` writes, settings/secrets/rulesets/workflows/releases (exit 4). With an agent line in accounts.conf, acts as the agent login (except the owner-approved label). |
 | `team-post-check` | `team-post-check <sha> <context> <state> <description> [--target-url URL]` | context ∈ `ai-review ai-security ai-qa`; state ∈ `pending success failure error`; sha = 40 hex; refuses release PRs (4) |
-| `team-bootstrap-repo` | `team-bootstrap-repo <owner/repo> [--profile project|standards|template] [--create [--visibility public|private]] [--apply]` | `--create` generates the repo from the template first; then §2–3, rulesets, settings, environments, variables, secrets, agent invite; plan by default |
+| `team-bootstrap-repo` | `team-bootstrap-repo <owner/repo> [--profile project|standards|template] [--create [--visibility public|private]] [--apply]` | `--create` generates the repo from the template first; then §2–3, repo variable `OWNER_LOGIN` (always), rulesets, settings, environments, variables, secrets, agent invite; plan by default |
 | `team-verify-repo` | `team-verify-repo <owner/repo> [--profile …]` | pass/fail table; exit 1 on any fail; warns on disabled scheduled workflows |
-| `team-new-worktree` | `team-new-worktree <issue> [--type T] [--slug S] [--no-setup]` | branch from `origin/main --no-track`; port under `locks/ports.lock`; env file; DB; `.team/evidence` → symlink to the main checkout's `.team/evidence`; `make setup`; snapshot or seed; prints `key=value` summary (`path branch port db app_url`) |
+| `team-new-worktree` | `team-new-worktree <issue|pr> [--type T] [--slug S] [--no-setup]` (with both `--type` and `--slug` no issue lookup is made) | branch from `origin/main --no-track`; port under `locks/ports.lock`; env file; DB; `.team/evidence` → symlink to the main checkout's `.team/evidence`; `make setup`; snapshot or seed; prints `key=value` summary (`path branch port db app_url`) |
 | `team-remove-worktree` | `team-remove-worktree <path|issue> [--force]` | stops the app, drops only the registry-recorded DB, frees the port, removes the worktree (keeps `.team/evidence` in the main checkout) |
 | `team-conflict-check` | `team-conflict-check <issue>…` | reads each issue's "Likely files"; prints groups that must run one after another |
 | `team-hooks` | `team-hooks [--check]` | the only way to set `core.hooksPath`; chains to an existing path |
@@ -206,8 +206,8 @@ Installed root-owned to `/usr/local/lib/team/`. Scripts: `discover`, `provision`
 - Config read: `defaults.conf` (`VPS_ALIAS VPS_IP VPS_HOSTNAME DOMAIN VPS_FORBIDDEN_ALIASES BACKGROUND_PERMISSION_MODE`), `accounts.conf` (GitHub SSH aliases → allowlist). Missing config → every ssh-family command except to GitHub aliases is denied.
 - Standards repo = a repo whose `origin` URL path ends `/dev-standards` or `/dev-standards.git`; there, workflows and `managed/**`, `tests/**` copies are ordinary files.
 - Trusted commands (not scanned): the `team-*` commands in the plugin's own `bin/`.
-- Agent Bash allowlists: all review agents → read-only `git` and `gh`, plain readers, `team-post-check` (own context only); `team:team-reviewer`, `team:team-security` → + `team-gh pr comment`, `team-gh pr review --comment`; `team:team-qa` → + `team-app`, `make e2e`; `team:team-health` → + `team-gh issue create`. Review agents get no Write/Edit/NotebookEdit.
-- Nested Claude allowed form only: `[cd <dir> &&] claude --bg [--name <n>] [--permission-mode <BACKGROUND_PERMISSION_MODE>] <prompt>`, plus read-only management `claude agents --json [--all]`, `claude logs <id>`, `claude stop <id>`, `claude rm <id>`, `claude --version`, `claude plugin list|validate …`.
+- Agent Bash allowlists: all review agents → read-only `git` and `gh`, plain readers, `team-post-check` (own context only); `team:team-reviewer`, `team:team-security` → + `team-gh pr comment`, `team-gh pr review --comment`; `team:team-qa` → + `team-app`, `make e2e` (also as `cd "<dir>" && …`), `ls`, `curl` GET to localhost; `team:team-health` → + `team-gh issue create|list`, `make audit`. Review agents get no Write/Edit/NotebookEdit.
+- Nested Claude allowed form only: `[cd <dir> &&] claude --bg [--name <n>] [--permission-mode <BACKGROUND_PERMISSION_MODE>] <prompt>` (writers use the prompt `"/team:ship <n> background-writer"`; ship's writer mode runs fix-bug or build-feature first), plus read-only management `claude agents --json [--all]`, `claude logs <id>`, `claude stop <id>`, `claude rm <id>`, `claude --version`, `claude plugin list|validate …`.
 
 ## 14. Reusable workflows (`.github/workflows/`, called `@v1`)
 
@@ -243,6 +243,8 @@ Lessons: <none, or one line each>
 Questions for you: <none or list>
 PR: <link>
 ```
+
+The PR body ends with `Fixes #<issue>` (or `Refs #<issue>` for a logging-only `needs-info` change).
 
 ## 16. Mac bash rules (hooks, `bin/`, `lib/`, tests)
 
