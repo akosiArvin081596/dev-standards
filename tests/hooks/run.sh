@@ -107,11 +107,15 @@ build_json() {
     printf '%s' "$input"
     return 0
   fi
-  jq -cn --arg tool "$tool" --arg agent "$agent" --arg cwd "$cwd" --arg in "$input" '
+  # MCP tools are written as <tool>@<field>, e.g. mcp__playwright__browser_navigate@url
+  local field=""
+  case "$tool" in *@*) field=${tool#*@}; tool=${tool%%@*} ;; esac
+  jq -cn --arg tool "$tool" --arg agent "$agent" --arg cwd "$cwd" --arg in "$input" --arg field "$field" '
     {session_id:"t", hook_event_name:"PreToolUse", permission_mode:"bypassPermissions",
      cwd:$cwd, tool_name:$tool,
      tool_input:(
-       if   $tool=="Bash"         then {command:$in, description:"fence test"}
+       if   $field != ""          then {($field): $in}
+       elif $tool=="Bash"         then {command:$in, description:"fence test"}
        elif $tool=="Monitor"      then {command:$in, description:"fence test"}
        elif $tool=="Write"        then {file_path:$in, content:"x\n"}
        elif $tool=="Edit"         then {file_path:$in, old_string:"a", new_string:"b"}

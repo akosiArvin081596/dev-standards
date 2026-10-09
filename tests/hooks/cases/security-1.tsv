@@ -1,0 +1,105 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# Security fixes round 1 (briefs/security-fixes-1.md): C1, C2, M1, H1. Written from the brief and fence-rules.md.
+#
+# --- C1: quoted / escaped / split reserved words are ordinary command words ---
+deny	push-main|disguised	main	Bash	feat-repo	'case' x in y; git push origin main	single-quoted case, push after it
+deny	push-main|disguised	main	Bash	feat-repo	"case" x in y; git push origin main	double-quoted case
+deny	push-main|disguised	main	Bash	feat-repo	\case x in y; git push origin main	backslash-escaped case
+deny	push-main|disguised	main	Bash	feat-repo	ca''se x in y; git push origin main	split case
+deny	push-main|disguised	main	Bash	feat-repo	'esac'; git push origin main	quoted esac
+deny	push-main|disguised	main	Bash	feat-repo	'if' true; git push origin main	quoted if
+deny	push-main|disguised	main	Bash	feat-repo	"for" x in y; git push origin main	quoted for
+deny	push-main|disguised	main	Bash	feat-repo	\while x; git push origin main	escaped while
+deny	push-main|disguised	main	Bash	feat-repo	'function' f; git push origin main	quoted function
+deny	push-main|disguised	main	Bash	feat-repo	\{ x; git push origin main	escaped {
+deny	push-main|disguised	main	Bash	feat-repo	'[[' x; git push origin main	quoted [[
+deny	merge-admin|disguised	main	Bash	project	"case" a in b; gh pr merge 5 --admin	quoted case before --admin merge
+deny	nested-claude|disguised	main	Bash	project	'case' a in b; claude -p x	quoted case before nested claude
+deny	fence-file|disguised	main	Bash	project	\case a in b; echo x > .claude/settings.json	escaped case before a fence write
+#
+# --- C1: real case ... esac with forbidden commands in the arms ---
+deny	push-main	main	Bash	feat-repo	case x in x) git push origin main;; esac	push in an arm
+deny	merge-admin	main	Bash	project	case "$1" in *) gh pr merge 5 --admin;; esac	--admin merge in a catch-all arm
+deny	tag-write	main	Bash	feat-repo	case a in a) echo ok;; b) git tag v1;; esac	forbidden command in the second arm
+deny	force-push	main	Bash	feat-repo	case a in (a) git push --force;; esac	(pattern) form
+deny	push-main	main	Bash	feat-repo	case a in{NL}  a)  git push origin main ;;{NL}esac	multi-line case
+deny	push-main	main	Bash	feat-repo	case a in a) echo x;; esac; git push origin main	push after esac
+deny	push-main	main	Bash	feat-repo	case a in a|b) true && git push origin HEAD:main;; esac	alternation pattern, chained push
+deny	fence-file	main	Bash	project	case a in a) echo x > .claude/settings.json;; esac	fence write in an arm
+deny	ssh-dest	main	Bash	project	case a in a) ssh 192.0.2.10;; esac	VPS by IP in an arm
+deny	push-main	main	Bash	feat-repo	case a in a) case b in b) git push origin main;; esac;; esac	nested case
+allow	disguised	main	Bash	project	case "$x" in a) echo a;; *) echo other;; esac	harmless real case
+allow	push-main	main	Bash	feat-repo	case x in x) git status;; esac	read-only git in an arm
+allow	push-main	main	Bash	feat-repo	case main in main) echo main;; esac	the word main only as data
+allow	push-main	main	Bash	feat-repo	case a in a) git push -u origin HEAD;; esac	feature push in an arm
+#
+# --- C2: zsh semantics that run code (the Bash tool runs /bin/zsh) ---
+deny	disguised	main	Bash	project	ls *(e:'true':)	glob qualifier e
+deny	disguised	main	Bash	project	ls *(.e:'true':)	qualifier list containing e
+deny	disguised	main	Bash	project	ls *(+myfunc)	glob qualifier +func
+deny	disguised	main	Bash	project	ls src/*(+f)	qualifier + after a path glob
+deny	disguised	main	Bash	feat-repo	ls *(e:'git push origin main':)	qualifier e with a push inside
+deny	disguised	main	Bash	project	echo ${(e)x}	${(e)...} evaluate flag
+deny	disguised	main	Bash	project	echo ${(e):-'$(true)'}	${(e)...} with a default
+deny	disguised	main	Bash	project	echo ${(f)x}	any ${(...)name} flags form
+deny	disguised	main	Bash	project	ls ${~pat}	${~...} glob substitution
+deny	disguised	main	Bash	feat-repo	x='git push origin main'; $=x	$= word splitting into a command
+deny	disguised	main	Bash	feat-repo	diff =(git log -1) /tmp/x	=(...) process substitution
+deny	disguised	main	Bash	feat-repo	sh <<< 'git push origin main'	here-string fed to sh
+deny	disguised	main	Bash	feat-repo	zsh <<< "git status"	here-string fed to zsh
+deny	disguised	main	Bash	project	python3 <<< 'print(1)'	here-string fed to an interpreter
+allow	disguised	main	Bash	project	ls *(.)	harmless qualifier (.)
+allow	disguised	main	Bash	project	ls -d *(/)	harmless qualifier (/)
+allow	disguised	main	Bash	project	ls *(N)	harmless qualifier (N)
+allow	disguised	main	Bash	project	ls *(D)	harmless qualifier (D)
+allow	disguised	main	Bash	project	ls *(om)	harmless qualifier (om)
+allow	disguised	main	Bash	project	grep x <<< "text"	here-string into a plain reader
+allow	disguised	main	Bash	project	(cd src && ls)	subshell with a space is not a qualifier
+#
+# --- M1: Playwright navigate ---
+allow	disguised	main	mcp__playwright__browser_navigate@url	project	http://localhost:3000/	localhost
+allow	disguised	main	mcp__playwright__browser_navigate@url	project	http://localhost/login	localhost without port
+allow	disguised	main	mcp__playwright__browser_navigate@url	project	http://127.0.0.1:8080/x	127.0.0.1
+allow	disguised	main	mcp__playwright__browser_navigate@url	project	https://example.test/	https
+allow	disguised	main	mcp__playwright__browser_navigate@url	project	about:blank	about:blank
+allow	disguised	team:team-qa	mcp__playwright__browser_navigate@url	project	http://localhost:3000/health	qa agent to localhost
+deny	credential-read	main	mcp__playwright__browser_navigate@url	project	file:///etc/hosts	file:
+deny	credential-read	main	mcp__playwright__browser_navigate@url	project	file://{HOME}/.ssh/id_ed25519	file: to a private key
+deny	credential-read	team:team-qa	mcp__playwright__browser_navigate@url	project	file://{PROJ}/.env.production	qa agent, file: to a production env file
+deny	credential-read|disguised	main	mcp__playwright__browser_navigate@url	project	FILE:///etc/hosts	upper-case scheme
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	data:text/html,hello	data:
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	javascript:void(0)	javascript:
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	chrome://settings	chrome:
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	about:config	about: other than blank
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	view-source:https://example.test/	view-source:
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	http://example.test/	plain http to a non-local host
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	http://localhost.evil.example/	look-alike localhost
+deny	disguised	main	mcp__playwright__browser_navigate@url	project	ftp://example.test/x	other scheme
+deny	disguised	main	mcp__playwright__browser_tabs@url	project	javascript:void(0)	any playwright tool with a url field
+#
+# --- M1: MCP file fields ---
+allow	fence-file	main	mcp__playwright__browser_take_screenshot@filename	project	.team/evidence/login.png	screenshot to the evidence folder
+allow	fence-file	main	mcp__playwright__browser_take_screenshot@filename	project	{PROJ}/.team/evidence/home.png	absolute evidence path
+allow	fence-file	team:team-qa	mcp__playwright__browser_take_screenshot@filename	project	login.png	plain file name
+deny	fence-file	main	mcp__playwright__browser_take_screenshot@filename	project	{PROJ}/.claude/settings.json	screenshot onto a fence file
+deny	fence-file	main	mcp__playwright__browser_take_screenshot@filename	project	{HOME}/.claude/x.png	screenshot under ~/.claude
+deny	credential-read	main	mcp__playwright__browser_take_screenshot@filename	project	{HOME}/.ssh/id_ed25519	file name is a private key
+deny	credential-read	main	mcp__other__read_file@path	project	{HOME}/.ssh/id_ed25519	other MCP tool, path names a private key
+deny	credential-read	main	mcp__other__read_file@file	project	{PROJ}/.env.production	other MCP tool, file names a production env file
+deny	fence-file	main	mcp__other__write_file@path	project	{PROJ}/.mcp.json	other MCP tool, path names .mcp.json
+allow	credential-read	main	mcp__other__read_file@path	project	{PROJ}/src/app.txt	other MCP tool, ordinary path
+#
+# --- H1: gh api field-flag forms through the hook ---
+deny	gh-api-write	main	Bash	project	gh api -F title=x repos/o/r/issues	-F before the endpoint
+deny	gh-api-write	main	Bash	project	gh api -f title=x repos/o/r/issues	-f before the endpoint
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/issues --field=title=x	--field=
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/issues --raw-field=title=x	--raw-field=
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/issues --input -	--input from stdin
+deny	gh-api-write	main	Bash	project	gh api --input=b.json repos/o/r/labels	--input=
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/issues -F body=@/tmp/b.md	-F with a file value
+deny	gh-api-write|owner-approved	main	Bash	project	gh api repos/o/r/issues/5/labels -f labels[]=bug	labels endpoint with -f
+deny	gh-api-write|owner-approved	main	Bash	project	gh api -X DELETE repos/o/r/issues/5/labels/owner-approved	delete a label via api
+deny	gh-api-write	main	Bash	project	team-gh api repos/o/r/labels -f name=x	team-gh api with -f
+deny	gh-api-write	main	Bash	project	GH_TOKEN=x gh api repos/o/r/issues --field title=x	GH_TOKEN form with --field
+allow	gh-api-write	main	Bash	project	gh api repos/o/r/issues/5/labels	read labels via api
+allow	gh-api-write	main	Bash	project	gh api repos/o/r/labels --jq '.[].name'	read labels with --jq

@@ -43,7 +43,7 @@ Tab-separated. Lines starting with `#` are comments.
 | expect | `allow`, `deny`, `error` (exit-2 error-deny), `block` (deny or error-deny, both fail closed) |
 | rule | rule id, or alternatives `a\|b` where the rules make more than one id correct; `-` for allow |
 | agent | `main` (no `agent_id`), or an `agent_type` such as `team:team-qa`, `general-purpose` (adds `agent_id`) |
-| tool | `Bash`, `Monitor`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Read`, `Glob`, `Grep`, `Agent`, `WebFetch`, or `RAW` (column 6 is fed to stdin as-is) |
+| tool | `Bash`, `Monitor`, `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Read`, `Glob`, `Grep`, `Agent`, `WebFetch`, `RAW` (column 6 is fed to stdin as-is), or an MCP tool as `<tool>@<field>` (e.g. `mcp__playwright__browser_navigate@url`: column 6 becomes that one input field) |
 | cwd | fixture name: `main-repo` (on `main`, tag `v9.9.9`), `feat-repo` (on `feat/12-login`), `wt-feat` (linked worktree of main-repo on `feat/30-wt`), `standards-repo`, `std-https`, `std-fork`, `project`, `plain`, or an absolute path |
 | command/path | Bash command, file path, Agent prompt, or raw stdin |
 | note | shown in the output |
@@ -55,6 +55,9 @@ Placeholders: `{MAIN} {FEAT} {STD} {PROJ} {PLAIN} {FX}` (fixture paths), `{HOME}
 
 The fixtures (repos, scripts, Makefiles, untrusted `team-gh` look-alikes, fake keys and env files)
 are built by `fixtures.sh` and listed in the header of `cases/scan-messages.tsv`.
+
+## Bash 5 safety
+Every placeholder replacement in `run.sh` is quoted (`${s//"{X}"/"$X"}`). Under bash 5.2 `patsub_replacement`, an unquoted `&` in a replacement expands to the match.
 
 ## Adding a case
 Every rule id needs at least one allowed and one denied case. Pick the table for the rule and
