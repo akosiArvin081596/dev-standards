@@ -1,40 +1,51 @@
 #!/usr/bin/env bash
 # tests/server/run.sh — test the server scripts (plugins/team/server/).
 # 1. On this machine: shellcheck + bash -n on every server script, the one-open-item rule, and a scan
-#    for infrastructure details. 2. In a throwaway Ubuntu 24.04 container: tests/server/in-container.sh.
+#    for infrastructure details. 2. In a throwaway container per Ubuntu LTS base (24.04 and 26.04 by
+#    default): tests/server/in-container.sh.
 # Run on the Mac with: /bin/bash tests/server/run.sh   (bash 3.2 + BSD tools; never touches a real server)
 set -euo pipefail
 export LC_ALL=C   # bash 3.2 in some locales (e.g. en_PH.UTF-8) lets [a-z] match capitals
 
 usage() {
   cat <<'EOF'
-Usage: tests/server/run.sh [--keep-image] [--static-only]
+Usage: tests/server/run.sh [--base ubuntu:24.04|ubuntu:26.04]... [--keep-image] [--static-only]
 
-  --keep-image   keep the team-srvtest-img image afterwards (faster re-runs); default removes it
+  --base IMAGE   Ubuntu base to test on (repeatable). Default: ubuntu:24.04, then ubuntu:26.04
+                 (26.04 brings sudo-rs, Rust coreutils, PostgreSQL 18, MariaDB 11.8, PHP 8.5).
+  --keep-image   keep the team-srvtest-img-<version> images afterwards (faster re-runs)
   --static-only  only shellcheck / bash -n / open-item / infrastructure scan; no Docker
 
-Builds image team-srvtest-img from tests/server/Dockerfile, runs container team-srvtest-run-<pid>,
-copies the server scripts and tests in, runs in-container.sh, and removes the container (and the
-image unless --keep-image) on exit, even on failure. Only team-srvtest-* names are ever touched.
+For each base: builds team-srvtest-img-<version> from tests/server/Dockerfile, runs container
+team-srvtest-run-<pid>-<version>, copies the server scripts, the tests and tests/lib (net-guard) in,
+runs in-container.sh, and removes the container (and the image unless --keep-image) on exit, even
+on failure. Only team-srvtest-* names are ever touched; Colima is never started or stopped.
 Exit codes: 0 all passed, 1 a check failed, 2 usage, 5 Docker/shellcheck missing.
 EOF
 }
 
-KEEP_IMAGE=0 STATIC_ONLY=0
-for a in "$@"; do
-  case $a in
+KEEP_IMAGE=0 STATIC_ONLY=0 BASES=""
+while [ $# -gt 0 ]; do
+  case $1 in
     -h|--help) usage; exit 0 ;;
-    --keep-image) KEEP_IMAGE=1 ;;
-    --static-only) STATIC_ONLY=1 ;;
-    *) printf 'run.sh: unknown argument %s (see --help)\n' "$a" >&2; exit 2 ;;
+    --keep-image) KEEP_IMAGE=1; shift ;;
+    --static-only) STATIC_ONLY=1; shift ;;
+    --base)
+      [ $# -ge 2 ] || { echo "run.sh: --base needs an image (see --help)" >&2; exit 2; }
+      case $2 in
+        ubuntu:[0-9][0-9].[0-9][0-9]) BASES="$BASES $2" ;;
+        *) printf 'run.sh: --base must be ubuntu:YY.MM (got %s)\n' "$2" >&2; exit 2 ;;
+      esac
+      shift 2 ;;
+    *) printf 'run.sh: unknown argument %s (see --help)\n' "$1" >&2; exit 2 ;;
   esac
 done
+[ -n "$BASES" ] || BASES="ubuntu:24.04 ubuntu:26.04"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 SERVER=$ROOT/plugins/team/server
-IMG=team-srvtest-img
-CTR=team-srvtest-run-$$
+CREATED_CTRS="" CREATED_IMGS=""
 START=$(date +%s)
 PASS=0 FAIL=0
 
@@ -58,13 +69,14 @@ printf '=== static checks (host)\n'
 SCRIPTS="discover provision deploy-receive snapshot serve-snapshot refresh-staging backup flag lib.sh"
 for f in $SCRIPTS; do
   [ -f "$SERVER/$f" ] || { fail "server script present: $f"; continue; }
-  if (cd "$SERVER" && shellcheck -x -s bash "$f" >/dev/null 2>&1); then pass "shellcheck $f"
-  else fail "shellcheck $f"; (cd "$SERVER" && shellcheck -x -s bash "$f" 2>&1 | head -n 20 | sed 's/^/      | /'); fi
+  # from the repo root, as the self-test runs it
+  if (cd "$ROOT" && shellcheck -x "plugins/team/server/$f" >/dev/null 2>&1); then pass "shellcheck $f (from the repo root)"
+  else fail "shellcheck $f (from the repo root)"; (cd "$ROOT" && shellcheck -x "plugins/team/server/$f" 2>&1 | head -n 20 | sed 's/^/      | /'); fi
   if /bin/bash -n "$SERVER/$f" 2>/dev/null; then pass "bash -n $f"; else fail "bash -n $f"; fi
 done
 for f in run.sh in-container.sh helpers.sh; do
-  if (cd "$HERE" && shellcheck -x -s bash "$f" >/dev/null 2>&1); then pass "shellcheck tests/server/$f"
-  else fail "shellcheck tests/server/$f"; (cd "$HERE" && shellcheck -x -s bash "$f" 2>&1 | head -n 20 | sed 's/^/      | /'); fi
+  if (cd "$ROOT" && shellcheck -x "tests/server/$f" >/dev/null 2>&1); then pass "shellcheck tests/server/$f (from the repo root)"
+  else fail "shellcheck tests/server/$f (from the repo root)"; (cd "$ROOT" && shellcheck -x "tests/server/$f" 2>&1 | head -n 20 | sed 's/^/      | /'); fi
 done
 for f in $SCRIPTS; do
   [ "$f" = lib.sh ] && continue
@@ -104,26 +116,45 @@ docker info >/dev/null 2>&1 || { echo "run.sh: Docker is not running (start Coli
 cleanup() {
   rc=$?
   rm -rf "${GUARD_TMP:?}"
-  docker rm -f "$CTR" >/dev/null 2>&1 || true
-  if [ "$KEEP_IMAGE" = 0 ]; then docker rmi "$IMG" >/dev/null 2>&1 || true; fi
+  for c in $CREATED_CTRS; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  if [ "$KEEP_IMAGE" = 0 ]; then for i in $CREATED_IMGS; do docker rmi "$i" >/dev/null 2>&1 || true; done; fi
   exit "$rc"
 }
 trap cleanup EXIT INT TERM
 
-printf '\n=== container tests (%s)\n' "$CTR"
-printf 'building %s …\n' "$IMG"
-if ! docker build -q -t "$IMG" "$HERE" >/dev/null; then fail "docker build $IMG"; exit 1; fi
-docker run -d --name "$CTR" "$IMG" sleep infinity >/dev/null
-docker exec "$CTR" mkdir -p /src
-docker cp "$SERVER" "$CTR:/src/server" >/dev/null
-docker cp "$HERE" "$CTR:/src/tests" >/dev/null
-set +e
-docker exec "$CTR" bash /src/tests/in-container.sh
-crc=$?
-set -e
+RESULTS="" ALL_OK=1
+for base in $BASES; do
+  ver=$(printf '%s' "${base#ubuntu:}" | tr -d '.')
+  IMG=team-srvtest-img-$ver
+  CTR=team-srvtest-run-$$-$ver
+  t0=$(date +%s)
+  printf '\n=== container tests on %s (%s)\n' "$base" "$CTR"
+  printf 'building %s …\n' "$IMG"
+  CREATED_IMGS="$CREATED_IMGS $IMG"
+  if ! docker build -q --build-arg "BASE=$base" -t "$IMG" "$HERE" >/dev/null; then
+    fail "docker build $IMG"; ALL_OK=0; RESULTS="$RESULTS
+$base: image build FAILED"; continue
+  fi
+  CREATED_CTRS="$CREATED_CTRS $CTR"
+  docker run -d --name "$CTR" "$IMG" sleep infinity >/dev/null
+  docker exec "$CTR" mkdir -p /src
+  docker cp "$SERVER" "$CTR:/src/server" >/dev/null
+  docker cp "$HERE" "$CTR:/src/tests" >/dev/null
+  docker cp "$ROOT/tests/lib" "$CTR:/src/tests-lib" >/dev/null
+  set +e
+  docker exec "$CTR" bash /src/tests/in-container.sh | tee "$GUARD_TMP/suite-$ver.log"
+  crc=${PIPESTATUS[0]}
+  set -e
+  docker rm -f "$CTR" >/dev/null 2>&1 || true
+  line=$(grep '^container suite:' "$GUARD_TMP/suite-$ver.log" | tail -n 1)
+  if [ "$crc" = 0 ]; then RESULTS="$RESULTS
+$base: PASSED · ${line#container suite: } · $(( $(date +%s) - t0 ))s with the image build"
+  else ALL_OK=0; RESULTS="$RESULTS
+$base: FAILED (exit $crc) · ${line#container suite: }"; fi
+done
 
 printf '\n=== summary\n'
 printf 'host static checks: %d passed, %d failed\n' "$PASS" "$FAIL"
-if [ "$crc" = 0 ]; then printf 'container suite: passed\n'; else printf 'container suite: FAILED (exit %s)\n' "$crc"; fi
+printf '%s\n' "$RESULTS" | sed '/^$/d'
 printf 'runtime: %ss\n' "$(( $(date +%s) - START ))"
-[ "$FAIL" = 0 ] && [ "$crc" = 0 ]
+[ "$FAIL" = 0 ] && [ "$ALL_OK" = 1 ]

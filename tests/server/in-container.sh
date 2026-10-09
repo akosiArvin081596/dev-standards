@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # The server-script test suite. Runs INSIDE a throwaway team-srvtest-* container (Ubuntu 24.04, root),
 # started by tests/server/run.sh. Prints PASS/FAIL per check; exits 1 if anything failed.
 # Never run this on a real server: it creates users, databases and nginx sites.
@@ -20,12 +21,26 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/helpers.sh"
 started=$(date +%s)
 [[ -f /.dockerenv || ${TEAM_SRVTEST_FORCE:-} == 1 ]] || { echo "refusing: this suite only runs inside a test container" >&2; exit 4; }
+# Network guard (tests/lib/net-guard.sh, copied in by run.sh): fake ssh/scp/sftp/rsync first on PATH,
+# logging and refusing, and a fake TEAM_CONFIG_DIR. Nothing here may reach a server.
+if [[ -r /src/tests-lib/net-guard.sh ]]; then
+  # shellcheck source=../lib/net-guard.sh
+  . /src/tests-lib/net-guard.sh
+  mkdir -p "$T/fake-team-config"
+  export TEAM_CONFIG_DIR=$T/fake-team-config
+  net_guard_install "$T/net-guard"
+  if net_guard_assert; then pass "net-guard: fake ssh/scp/sftp/rsync first on PATH, refusing and logging"
+  else echo "net-guard is not in place; refusing to run any test" >&2; exit 1; fi
+else
+  echo "net-guard missing (run this suite through tests/server/run.sh)" >&2; exit 1
+fi
+printf 'base: %s · sudo: %s · php %s · %s\n' "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')" "$(sudo --version 2>/dev/null | head -n 1)" "$PHPV" "$(date --version | head -n 1)"
 ubuntu_before=$(getent passwd ubuntu || true)
 tz_before=$(readlink /etc/localtime || true)
 
 # ============================================================================ 0. services
 section "0. services (no systemd here: started with service … start)"
-for s in postgresql mariadb nginx php8.3-fpm; do service "$s" start > /dev/null 2>&1; done
+for s in postgresql mariadb nginx "php$PHPV-fpm"; do service "$s" start > /dev/null 2>&1; done
 check "postgres answers" pgq -d postgres -c 'SELECT 1'
 check "mariadb answers" myq -e 'SELECT 1'
 check "nginx config is valid before the pack touches it" nginx -t
@@ -37,7 +52,12 @@ touch "$T/marker"; sleep 1
 check "discover runs as root" "$SERVER/discover"
 cp "$LOG" "$T/discover.out"
 ok_if "discover reports OS, web servers, databases, runtimes, users, ports, firewall, cron" \
-  'grep -q "^OS: Ubuntu" $T/discover.out && grep -q "^NGINX: " $T/discover.out && grep -q "^POSTGRES: " $T/discover.out && grep -q "^MARIADB: 10" $T/discover.out && grep -q "^PYTHON3: " $T/discover.out && grep -q "^USER: ubuntu" $T/discover.out && grep -q "^LISTEN: " $T/discover.out && grep -q "^UFW: " $T/discover.out && grep -q "^CRON: " $T/discover.out'
+  'grep -q "^OS: Ubuntu" $T/discover.out && grep -q "^NGINX: " $T/discover.out && grep -q "^POSTGRES: " $T/discover.out && grep -q "^MARIADB: [0-9]" $T/discover.out && grep -q "^PYTHON3: " $T/discover.out && grep -q "^USER: ubuntu" $T/discover.out && grep -q "^LISTEN: " $T/discover.out && grep -q "^UFW: " $T/discover.out && grep -q "^CRON: " $T/discover.out'
+if [[ $SUDO_IMPL == sudo-rs ]]; then
+  ok_if "discover names the sudo implementation (sudo-rs) and coreutils" 'grep -q "^SUDO: sudo-rs [0-9]" $T/discover.out && grep -q "^COREUTILS: " $T/discover.out && grep -q "^SUDOERS_CHECK: " $T/discover.out'
+else
+  ok_if "discover names the sudo implementation (classic sudo) and coreutils" 'grep -q "^SUDO: sudo [0-9].*(classic)" $T/discover.out && grep -q "^COREUTILS: " $T/discover.out && grep -q "^SUDOERS_CHECK: " $T/discover.out'
+fi
 check "discover runs as an unprivileged user" runuser -u ubuntu -- "$SERVER/discover"
 changed=$(find /etc /srv /usr/local /var/www /var/lib/team /var/log/team -newer "$T/marker" 2>/dev/null | head -n 5)
 ok_if "discover changed nothing on disk" '[[ -z $changed ]]'
@@ -68,6 +88,7 @@ ok_if "plan changed nothing (no user, no /etc/team, no database, no vhost)" \
 
 for b in pg-s pg-p my-s my-p st-s st-p; do
   expect_rc 0 "provision --apply ($b)" provision_run "$T/b-$b" --apply
+  cp "$LOG" "$T/apply-$b.log"
   ok_if "  … ends with TEAM-RESULT ok ($b)" '[[ $(tail -n 1 $LOG) == "TEAM-RESULT ok" ]]'
 done
 check "nginx -t passes with all six vhosts" nginx -t
@@ -105,12 +126,16 @@ ok_if "units: User=, WorkingDirectory=…/current, EnvironmentFile=…/shared/.e
 check "systemd-analyze verify accepts the generated units and timers" \
   systemd-analyze verify /etc/systemd/system/team-pgapp-staging-web.service /etc/systemd/system/team-pgapp-staging-worker.service /etc/systemd/system/team-myapp-production-queue.service /etc/systemd/system/team-pgapp-snapshot.service /etc/systemd/system/team-pgapp-snapshot.timer /etc/systemd/system/team-myapp-backup-verify.timer
 for f in /etc/sudoers.d/team-*; do check "visudo -cf $(basename "$f")" visudo -cf "$f"; done
-check "visudo -c (whole sudoers) passes" visudo -c
+# The whole configuration (with every drop-in), checked through a 0440 copy of /etc/sudoers: sudo-rs
+# ships it 0644, which its visudo -c reports even though sudo-rs itself accepts it.
+cp /etc/sudoers "$T/sudoers.copy" && chmod 440 "$T/sudoers.copy"
+check "visudo: the whole sudoers configuration, with every pack drop-in, parses ($SUDO_IMPL)" visudo -cf "$T/sudoers.copy"
+check "sudo -l -U lists the exact deploy commands for the production user ($SUDO_IMPL)" sudo_lists pgapp-production "/usr/bin/systemctl reload-or-restart team-pgapp-production-web.service" "/usr/local/lib/team/backup pgapp --pre-deploy"
 ok_if "sudo rule lists only exact commands (production adds backup --pre-deploy; php-fpm adds its reload)" \
-  'grep -q "/usr/local/lib/team/backup pgapp --pre-deploy" /etc/sudoers.d/team-pgapp-production && ! grep -q backup /etc/sudoers.d/team-pgapp-staging && grep -q "reload php8.3-fpm.service" /etc/sudoers.d/team-myapp-staging && ! grep -qE "ALL$|\*" /etc/sudoers.d/team-pgapp-production'
+  'grep -q "/usr/local/lib/team/backup pgapp --pre-deploy" /etc/sudoers.d/team-pgapp-production && ! grep -q backup /etc/sudoers.d/team-pgapp-staging && grep -q "reload php$PHPV-fpm.service" /etc/sudoers.d/team-myapp-staging && ! grep -qE "ALL$|\*" /etc/sudoers.d/team-pgapp-production'
 ok_if "static staging with no services gets no sudo rule" '[[ ! -e /etc/sudoers.d/team-stapp-staging ]]'
 for f in /etc/logrotate.d/team-*; do check "logrotate -d $(basename "$f")" logrotate -d "$f"; done
-ok_if "php-fpm pools run as the env users" 'grep -q "^user = myapp-staging$" /etc/php/8.3/fpm/pool.d/team-myapp-staging.conf && [[ -S /run/php/team-myapp-staging.sock ]]'
+ok_if "php-fpm pools run as the env users" 'grep -q "^user = myapp-staging$" /etc/php/$PHPV/fpm/pool.d/team-myapp-staging.conf && [[ -S /run/php/team-myapp-staging.sock ]]'
 
 # env template changes: new keys are appended, existing values never overwritten
 cp -R "$T/b-pg-s" "$T/b-pg-s2"
@@ -131,10 +156,10 @@ check_not "postgres: production user cannot connect to staging's database" env P
 check_not "postgres: app user cannot create databases" env PGPASSWORD="$PW_PS" psql -X -h 127.0.0.1 -U pgapp_staging -d pgapp_staging -Atc 'CREATE DATABASE team_should_fail'
 ok_if "postgres: app role defaults to timezone UTC" '[[ $(env PGPASSWORD="$PW_PS" psql -X -h 127.0.0.1 -U pgapp_staging -d pgapp_staging -Atc "SHOW timezone") == UTC ]]'
 PW_MS=$(env_get /srv/team/myapp/staging/shared/.env DB_PASSWORD)
-check "mariadb: staging user connects to its own database" env MYSQL_PWD="$PW_MS" mysql -h 127.0.0.1 -u myapp_staging myapp_staging -e 'SELECT 1'
-check_not "mariadb: staging user cannot use production's database" env MYSQL_PWD="$PW_MS" mysql -h 127.0.0.1 -u myapp_staging myapp_production -e 'SELECT 1'
+check "mariadb: staging user connects to its own database" env MYSQL_PWD="$PW_MS" "$MYSQL_BIN" -h 127.0.0.1 -u myapp_staging myapp_staging -e 'SELECT 1'
+check_not "mariadb: staging user cannot use production's database" env MYSQL_PWD="$PW_MS" "$MYSQL_BIN" -h 127.0.0.1 -u myapp_staging myapp_production -e 'SELECT 1'
 myq -e 'CREATE DATABASE myappXstaging' 2>/dev/null
-check_not "mariadb: the grant is escaped (no _ wildcard match on myappXstaging)" env MYSQL_PWD="$PW_MS" mysql -h 127.0.0.1 -u myapp_staging myappXstaging -e 'SELECT 1'
+check_not "mariadb: the grant is escaped (no _ wildcard match on myappXstaging)" env MYSQL_PWD="$PW_MS" "$MYSQL_BIN" -h 127.0.0.1 -u myapp_staging myappXstaging -e 'SELECT 1'
 myq -e 'DROP DATABASE IF EXISTS myappXstaging'
 
 # refusals: never reuse something the pack did not create
@@ -178,23 +203,42 @@ rm -f /usr/local/sbin/nginx
 expect_rc 0 "re-running the good bundle repairs the record" provision_run "$T/b-st-s" --apply
 check "nginx -t passes again" nginx -t
 
-# a sudo rule that fails visudo -c is rolled back (a broken sudoers file could lock out sudo)
+# The sudo rule gate, both ways. A test double stands in for `visudo -c` (whole configuration):
+#   default  checks a 0440 copy of /etc/sudoers (a server whose whole-config check passes)
+#   marker -mailer  fails once the new rule mentions "mailer"   → strict path: roll back
+#   marker -always  fails before and after                     → fallback: visudo -cf + sudo -l
 cat > /usr/local/sbin/visudo <<'EOF'
 #!/bin/bash
-# test double: the whole-sudoers check fails while the marker file exists
-if [[ $# == 1 && $1 == -c && -e /tmp/team-srvtest-fail-visudo ]]; then echo "visudo: simulated parse error" >&2; exit 1; fi
+if [[ $# == 1 && $1 == -c ]]; then
+  [[ -e /tmp/team-srvtest-visudo-always ]] && { echo "visudo: simulated problem elsewhere in sudoers" >&2; exit 1; }
+  if [[ -e /tmp/team-srvtest-visudo-mailer ]] && grep -qs mailer /etc/sudoers.d/team-pgapp-staging; then
+    echo "visudo: simulated parse error" >&2; exit 1
+  fi
+  cp /etc/sudoers /tmp/team-srvtest-sudoers.copy && chmod 440 /tmp/team-srvtest-sudoers.copy
+  exec /usr/sbin/visudo -cf /tmp/team-srvtest-sudoers.copy
+fi
 exec /usr/sbin/visudo "$@"
 EOF
 chmod 755 /usr/local/sbin/visudo
-touch /tmp/team-srvtest-fail-visudo
-su_before=$(sha256sum /etc/sudoers.d/team-pgapp-staging)
 cp -R "$T/b-pg-s" "$T/b-pg-s-extra"
 printf 'mailer|worker|python3 -m http.server 9999\n' >> "$T/b-pg-s-extra/ops/services.conf"
-expect_rc 1 "a sudo rule that fails visudo -c fails provision" provision_run "$T/b-pg-s-extra" --apply
+su_before=$(sha256sum /etc/sudoers.d/team-pgapp-staging)
+touch /tmp/team-srvtest-visudo-mailer
+expect_rc 1 "a sudo rule that breaks visudo -c fails provision" provision_run "$T/b-pg-s-extra" --apply
 ok_if "  … and the previous sudo rule is back, byte for byte" '[[ $(sha256sum /etc/sudoers.d/team-pgapp-staging) == "$su_before" ]] && grep -q "TEAM-RESULT fail sudoers did not validate" $LOG'
-rm -f /usr/local/sbin/visudo /tmp/team-srvtest-fail-visudo
+rm -f /tmp/team-srvtest-visudo-mailer
 expect_rc 0 "re-running the good bundle removes the extra unit again" provision_run "$T/b-pg-s" --apply
 ok_if "  … ([remove] the stale unit)" 'grep -q "^\[remove\] systemd unit team-pgapp-staging-mailer.service" $LOG && [[ ! -e /etc/systemd/system/team-pgapp-staging-mailer.service ]]'
+touch /tmp/team-srvtest-visudo-always
+expect_rc 0 "when visudo -c already fails for other reasons (as on stock sudo-rs), provision still updates the rule" provision_run "$T/b-pg-s-extra" --apply
+ok_if "  … says why, and checks the rule with visudo -cf and sudo -l instead" 'grep -q "^\[warn\] visudo -c already fails before this change" $LOG && [[ $(changes_in $LOG) -ge 2 ]]'
+check "  … sudo really grants the new commands" sudo_lists pgapp-staging "/usr/bin/systemctl reload-or-restart team-pgapp-staging-mailer.service"
+rm -f /usr/local/sbin/visudo /tmp/team-srvtest-visudo-always /tmp/team-srvtest-sudoers.copy
+expect_rc 0 "back to the good bundle" provision_run "$T/b-pg-s" --apply
+ok_if "  … the mailer commands are gone from the rule" '! grep -q mailer /etc/sudoers.d/team-pgapp-staging && [[ ! -e /etc/systemd/system/team-pgapp-staging-mailer.service ]]'
+if [[ $SUDO_IMPL == sudo-rs && $(stat -c %a /etc/sudoers) == 644 ]]; then
+  ok_if "stock sudo-rs (/etc/sudoers 0644): the first apply took the visudo -cf + sudo -l path" 'grep -q "^\[warn\] visudo -c already fails before this change" $T/apply-pg-s.log'
+fi
 
 # a web server the pack can't drive: the config is printed for a manual install, exit 6
 cp /etc/nginx/nginx.conf "$T/nginx.conf.orig"
@@ -270,7 +314,13 @@ ok_if "MIGRATE_CMD ran in the release with the env loaded and TZ=UTC" '[[ $(cat 
 ok_if "health check passes through nginx without a login on staging" '[[ $(curl -s -o /dev/null -w "%{http_code}" -H "Host: pgapp-staging.example.test" http://127.0.0.1/health) == 200 ]]'
 ok_if "staging pages need the login (401), and work with it" \
   '[[ $(curl -s -o /dev/null -w "%{http_code}" -H "Host: pgapp-staging.example.test" http://127.0.0.1/) == 401 && $(curl -s -o /dev/null -w "%{http_code}" -u client:staging-pass-pgapp -H "Host: pgapp-staging.example.test" http://127.0.0.1/) == 200 ]]'
-ok_if "staging responses carry X-Robots-Tag: noindex" 'curl -s -D- -o /dev/null -u client:staging-pass-pgapp -H "Host: pgapp-staging.example.test" http://127.0.0.1/ | grep -qi "^X-Robots-Tag: noindex, nofollow"'
+robots() { curl -s -D- -o /dev/null "$@" | tr -d '\r' | grep -qi '^X-Robots-Tag: noindex, nofollow$'; }
+check "staging: X-Robots-Tag noindex on pages (logged in)" robots -u client:staging-pass-pgapp -H "Host: pgapp-staging.example.test" http://127.0.0.1/
+check "staging: X-Robots-Tag noindex on HEALTH_PATH (no login)" robots -H "Host: pgapp-staging.example.test" http://127.0.0.1/health
+check "staging: X-Robots-Tag noindex on the 401 login challenge" robots -H "Host: pgapp-staging.example.test" http://127.0.0.1/
+check "staging: X-Robots-Tag noindex on a 404" robots -u client:staging-pass-pgapp -H "Host: pgapp-staging.example.test" http://127.0.0.1/no-such-page
+check "staging (TLS): X-Robots-Tag noindex on the HTTP→HTTPS redirect" robots -H "Host: acmeapp-staging.example.test" http://127.0.0.1/
+check "staging (TLS): X-Robots-Tag noindex on HEALTH_PATH over HTTPS" robots -k --resolve acmeapp-staging.example.test:443:127.0.0.1 https://acmeapp-staging.example.test/health
 expect_rc 1 "deploy release B (health check fails) exits 1" deploy_as pgapp-staging pgapp staging "deploy b2b2b2b" "$T/B.tgz"
 ok_if "  … and switched back to A automatically; B removed" '[[ $(readlink $D/current) == $D/releases/a1a1a1a && ! -e $D/releases/b2b2b2b ]] && grep -q "switched back to a1a1a1a" $LOG'
 expect_rc 0 "deploy release C (healthy)" deploy_as pgapp-staging pgapp staging "deploy c3c3c3c" "$T/C.tgz"
@@ -288,6 +338,18 @@ expect_rc 4 "deploy-receive refuses to run as another user (root)" env SSH_ORIGI
 printf 'not a tarball' > "$T/junk.tgz"
 expect_rc 1 "a corrupt tarball fails and changes nothing" deploy_as pgapp-staging pgapp staging "deploy deadbee" "$T/junk.tgz"
 ok_if "  … current unchanged, no release or temp folder left" '[[ $(readlink $D/current) == $D/releases/c3c3c3c && ! -e $D/releases/deadbee && -z $(find $D/releases -maxdepth 1 -name ".incoming-*") ]]'
+# the pipeline sends the full 40-character GITHUB_SHA
+FULL=0123456789abcdef0123456789abcdef01234567
+make_release "$T/rF" "$T/F.tgz" yes pgapp
+expect_rc 0 "deploy with a full 40-character sha (as the pipeline sends GITHUB_SHA)" deploy_as pgapp-staging pgapp staging "deploy $FULL" "$T/F.tgz"
+ok_if "  … the release is keyed by the full sha" '[[ $(readlink $D/current) == $D/releases/$FULL ]] && grep -q " deploy $FULL ok$" $D/deploys.log'
+expect_rc 0 "rollback <7-char sha> back to c3c3c3c" deploy_as pgapp-staging pgapp staging "rollback c3c3c3c"
+expect_rc 0 "rollback <full 40-char sha>" deploy_as pgapp-staging pgapp staging "rollback $FULL"
+ok_if "  … current → the full-sha release" '[[ $(readlink $D/current) == $D/releases/$FULL ]]'
+expect_rc 0 "rollback by a 7-char prefix of the full sha" deploy_as pgapp-staging pgapp staging "rollback ${FULL:0:7}"
+expect_rc 4 "a 41-character sha is refused" deploy_as pgapp-staging pgapp staging "deploy ${FULL}8" "$T/F.tgz"
+expect_rc 0 "back to c3c3c3c" deploy_as pgapp-staging pgapp staging "rollback c3c3c3c"
+
 # hostile tarballs: path traversal, absolute paths, writing through a symlink, symlinked parent dirs
 python3 - "$T/evil.tgz" "$T/sneaky.tgz" "$D" <<'PY'
 import io, sys, tarfile
@@ -318,7 +380,7 @@ ok_if "  … leaves no current link and no release" '[[ ! -e /srv/team/stapp/sta
 
 # production: pre-deploy backup through the narrow sudo rule, then the release that snapshot reads
 { echo 'SET ROLE pgapp_production;'; cat "$FIX/seed-postgres.sql"; } | pg -d pgapp_production > /dev/null
-mysql myapp_production < "$FIX/seed-mariadb.sql"
+my myapp_production < "$FIX/seed-mariadb.sql"
 make_release "$T/rP" "$T/P.tgz" yes pgapp
 expect_rc 0 "production deploy (postgres)" deploy_as pgapp-production pgapp production "deploy feedf00d" "$T/P.tgz"
 ok_if "  … made a pre-deploy backup first (sudo -n backup pgapp --pre-deploy)" \
@@ -337,9 +399,12 @@ EOF
 cp -R "$FIX/myapp/ops" "$T/rM/ops"
 tar -czf "$T/M.tgz" -C "$T/rM" .
 expect_rc 0 "php-fpm staging deploy (health through nginx + php-fpm, no login)" deploy_as myapp-staging myapp staging "deploy abcdef12" "$T/M.tgz"
+check "php-fpm staging: X-Robots-Tag noindex on HEALTH_PATH (front controller)" robots -H "Host: myapp-staging.example.test" http://127.0.0.1/health
 ok_if "php-fpm staging: / needs the login, /health doesn't" \
   '[[ $(curl -s -o /dev/null -w "%{http_code}" -H "Host: myapp-staging.example.test" http://127.0.0.1/) == 401 && $(curl -s -H "Host: myapp-staging.example.test" http://127.0.0.1/health) == ok ]]'
 expect_rc 0 "php-fpm production deploy (pre-deploy backup on mariadb)" deploy_as myapp-production myapp production "deploy abcdef12" "$T/M.tgz"
+check_not "production: no X-Robots-Tag on HEALTH_PATH" robots -H "Host: pgapp.example.test" http://127.0.0.1/health
+check_not "production: no X-Robots-Tag on pages" robots -H "Host: myapp.example.test" http://127.0.0.1/
 ok_if "php-fpm production serves the app without a login" '[[ $(curl -s -o /dev/null -w "%{http_code}" -H "Host: myapp.example.test" http://127.0.0.1/) == 200 ]]'
 expect_rc 0 "static production deploy (no database: pre-deploy backup skips)" deploy_as stapp-production stapp production "deploy 5ca1ab1e" "$T/A.tgz"
 ok_if "static production serves current/public" '[[ $(curl -s -H "Host: stapp.example.test" http://127.0.0.1/health) == ok ]]'
@@ -358,6 +423,9 @@ for eng in postgres mariadb; do
   ok_if "[$eng] the sanitized dump contains none of the original personal values" '! grep -F -f $FIX/original-values.txt $T/snap1-$eng.sql > $LOG'
   ok_if "[$eng] fake emails/phones/names are in place, plus the devlogin" \
     'grep -Eq "u[0-9a-f]{10}@example\.invalid" $T/snap1-$eng.sql && grep -Eq "\+1555[0-9]{7}" $T/snap1-$eng.sql && grep -q "dev@example.test" $T/snap1-$eng.sql && grep -q "knownDevLoginHashForLocalUseOnly00" $T/snap1-$eng.sql'
+  if [[ $eng == postgres ]]; then
+    ok_if "[postgres] restorable into an older local Postgres (no SET transaction_timeout line)" '! grep -q "^SET transaction_timeout" $T/snap1-postgres.sql'
+  fi
   ok_if "[$eng] kept fields that are not personal (shipping city, totals)" 'grep -q "Baguio City" $T/snap1-$eng.sql && grep -q "15000.00" $T/snap1-$eng.sql'
   sleep 1
   expect_rc 0 "[$eng] second snapshot run" "$LIB/snapshot" "$P"
@@ -371,7 +439,7 @@ for eng in postgres mariadb; do
     q() { pgq -d srvtest_restore -c "$1"; }
   else
     myq -e 'DROP DATABASE IF EXISTS srvtest_restore; CREATE DATABASE srvtest_restore'
-    mysql srvtest_restore < "$T/snap1-$eng.sql"
+    my srvtest_restore < "$T/snap1-$eng.sql"
     q() { myq srvtest_restore -e "$1"; }
   fi
   ok_if "[$eng] the sanitized dump restores; unique emails stay unique" \
@@ -460,7 +528,7 @@ expect_rc 0 "backup of a project without a database skips" "$LIB/backup" stapp
 # ============================================================================ 6. flag
 section "6. flag"
 { echo 'SET ROLE pgapp_staging;'; cat "$FIX/seed-postgres.sql"; } | pg -d pgapp_staging > /dev/null
-mysql myapp_staging < "$FIX/seed-mariadb.sql"
+my myapp_staging < "$FIX/seed-mariadb.sql"
 : > "$T/flag-before"
 [[ -e /var/log/team/flags.log ]] && cp /var/log/team/flags.log "$T/flag-before"
 expect_rc 0 "[postgres] flag pgapp staging new-checkout on --by tester" "$LIB/flag" pgapp staging new-checkout on --by tester
@@ -512,7 +580,7 @@ check_not "[postgres]   … production's user still can't connect to staging" en
 check "[postgres]   … staging's user still can" env PGPASSWORD="$PW_PS" psql -X -h 127.0.0.1 -U pgapp_staging -d pgapp_staging -Atc 'SELECT count(*) FROM customers'
 expect_rc 0 "[mariadb] refresh-staging --apply" "$LIB/refresh-staging" myapp --apply
 ok_if "[mariadb]   … staging now holds the sanitized data" '[[ $(myq myapp_staging -e "SELECT count(*) FROM customers WHERE email NOT LIKE '"'"'%@example.invalid'"'"'") == 0 ]]'
-check "[mariadb]   … staging's user still connects" env MYSQL_PWD="$PW_MS" mysql -h 127.0.0.1 -u myapp_staging myapp_staging -e 'SELECT count(*) FROM customers'
+check "[mariadb]   … staging's user still connects" env MYSQL_PWD="$PW_MS" "$MYSQL_BIN" -h 127.0.0.1 -u myapp_staging myapp_staging -e 'SELECT count(*) FROM customers'
 expect_rc 3 "refresh-staging without a database → not configured" "$LIB/refresh-staging" stapp
 
 # ============================================================================ wrap-up

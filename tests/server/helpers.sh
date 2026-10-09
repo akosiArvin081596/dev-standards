@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034  # values here are used by in-container.sh
 # Helpers for tests/server/in-container.sh. Runs INSIDE the throwaway team-srvtest container
 # (Ubuntu, bash 5, root). Never used on a real server.
 
@@ -129,7 +129,22 @@ wait_port() { local i; for ((i = 0; i < 50; i++)); do ss -ltnH | grep -q ":$1 " 
 
 pg() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
 pgq() { runuser -u postgres -- psql -X -At -v ON_ERROR_STOP=1 "$@"; }
-my() { mysql "$@"; }
-myq() { mysql -N -B "$@"; }
+# MariaDB 11+ names its client mariadb (the mysql name may be absent); MySQL keeps mysql.
+MYSQL_BIN=mysql
+command -v mariadb > /dev/null 2>&1 && MYSQL_BIN=mariadb
+my() { "$MYSQL_BIN" "$@"; }
+myq() { "$MYSQL_BIN" -N -B "$@"; }
+# The release's PHP version (8.3 on 24.04, 8.5 on 26.04) and its sudo (sudo or sudo-rs)
+PHPV=$(find /etc/php -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n 1)
+SUDO_IMPL=classic
+sudo --version 2>/dev/null | head -n 1 | grep -q '^sudo-rs' && SUDO_IMPL=sudo-rs
+
+# sudo_lists <user> <command…> : `sudo -l -U` (sudo and sudo-rs alike) shows every command
+sudo_lists() {
+  local user=$1 out c
+  shift
+  out=$(sudo -n -l -U "$user" | tr -s ' \t\n' ' ') || return 1
+  for c in "$@"; do [[ $out == *"$c"* ]] || { printf 'missing: %s\nlisted: %s\n' "$c" "$out"; return 1; }; done
+}
 
 conf_get() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
