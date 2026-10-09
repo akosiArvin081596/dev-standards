@@ -115,7 +115,35 @@ Examples are Bash commands from the main session unless noted. `vps-test`, `192.
   really there (`rm -rf build/*` passes; `cat dir/*` with a `production.env` in it doesn't).
   With an unreadable or missing directory, and for explicit fence globs
   (`.claude/settings*.json`, `.cl*/settings.json`), the exemplar match decides.
-- Review agents may also run `date`, `date -u`, `date +FMT` and `date -u +FMT`.
+- Review agents may also run `date`, `date -u`, `date +FMT` and `date -u +FMT`. They may not
+  set any environment variable on a command, nor use a reader option that opens a pager/editor
+  or writes a file (`git grep -O`/`--open-files-in-pager`/`--output`, `grep -O`).
+- Deny-by-default in the sensitive-tool handlers: an unknown git subcommand or git alias, an
+  unknown value-taking git global option, interpreter module/preload options (`python -m`,
+  node `-r/--require/--import/--loader`, ruby `-r`, perl `-M/-m/-I`, php `-d`), and any word
+  after a command runner (`xargs`, `find -exec`, `taskset`, `ionice`, `chroot`, `npx`, …) that
+  is a sensitive tool name — all deny rather than fall through to allow.
+- Environment prefixes: a sensitive command (git, gh, ssh-family, curl/wget, a shell, an
+  interpreter, make) carrying any variable that redirects it to a config/program, preloads code
+  or changes the shell (`GIT_DIR`, `GIT_SSH*`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `PERL5OPT`,
+  `BASH_ENV`, `ZDOTDIR`, `CURL_HOME`, `LD_*`, `PATH`, `IFS`, clearing `CLAUDECODE`, …) is
+  `disguised`. A prefix applies to one command only; a standalone or exported `GIT_DIR` leaves
+  the repo unknown so the next git command denies.
+- A `cd` that may not run (inside a `{ }` group or function body, or reached through `eval`
+  or `source`) leaves the directory unknown; a later script, interpreter file or make target
+  that then can't be located denies as `script-scan`.
+- `curl`/`wget`: a config/input-file/templated-URL option (`-K`, wget `-i`/`-e`, `--expand-*`)
+  hides the request and denies as `curl-github-write`; GitHub is also recognised by a `Host:`
+  header. A QA agent's localhost `curl` must be truly local — `--unix-socket`, `--resolve`,
+  `--connect-to`, `-x`/`--proxy` and the like are not.
+- ssh to the VPS through a git remote URL (`ssh://`, `host:path`, by alias/IP/hostname) or a
+  `curl scp://`/`sftp://` URL is `ssh-dest`.
+- Schedulers that run commands later, outside the fence (`at`, `batch`, `crontab` install,
+  `launchctl load`), are denied; `crontab -l` and `launchctl list` are reads.
+- The `claude --bg` prompt must be one literal quoted string starting with `/team:`.
+- `f_prod` denies production/prod (or a non-literal word) anywhere in the arguments; `make`
+  scans pattern rules, `.DEFAULT`, one level of `include`, `-E`/`--eval` strings, and denies a
+  `SHELL=`/`MAKEFLAGS=` override.
 - Reserved words count only when unquoted and unescaped in command position: `\case`,
   `'case'` or `ca''se` is an ordinary command, and the rest of the line is analysed.
 - zsh (the owner's shell runs the Bash tool) constructs that build code are `disguised`:
