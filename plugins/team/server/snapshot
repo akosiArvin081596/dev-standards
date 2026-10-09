@@ -27,6 +27,8 @@ to store (exit 4) if
   (b) any value looks like an email outside example.invalid / example.com / example.org /
       example.net / *.test (the devlogin email is allowed), or
   (c) any value looks like a PH mobile number ((+63|0)9xxxxxxxxx).
+It also refuses, before dumping anything, an `ignore|*|<column>` line whose column looks personal:
+such a column must be ignored per named table.
 The temporary database and the raw dumps are always removed.
 
 Exit codes: 0 stored (or DB_ENGINE=none), 1 failure, 2 usage, 4 refused by the check,
@@ -88,7 +90,7 @@ STRATEGIES=" email name first_name last_name phone address text null redact hash
 BUILTIN_IGNORES=("feature_flags|name")
 
 R_T=() R_C=() R_S=() R_A=()
-I_T=() I_C=()
+I_T=() I_C=() I_LINE=()
 D_T=() D_K=() D_V=() D_SETS=()
 DEV_EMAILS=()
 IDENT_RE='^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$'
@@ -122,7 +124,7 @@ parse_rules() {
         ((${#f[@]} >= 3)) || bad_rule "$n" "expected ignore|<table>|<column>|<reason>"
         t=$(team_trim "${f[1]}") c=$(team_trim "${f[2]}")
         [[ ($t == '*' || $t =~ $IDENT_RE) && $c =~ $COL_RE ]] || bad_rule "$n" "bad table or column name"
-        I_T+=("$t") I_C+=("$c")
+        I_T+=("$t") I_C+=("$c") I_LINE+=("$n")
         ;;
       devlogin)
         ((${#f[@]} >= 5)) || bad_rule "$n" "expected devlogin|<table>|<key column>|<key value>|<col>=<value>[;…]"
@@ -192,6 +194,26 @@ anon_expr() {
 
 # ============================================================================ dump and restore
 parse_rules
+mapfile -t PII_PATTERNS < <(team_pii_patterns)
+
+# A wildcard ignore (`ignore|*|<column>`) may only name a column that does NOT look personal: for a
+# personal-looking column it would silence check (a) in every table, including tables added later.
+# Such columns must be ignored per named table. Refused before anything is dumped.
+WILDCARD_PROBLEMS=()
+for i in "${!I_T[@]}"; do
+  [[ ${I_T[$i]} == '*' ]] || continue
+  lc=${I_C[$i],,}
+  for pat in "${PII_PATTERNS[@]}"; do
+    if [[ $lc =~ $pat ]]; then
+      WILDCARD_PROBLEMS+=("ops/anonymize line ${I_LINE[$i]}: ignore|*|${I_C[$i]} would skip the personal-data check for '${I_C[$i]}' in every table (matches /$pat/); write one ignore line per table instead")
+      break
+    fi
+  done
+done
+if ((${#WILDCARD_PROBLEMS[@]})); then
+  for p in "${WILDCARD_PROBLEMS[@]}"; do team_say "[fail] check: $p"; done
+  team_die "$TEAM_EXIT_REFUSED" "REFUSED: ops/anonymize ignores a personal-looking column in every table; nothing was dumped or stored."
+fi
 team_say "snapshot $PROJECT ($DB_ENGINE) $(team_utc_now)"
 
 team_db_dump "$DB_ENGINE" "$DB_NAME" raw > "$WORK/raw.sql" || team_die "$TEAM_EXIT_FAIL" "could not dump $DB_NAME"
@@ -263,9 +285,9 @@ team_say "[ok] anonymized ${#ORDER[@]} table(s): $applied rule(s), ${#D_T[@]} de
 
 # ============================================================================ check (a): personal-looking columns
 PROBLEMS=()
-mapfile -t PII_PATTERNS < <(team_pii_patterns)
 declare -A IGNORED=()
-for i in "${!I_T[@]}"; do IGNORED[${I_T[$i],,}|${I_C[$i],,}]=1; done
+# (wildcard ignores were refused above for personal-looking columns, so none is honoured here)
+for i in "${!I_T[@]}"; do [[ ${I_T[$i]} == '*' ]] || IGNORED[${I_T[$i],,}|${I_C[$i],,}]=1; done
 for b in "${BUILTIN_IGNORES[@]}"; do IGNORED[$b]=1; done
 unhandled=0
 while IFS='|' read -r sch tab col; do
@@ -276,7 +298,7 @@ while IFS='|' read -r sch tab col; do
   [[ -n $hit ]] || continue
   ref="$sch|$tab"
   [[ -n ${HANDLED[$ref|$lc]:-} ]] && continue
-  [[ -n ${IGNORED[${tab,,}|$lc]:-} || -n ${IGNORED[${sch,,}.${tab,,}|$lc]:-} || -n ${IGNORED[*|$lc]:-} ]] && continue
+  [[ -n ${IGNORED[${tab,,}|$lc]:-} || -n ${IGNORED[${sch,,}.${tab,,}|$lc]:-} ]] && continue
   PROBLEMS+=("column $tab.$col looks personal (matches /$hit/) but ops/anonymize has no rule or ignore line for it")
   unhandled=$((unhandled + 1))
 done <<< "$COLS"

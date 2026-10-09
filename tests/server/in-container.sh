@@ -476,6 +476,23 @@ for eng in postgres mariadb; do
   ok_if "[$eng]   … reported as a PH mobile number" 'grep -q "PH mobile number pattern found" $LOG'
   run "ALTER TABLE orders DROP COLUMN remarks"
   ok_if "[$eng] refusals stored nothing (snapshot folder unchanged)" '[[ $(ls $SD | sort | tr "\n" " ") == "$before" ]]'
+
+  # A wildcard ignore may not name a personal-looking column (security finding H2): it would
+  # silence check (a) for that column in every table, including tables added later.
+  RULES_FILE=/srv/team/$P/production/current/ops/anonymize
+  cp -p "$RULES_FILE" "$T/anonymize.orig"
+  printf 'ignore|*|email|blanket ignore\n' >> "$RULES_FILE"
+  before=$(ls "$SD" | sort | tr '\n' ' ')
+  expect_rc 4 "[$eng] REFUSES ignore|*|email (wildcard ignore of a personal-looking column)" "$LIB/snapshot" "$P"
+  ok_if "[$eng]   … names the line, and dumps, stores and creates nothing" \
+    'grep -q "\[fail\] check: ops/anonymize line [0-9]*: ignore|\*|email would skip the personal-data check" $LOG && ! grep -q "dumped production" $LOG && [[ $(ls $SD | sort | tr "\n" " ") == "$before" && ! -s /var/lib/team/$P/tmp-databases ]]'
+  cp -p "$T/anonymize.orig" "$RULES_FILE"
+  printf 'ignore| * |Phone|case and spaces don\x27t help\n' >> "$RULES_FILE"
+  expect_rc 4 "[$eng] REFUSES 'ignore| * |Phone' (case and spaces normalized)" "$LIB/snapshot" "$P"
+  cp -p "$T/anonymize.orig" "$RULES_FILE"
+  printf 'ignore|*|internal_code|not personal, fine in every table\n' >> "$RULES_FILE"
+  expect_rc 0 "[$eng] a wildcard ignore of a column that doesn't look personal is still accepted" "$LIB/snapshot" "$P"
+  cp -p "$T/anonymize.orig" "$RULES_FILE"
 done
 ok_if "temporary databases are always dropped (none left, registry empty)" \
   '[[ -z $(pgq -d postgres -c "SELECT datname FROM pg_database WHERE datname LIKE '"'"'team\_%'"'"'") && -z $(myq -e "SHOW DATABASES LIKE '"'"'team\\_%'"'"'") && ! -s /var/lib/team/pgapp/tmp-databases && ! -s /var/lib/team/myapp/tmp-databases ]]'
