@@ -6,6 +6,12 @@
 #   TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 #   . "$TEAM_SELF_DIR/../lib/team-common.sh"
 
+# Byte-order matching: under locales such as en_PH.UTF-8, bash 3.2 lets [a-z] match capitals,
+# which silently weakens every name check. Must stay before any pattern match.
+unset LC_ALL
+LC_COLLATE=C
+export LC_COLLATE
+
 TEAM_CONFIG_DIR="${TEAM_CONFIG_DIR:-$HOME/.config/team}"
 TEAM_STANDARDS_REPO="${TEAM_STANDARDS_REPO:-akosiArvin081596/dev-standards}"
 TEAM_TEMPLATE_REPO="${TEAM_TEMPLATE_REPO:-akosiArvin081596/project-starter}"
