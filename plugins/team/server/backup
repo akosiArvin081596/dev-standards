@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # backup — compressed, timestamped dumps of a project's production database, with retention and a
 # restore test (docs/rules.md §11). The off-server copy is the pack's one open item (marked below).
 set -Eeuo pipefail
@@ -16,7 +17,7 @@ Usage: backup <project> [--verify | --pre-deploy]
                 through its narrow sudo rule before migrating production
   --verify      restore the newest backup into a temporary database, check it has tables, drop it
 
-Dumps never lock tables (pg_dump; mysqldump --single-transaction --skip-lock-tables). Backups are
+Dumps never lock tables (pg_dump; mariadb-dump/mysqldump --single-transaction --skip-lock-tables). Backups are
 root-only (700 directory, 600 files). Off-server copies go to OFFSITE_BACKUP_TARGET in
 /etc/team/backup.conf once that exists. Run as root.
 

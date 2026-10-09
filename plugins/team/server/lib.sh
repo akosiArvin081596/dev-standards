@@ -218,15 +218,21 @@ team_ledger_list() { # <project> <env> <kind> : names of that kind
 # (unix_socket / auth_socket), or the client options in /etc/team/mysql-admin.cnf if that exists.
 team_pg()      { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
 team_pg_dump() { runuser -u postgres -- pg_dump "$@"; }
+# MariaDB 11+ ships its clients as mariadb / mariadb-dump (the mysql names may be absent); MySQL
+# keeps mysql / mysqldump. Use whichever this server has, MariaDB names first.
+team_mysql_bin() { if command -v mariadb >/dev/null 2>&1; then printf 'mariadb'; else printf 'mysql'; fi; }
+team_mysqldump_bin() { if command -v mariadb-dump >/dev/null 2>&1; then printf 'mariadb-dump'; else printf 'mysqldump'; fi; }
 team_mysql() {
-  if [[ -r $TEAM_ETC_DIR/mysql-admin.cnf ]]; then mysql --defaults-extra-file="$TEAM_ETC_DIR/mysql-admin.cnf" "$@"
-  else mysql "$@"; fi
+  local bin; bin=$(team_mysql_bin)
+  if [[ -r $TEAM_ETC_DIR/mysql-admin.cnf ]]; then "$bin" --defaults-extra-file="$TEAM_ETC_DIR/mysql-admin.cnf" "$@"
+  else "$bin" "$@"; fi
 }
 team_mysqldump() {
-  if [[ -r $TEAM_ETC_DIR/mysql-admin.cnf ]]; then mysqldump --defaults-extra-file="$TEAM_ETC_DIR/mysql-admin.cnf" "$@"
-  else mysqldump "$@"; fi
+  local bin; bin=$(team_mysqldump_bin)
+  if [[ -r $TEAM_ETC_DIR/mysql-admin.cnf ]]; then "$bin" --defaults-extra-file="$TEAM_ETC_DIR/mysql-admin.cnf" "$@"
+  else "$bin" "$@"; fi
 }
-team_mysqldump_is_mariadb() { mysqldump --version 2>/dev/null | grep -qi mariadb; }
+team_mysqldump_is_mariadb() { "$(team_mysqldump_bin)" --version 2>/dev/null | grep -qi mariadb; }
 
 team_is_mysql_family() { [[ $1 == mysql || $1 == mariadb ]]; }
 
@@ -234,7 +240,7 @@ team_is_mysql_family() { [[ $1 == mysql || $1 == mariadb ]]; }
 team_db_ready() {
   case $1 in
     postgres) command -v psql >/dev/null 2>&1 && team_pg -d postgres -Atc 'SELECT 1' >/dev/null 2>&1 ;;
-    mysql|mariadb) command -v mysql >/dev/null 2>&1 && team_mysql -N -B -e 'SELECT 1' >/dev/null 2>&1 ;;
+    mysql|mariadb) command -v "$(team_mysql_bin)" >/dev/null 2>&1 && team_mysql -N -B -e 'SELECT 1' >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }

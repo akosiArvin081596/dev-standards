@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # snapshot — the nightly sanitized copy of production's database (docs/rules.md §8, §11).
 # Dump without locking tables → restore into a temporary database → anonymize with ops/anonymize of
 # production's current release (deterministic, salted) → check that no personal data is left →
@@ -283,7 +284,9 @@ if (( unhandled == 0 )); then team_say "[ok] check: every personal-looking colum
 
 # ============================================================================ the sanitized dump
 if [[ $DB_ENGINE == postgres ]]; then
-  team_db_dump postgres "$TMPDB" sanitized > "$WORK/sanitized.sql"
+  # PostgreSQL 17+ pg_dump adds `SET transaction_timeout = 0;`, which an older local Postgres (the
+  # owner's Mac) rejects; it is a session setting with no effect on the data, so it is dropped.
+  team_db_dump postgres "$TMPDB" sanitized | sed '/^SET transaction_timeout = 0;$/d' > "$WORK/sanitized.sql"
 else
   strip='/^-- Host: /d; s/ DEFINER=`[^`]+`@`[^`]+`//g'
   # (comment lines naming the temporary database are dropped so runs stay byte-identical)

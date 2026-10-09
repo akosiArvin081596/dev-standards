@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # provision — set up one project environment (<project>-<env>) on this server from a bundle that
 # team-provision sends (docs/rules.md §12). Plan by default; changes only with --apply.
 # shellcheck disable=SC2016  # nginx and systemd \$variables in single quotes are literal on purpose
@@ -66,7 +67,7 @@ refuse() { team_die "$TEAM_EXIT_REFUSED" "refusing: $*"; }
 
 team_require_root
 team_os_check
-team_require_cmd openssl install useradd getent runuser ss flock visudo curl
+team_require_cmd openssl install useradd getent runuser ss flock visudo sudo curl
 WORK=$(mktemp -d)
 team_flock provision 600
 
@@ -880,6 +881,27 @@ step_keys() {
   return 0
 }
 
+# The sudo rule is checked three ways once installed: visudo -cf on the file; visudo -c on the whole
+# configuration if that passed before the change (sudo-rs on Ubuntu 25.10+ ships /etc/sudoers 0644,
+# which its visudo -c reports as an error although sudo-rs itself accepts it); and `sudo -l -U` must
+# list every command, which proves the sudo in use (sudo or sudo-rs) really grants them.
+SUDO_CMDS=() VISUDO_BASELINE=""
+# shellcheck disable=SC2329  # called by sudoers_active
+sudo_grants() { # <user> <command…>
+  local user=$1 out c
+  shift
+  out=$(sudo -n -l -U "$user" 2>/dev/null | tr -s ' \t\n' ' ') || { echo "sudo -l -U $user failed"; return 1; }
+  for c in "$@"; do
+    [[ $out == *"$c"* ]] || { echo "sudo does not grant $user: $c"; return 1; }
+  done
+}
+# shellcheck disable=SC2329  # called through install_checked
+sudoers_active() {
+  visudo -cf "$SUDOERS" || return 1
+  if [[ $VISUDO_BASELINE == ok ]]; then visudo -c || return 1; fi
+  sudo_grants "$APP_USER" "${SUDO_CMDS[@]}"
+}
+
 step_sudoers() {
   local cmds=() u i out=$WORK/sudoers
   for u in "${UNITS[@]}"; do cmds+=("$SYSTEMCTL reload-or-restart $u" "$SYSTEMCTL restart $u"); done
@@ -903,7 +925,14 @@ step_sudoers() {
   visudo -cf "$out" >/dev/null || team_die "$TEAM_EXIT_FAIL" "the generated sudo rule does not pass visudo -c"
   plan_file "$SUDOERS" "$out" 440 root root "sudo rule $SUDOERS (${#cmds[@]} exact commands, validated with visudo -c)"
   if applying && [[ $CHANGED == 1 ]]; then
-    install_checked sudoers "$SUDOERS" "$out" 440 root root visudo -c \
+    SUDO_CMDS=("${cmds[@]}")
+    if visudo -c > /dev/null 2>&1; then
+      VISUDO_BASELINE=ok
+    else
+      VISUDO_BASELINE=fail
+      team_warn "visudo -c already fails before this change ($(visudo -c 2>&1 | grep -v 'parsed OK' | head -n 1)); checking the new rule with visudo -cf and sudo -l instead"
+    fi
+    install_checked sudoers "$SUDOERS" "$out" 440 root root sudoers_active \
       || team_die "$TEAM_EXIT_FAIL" "sudoers did not validate with the new $SUDOERS; the previous rule was restored"
   fi
   return 0
@@ -914,7 +943,7 @@ CAL="" CAL_NOTE=""
 # calendar_spec <weekday|""> <HH> <MM> : OnCalendar in the project's timezone, or converted to
 # server time when this systemd can't take a timezone (DST caveat noted).
 calendar_spec() {
-  local dow=$1 hh=$2 mm=$3 base ref u d h m
+  local dow=$1 hh=$2 mm=$3 base ref u d h m epoch
   base="${dow:+$dow }*-*-* $hh:$mm:00"
   CAL_NOTE=""
   if [[ ${TEAM_TIMER_TZ_CONVERT:-0} != 1 ]] && command -v systemd-analyze >/dev/null 2>&1 \
@@ -927,7 +956,10 @@ calendar_spec() {
     u=$(TZ=$TIMEZONE date -d "$ref" +%u)
     ref=$(date -d "$ref +$(( (7 - u) % 7 )) days" +%F)
   fi
-  read -r d h m <<< "$(date -d "TZ=\"$TIMEZONE\" $ref $hh:$mm" '+%a %H %M')"
+  # The project-time moment as an epoch, shown in server time. (Not `date -d 'TZ="…" …'`: the Rust
+  # coreutils date on Ubuntu 25.10+ silently ignores a TZ= inside -d.)
+  epoch=$(TZ=$TIMEZONE date -d "$ref $hh:$mm" +%s)
+  read -r d h m <<< "$(date -d "@$epoch" '+%a %H %M')"
   CAL="${dow:+$d }*-*-* $h:$m:00"
   CAL_NOTE="converted from ${dow:+$dow }$hh:$mm $TIMEZONE to server time on $(date -u +%F); a daylight-saving change in either zone shifts it by an hour until provision is re-run"
 }

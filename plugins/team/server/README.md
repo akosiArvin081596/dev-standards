@@ -5,12 +5,14 @@ and an `inputs.conf` to the VPS in one SSH connection and runs `sudo bash <dir>/
 [--apply]` (contract: `docs/rules.md` §11–§12). `provision --apply` installs every script root-owned
 (`root:root 0755`) in `/usr/local/lib/team/`; the forced commands, sudo rule and timers point there.
 
-Bash 5 + GNU tools, Ubuntu 24.04 or a newer LTS (others get a warning). Every script has `--help`,
-uses the exit codes in `docs/rules.md` §4, runs with `LC_ALL=C`, and stores and logs times in UTC.
+Bash 5 on Ubuntu 24.04 or a newer LTS (others get a warning); tested on 24.04 and 26.04, so it works
+with classic sudo or sudo-rs, GNU or Rust (uutils) coreutils, PostgreSQL 16–18, MariaDB 10.11–11.8 and
+PHP 8.3–8.5. Every script has `--help`, uses the exit codes in `docs/rules.md` §4, runs with
+`LC_ALL=C`, and stores and logs times in UTC.
 
 | Script | Runs as | What it does |
 |---|---|---|
-| `discover` | anyone (more with sudo) | Read-only `KEY: value` inventory: OS, web servers, databases, runtimes, sites, users, disk, RAM, ports, firewall, timers, cron (cron commands are not printed). |
+| `discover` | anyone (more with sudo) | Read-only `KEY: value` inventory: OS, sudo implementation (`SUDO: sudo-rs …` or classic), coreutils, web servers, databases, runtimes, sites, users, disk, RAM, ports, firewall, timers, cron (cron commands are not printed). |
 | `provision --bundle <dir> [--apply]` | root | Plan by default. Sets up `<project>-<env>`: OS user, `/srv/team/<project>/<env>/{releases,shared,current}`, `shared/.env` from the template, port 9100–9899, database + least-privilege user, nginx vhost (proxy / php-fpm / static; staging gets basic auth + `noindex`), TLS via certbot, systemd units + logrotate, deploy key, narrow sudo rule; production also gets the db-pull key and the snapshot / backup / verify timers. Ends with `TEAM-RESULT ok` or `TEAM-RESULT fail <reason>`. |
 | `deploy-receive <project> <env>` | env user (deploy key) | `deploy <sha>` (tarball on stdin) → unpack, link `shared/`, pre-deploy backup (production), `MIGRATE_CMD`, atomic switch, reload, health check, switch back on failure; `rollback <sha>` (exit 7 if the release is gone); `health`. Keeps 5 releases. |
 | `snapshot <project>` | root (nightly timer) | Dump production without locks → temp DB → `ops/anonymize` (salted, deterministic) → refuse to store if personal data remains → `sanitized-<utc>.sql.gz`, keep 7. |
@@ -30,6 +32,10 @@ the ledger, so other sites' users, vhosts and databases are never touched. Other
 changes the server timezone, never adds a firewall, `rm -rf "${VAR:?}"/…` guards on every removal,
 temporary databases are recorded before creation and only those are dropped.
 
+The sudo rule is checked with `visudo -cf`, with `visudo -c` on the whole configuration when that
+passed before the change (sudo-rs ships `/etc/sudoers` 0644, which its `visudo -c` flags), and with
+`sudo -l -U <user>`, which must list every command; a rule that fails is replaced by the previous one.
+
 Root-only extras next to the ledger: `<project>.salt` (anonymization salt, created once) and
 `<project>-<env>.dbpass` (the generated database password, so new env-template keys can be filled
 later without resetting it). If MySQL/MariaDB root can't log in over the socket, put client options
@@ -44,7 +50,8 @@ configured`. The encrypted (`age`) upload goes where `backup` carries the `offsi
 ## Testing
 
 `/bin/bash tests/server/run.sh` on the Mac: shellcheck and `bash -n` on every script, the one-open-item
-rule, a scan for real IPs and host names, the PII-pattern drift check, then the full suite in a
-throwaway `ubuntu:24.04` container named `team-srvtest-*` (removed afterwards). It never connects to
+rule, a scan for real IPs and host names, the PII-pattern drift check, then the full suite in one
+throwaway container per base (`ubuntu:24.04` then `ubuntu:26.04`; pick with `--base`), named
+`team-srvtest-*` and removed afterwards. It never connects to
 a real server. What a container can't show (real systemd, certbot, sshd forced-command wiring) is
 listed in `tests/server/in-container.sh` and the build report.

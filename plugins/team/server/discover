@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # discover — read-only inventory of this server for /team:new-project (docs/rules.md §11).
 # Changes nothing. Prints "KEY: value" lines in "== section" blocks. Works without root; with root
 # (sudo) it also sees process names on ports and user crontabs.
@@ -48,6 +49,27 @@ else
   kv TIMER_TIMEZONES "not supported (timers are converted to server time)"
 fi
 kv UPTIME "$(uptime -p 2>/dev/null || true)"
+if have sudo; then
+  sv=$(sudo --version 2>/dev/null | head -n 1 || true)
+  case $sv in
+    sudo-rs*) impl="sudo-rs ${sv#sudo-rs }" ;;
+    "Sudo version "*) impl="sudo ${sv#Sudo version } (classic)" ;;
+    *) impl=${sv:-unknown} ;;
+  esac
+  kv SUDO "$impl, $(readlink -f "$(command -v sudo)")"
+else
+  kv SUDO "not installed"
+fi
+if have visudo && [[ $(id -u) -eq 0 ]]; then
+  if visudo -c > /dev/null 2>&1; then kv SUDOERS_CHECK "visudo -c passes"
+  else kv SUDOERS_CHECK "visudo -c fails: $(visudo -c 2>&1 | grep -v 'parsed OK' | head -n 1) (provision then checks its rule with visudo -cf and sudo -l)"; fi
+fi
+cv=$(date --version 2>/dev/null | head -n 1 || true)
+case $cv in
+  *uutils*) kv COREUTILS "uutils (Rust) ${cv##* }" ;;
+  *GNU*) kv COREUTILS "GNU ${cv##* }" ;;
+  *) kv COREUTILS "${cv:-unknown}" ;;
+esac
 
 # ---------------------------------------------------------------------------- web servers
 section "web servers"
@@ -81,6 +103,7 @@ else kv POSTGRES "not installed"; fi
 my_v=""
 have mysqld && my_v=$(first_line mysqld --version)
 have mariadbd && my_v=$(first_line mariadbd --version)
+if [[ -z $my_v ]] && have mariadb; then my_v=$(first_line mariadb --version); fi
 if [[ -z $my_v ]] && have mysql; then my_v=$(first_line mysql --version); fi
 if [[ $my_v == *[Mm]aria[Dd][Bb]* ]]; then
   st=installed; pgrep -x 'mariadbd|mysqld' >/dev/null 2>&1 && st=running
