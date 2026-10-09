@@ -24,6 +24,9 @@ Sets up one environment of a project on this server, from <dir>/inputs.conf and 
 Prints a plan ([create] [update] [remove] [ok] [skip] lines) and changes nothing unless --apply.
 Re-running applies changes made in ops/ and is otherwise a no-op. Refuses (exit 4) to reuse an OS
 user, database, database user or nginx file the pack did not create. Run as root (sudo).
+Just before it, one line "TEAM-HOSTKEY <keytype> <base64>" gives this server's SSH host key
+(ed25519, else ecdsa, else rsa; no comment, so no hostname), so team-provision can pin it in
+known_hosts from the same connection. The line is left out only when the server has no host key.
 The last line is "TEAM-RESULT ok" or "TEAM-RESULT fail <reason>".
 
 inputs.conf keys: PROJECT ENV HOST BASIC_AUTH_USER BASIC_AUTH_PASSWORD (staging) DEPLOY_PUBKEY
@@ -37,11 +40,28 @@ for a in "$@"; do case $a in -h|--help) usage; exit 0 ;; esac; done
 
 WORK=""
 RESULT_ARMED=1
+# host_key_line : "TEAM-HOSTKEY <type> <base64>" from the first usable host key, never the comment
+# shellcheck disable=SC2329  # called from the EXIT trap
+host_key_line() {
+  local f t k rest
+  for f in /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ecdsa_key.pub /etc/ssh/ssh_host_rsa_key.pub; do
+    [[ -r $f ]] || continue
+    t="" k=""
+    read -r t k rest < "$f" || true
+    : "${rest:-}"
+    if [[ $t =~ ^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa)$ && $k =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+      printf 'TEAM-HOSTKEY %s %s\n' "$t" "$k"
+      return 0
+    fi
+  done
+  return 0
+}
 # shellcheck disable=SC2329  # invoked by the EXIT trap
 on_exit() {
   local rc=$?
   [[ -n $WORK && -d $WORK ]] && rm -rf "${WORK:?}"
   if [[ $RESULT_ARMED == 1 ]]; then
+    host_key_line
     if (( rc == 0 )); then printf 'TEAM-RESULT ok\n'
     else printf 'TEAM-RESULT fail %s\n' "$(printf '%s' "${TEAM_FAIL_REASON:-exit $rc}" | tr '\n' ' ')"; fi
   fi

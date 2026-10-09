@@ -78,6 +78,28 @@ make_bundle pgapp staging "$T/b-bad" 'HOST=Not A Host'
 expect_rc 2 "provision rejects a bad HOST (usage error)" provision_run "$T/b-bad"
 ok_if "a usage error still ends with TEAM-RESULT fail" '[[ $(tail -n 1 $LOG) == "TEAM-RESULT fail"* ]]'
 
+# TEAM-HOSTKEY: one line with the server's SSH host key just before TEAM-RESULT, so team-provision
+# pins it from the same connection: ed25519, else ecdsa, else rsa; never the comment (hostname).
+hostkey_lines() { grep -c '^TEAM-HOSTKEY ' "$1" || true; }
+hostkey_of() { cut -d' ' -f1,2 "/etc/ssh/ssh_host_$1_key.pub"; }
+ok_if "the test image starts without SSH host keys (openssh-client only)" '[[ -z $(ls /etc/ssh/ssh_host_* 2> /dev/null) ]]'
+provision_run "$T/b-pg-s" > "$LOG" 2>&1
+ok_if "no host key on the server → no TEAM-HOSTKEY line; TEAM-RESULT still last" '[[ $(hostkey_lines $LOG) == 0 && $(tail -n 1 $LOG) == "TEAM-RESULT ok" ]]'
+mkdir -p /etc/ssh
+ssh-keygen -q -t rsa -b 2048 -N '' -C root@srvtest-hostname -f /etc/ssh/ssh_host_rsa_key
+provision_run "$T/b-pg-s" > "$LOG" 2>&1
+ok_if "only an rsa host key → TEAM-HOSTKEY ssh-rsa <base64>" '[[ $(hostkey_lines $LOG) == 1 && $(grep "^TEAM-HOSTKEY " $LOG) == "TEAM-HOSTKEY $(hostkey_of rsa)" ]]'
+ssh-keygen -q -t ecdsa -N '' -C root@srvtest-hostname -f /etc/ssh/ssh_host_ecdsa_key
+provision_run "$T/b-pg-s" > "$LOG" 2>&1
+ok_if "ecdsa is preferred over rsa" '[[ $(hostkey_lines $LOG) == 1 && $(grep "^TEAM-HOSTKEY " $LOG) == "TEAM-HOSTKEY $(hostkey_of ecdsa)" ]]'
+ssh-keygen -q -t ed25519 -N '' -C root@srvtest-hostname -f /etc/ssh/ssh_host_ed25519_key
+provision_run "$T/b-pg-s" > "$LOG" 2>&1
+ok_if "ed25519 is preferred: exactly one TEAM-HOSTKEY line, right before TEAM-RESULT" \
+  '[[ $(hostkey_lines $LOG) == 1 && $(tail -n 2 $LOG | head -n 1) == "TEAM-HOSTKEY $(hostkey_of ed25519)" && $(tail -n 1 $LOG) == "TEAM-RESULT ok" ]]'
+ok_if "  … type and base64 only: the key comment (hostname) is never printed" '! grep -q srvtest-hostname $LOG'
+provision_run "$T/b-bad" > "$LOG" 2>&1
+ok_if "  … also printed when provision fails (before TEAM-RESULT fail)" '[[ $(tail -n 2 $LOG | head -n 1) == "TEAM-HOSTKEY $(hostkey_of ed25519)" && $(tail -n 1 $LOG) == "TEAM-RESULT fail"* ]]'
+
 expect_rc 0 "plan (no --apply) for pgapp staging" provision_run "$T/b-pg-s"
 cp "$LOG" "$T/plan.out"
 ok_if "plan lists the user, database, env file, vhost, units, keys and sudo rule" \
