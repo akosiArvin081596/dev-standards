@@ -1,0 +1,55 @@
+# Managed by dev-standards (synced by team-sync; never edit in a project).
+name: Client request
+description: A change the client asked for, turned into checkable work.
+labels: ["client-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This repository is public.** Paraphrase the request: never paste client messages that contain names, emails, phone numbers, customer records, prices agreed in private, secrets, or server details.
+  - type: textarea
+    id: request
+    attributes:
+      label: Request
+      description: What the client wants, in plain words, and the reason if they gave one.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: One checkable statement per line, written so the client can confirm each on staging.
+    validations:
+      required: true
+  - type: textarea
+    id: likely-files
+    attributes:
+      label: Likely files
+      description: One path or glob per line. The conflict check uses this to decide which issues can run in parallel.
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - Normal
+        - High
+        - Urgent
+    validations:
+      required: false
+  - type: input
+    id: deadline
+    attributes:
+      label: Deadline
+      description: Date (and time, if it matters) with the timezone.
+      placeholder: 2026-10-20 5:00 PM Asia/Manila
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: This issue contains no customer data, real names, emails, phone numbers, secrets or server details.
+          required: true

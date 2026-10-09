@@ -1,0 +1,57 @@
+# Managed by dev-standards (synced by team-sync; never edit in a project).
+name: Feature
+description: A new capability or a change to how something works. Ships behind a feature flag.
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This repository is public.** Never include customer data, real names, emails, phone numbers, addresses, payment details, secrets, or server details. Use made-up values in examples.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What should be possible afterwards, for whom, and why.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: One checkable statement per line. These are what review and QA check.
+      placeholder: |
+        - A signed-in user can export their orders as CSV from /orders
+        - Times in the export name the project timezone
+    validations:
+      required: true
+  - type: textarea
+    id: likely-files
+    attributes:
+      label: Likely files
+      description: One path or glob per line. The conflict check uses this to decide which issues can run in parallel.
+      placeholder: |
+        src/orders/**
+        e2e/orders.spec.*
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Related things this issue should not change.
+    validations:
+      required: false
+  - type: textarea
+    id: rollout
+    attributes:
+      label: Rollout notes
+      description: Who approves it on staging, and anything about turning the flag on in production.
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: This issue contains no customer data, real names, emails, phone numbers, secrets or server details.
+          required: true
