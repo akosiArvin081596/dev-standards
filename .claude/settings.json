@@ -12,6 +12,9 @@
   "enabledPlugins": {
     "team@dev-standards": true
   },
+  "enabledMcpjsonServers": [
+    "playwright"
+  ],
   "autoMemoryEnabled": false,
   "worktree": {
     "bgIsolation": "none"
