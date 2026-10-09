@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-bootstrap-repo: bring a repo's GitHub settings to the pack's design (plan by default).
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-bootstrap-repo <owner/repo> [--profile project|standards|template] [--apply]
+                           [--timezone <IANA>] [--create [--visibility public|private]]
+
+Reads the repo's current GitHub settings and prints one line per item:
+[ok] already right, [create]/[update]/[delete] what --apply changes, [skip] not
+applicable, [missing] values only you or team-provision can supply, [fail] unreadable.
+Nothing changes without --apply. Safe to run again at any time.
+
+Acts as the repo owner's login, which must have an `account|` line in accounts.conf.
+
+What it sets (docs/rules.md §2–§3; profile default: project):
+  - ruleset "main" on the default branch: PR required with 0 approvals, squash only,
+    the profile's required checks (GitHub Actions checks bound to the Actions app,
+    ai-* statuses from any source), no force push, no deletion, repository admins
+    may bypass by PR only
+  - ruleset "release-tags" on refs/tags/v*: no create/update/delete except admins
+  - squash merges only (PR title, blank message), delete branch on merge, auto-merge,
+    is_template (profile template)
+  - secret scanning + push protection, Dependabot alerts + security updates, CodeQL
+    default setup when GitHub detects a supported language, immutable releases
+  - Actions: allowed, actions pinned to a full commit SHA, approval for fork PRs from
+    all outside contributors, default token read-only and unable to approve PRs
+  - the labels in config/labels.json (created or updated)
+  - project profile: environments staging and production, deploying from main only;
+    production needs the owner's (OWNER_LOGIN) approval, self-review allowed
+  - variable OWNER_LOGIN (always): OWNER_LOGIN from defaults.conf, else the repo owner;
+    the guarded-paths gate, team-gh and team-merge-if-green use it as the owner
+  - variable PROJECT_TIMEZONE from ops/project.conf (when run inside that project), or
+    --timezone; otherwise skipped with a note
+  - secret RELEASE_PLEASE_TOKEN (project and standards profiles), piped from the macOS
+    keychain item team-release-please-token (store it once with team-store-token);
+    lists other missing secrets, never invents values
+  - invites the agent account (accounts.conf `agent|` line) as a collaborator, if set
+
+Options:
+  --profile P        project (default), standards or template
+  --apply            make the changes (the owner's yes)
+  --timezone TZ      IANA name for PROJECT_TIMEZONE when there is no ops/project.conf
+  --create           when the repo doesn't exist, generate it from the template repo
+                     (akosiArvin081596/project-starter) first; project profile only
+  --visibility V     public (default) or private, with --create
+
+Private repos on GitHub Free: prints which settings GitHub won't allow (rulesets,
+environments, secret and code scanning, auto-merge), applies the rest, and tells you to
+switch the project to the private fallback (team-merge-if-green, team-deploy).
+
+Config files: $TEAM_STANDARDS_DIR/config, else the dev-standards clone this command
+runs from, else downloaded from GitHub (TEAM_STANDARDS_REF, the project's lock, or v1).
+
+Exit codes: 0 plan shown / applied; 1 failure (a read or change failed, repo missing);
+2 usage; 5 missing prerequisite (account, gh login, admin rights, config);
+6 applied, but waiting for you (for example run team-store-token).
+EOF
+}
+
+SLUG=""
+PROFILE="project"
+CREATE=0
+VISIBILITY=""
+FLAG_TZ=""
+need_value() { [ "$2" -ge 2 ] || team_usage_error "$1 needs a value"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --apply) TEAM_APPLY=1 ;;
+    --profile) need_value "$1" $#; PROFILE="$2"; shift ;;
+    --profile=*) PROFILE="${1#--profile=}" ;;
+    --create) CREATE=1 ;;
+    --visibility) need_value "$1" $#; VISIBILITY="$2"; shift ;;
+    --visibility=*) VISIBILITY="${1#--visibility=}" ;;
+    --timezone) need_value "$1" $#; FLAG_TZ="$2"; shift ;;
+    --timezone=*) FLAG_TZ="${1#--timezone=}" ;;
+    -*) team_usage_error "unknown option $1" ;;
+    *) [ -z "$SLUG" ] || team_usage_error "only one repo"; SLUG="$1" ;;
+  esac
+  shift
+done
+
+[ -n "$SLUG" ] || team_usage_error "missing <owner/repo>"
+tg_valid_slug "$SLUG" || team_usage_error "not an owner/repo: $SLUG"
+tg_valid_profile "$PROFILE" || team_usage_error "profile must be one of: $TG_PROFILES"
+if [ -n "$VISIBILITY" ] && [ "$CREATE" != 1 ]; then team_usage_error "--visibility goes with --create"; fi
+VISIBILITY="${VISIBILITY:-public}"
+case "$VISIBILITY" in public|private) ;; *) team_usage_error "--visibility must be public or private" ;; esac
+if [ "$CREATE" = 1 ] && [ "$PROFILE" != "project" ]; then
+  team_usage_error "--create makes project repos from the template; use --profile project"
+fi
+if [ -n "$FLAG_TZ" ] && ! tg_valid_tz "$FLAG_TZ"; then team_usage_error "not an IANA timezone: $FLAG_TZ"; fi
+
+team_require_cmd jq
+OWNER="${SLUG%%/*}"
+TG_LOGIN=""
+while IFS='|' read -r kind login rest; do
+  [ "$kind" = "account" ] || continue
+  if [ "$(tg_lower "$login")" = "$(tg_lower "$OWNER")" ]; then TG_LOGIN="$login"; break; fi
+done <<EOF
+$(team_accounts)
+EOF
+[ -n "$TG_LOGIN" ] || team_die "$TEAM_EXIT_PREREQ" "$OWNER has no account| line in $TEAM_CONFIG_DIR/accounts.conf; bootstrap acts as the repo owner"
+SLUG="$TG_LOGIN/${SLUG#*/}"
+NAME="${SLUG#*/}"
+tg_require_login "$TG_LOGIN"
+tg_tmp_init
+
+# The owner whose yes counts (owner-approved, production approval): OWNER_LOGIN from
+# defaults.conf, else the repo owner. Stored as the repo variable OWNER_LOGIN so the
+# guarded-paths gate, team-gh and team-merge-if-green agree.
+OWNER_VAR=$(team_default OWNER_LOGIN "")
+[ -n "$OWNER_VAR" ] || OWNER_VAR="$TG_LOGIN"
+printf '%s' "$OWNER_VAR" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$' \
+  || team_die "$TEAM_EXIT_NOT_CONFIGURED" "OWNER_LOGIN in defaults.conf is not a GitHub login: $OWNER_VAR"
+
+tg_config_file required-checks.json
+tg_config_file labels.json
+CHECKS_JSON=$(tg_required_checks_json "$PROFILE")
+LABELS_JSON=$(tg_labels_json)
+
+POLL_TRIES="${TEAM_BOOTSTRAP_POLL_TRIES:-10}"
+POLL_SLEEP="${TEAM_BOOTSTRAP_POLL_SLEEP:-2}"
+
+# ------------------------------------------------------------ output helpers
+
+N_OK=0
+N_CHANGE=0
+N_FAIL=0
+OWNER_ACTION=0
+line() { printf '%-10s %s\n' "$1" "$2"; }
+ok() { line "[ok]" "$*"; N_OK=$((N_OK + 1)); }
+skip() { line "[skip]" "$*"; }
+note() { line "[note]" "$*"; }
+missing() { line "[missing]" "$*"; }
+readfail() { line "[fail]" "$*"; N_FAIL=$((N_FAIL + 1)); }
+section() { printf '\n== %s\n' "$*"; }
+first_line() { tg_printable "$1" | head -n 1; }
+
+# change <create|update|delete> <description> <method> <path> [body] : plan line; with --apply, do it
+change() {
+  local kind="$1" desc="$2"
+  shift 2
+  line "[$kind]" "$desc"
+  N_CHANGE=$((N_CHANGE + 1))
+  [ "$TEAM_APPLY" = 1 ] || return 0
+  tg_api_try "$@"
+  if [ "$TG_RC" = 0 ]; then
+    line "" "done"
+    return 0
+  fi
+  N_FAIL=$((N_FAIL + 1))
+  line "" "FAILED: $(first_line "$TG_ERR")"
+  return 1
+}
+
+# json_diff <desired> <current> : "key current→desired" for every key that differs
+json_diff() {
+  jq -rn --argjson d "$1" --argjson c "$2" '
+    ($c | if type == "object" then . else {} end) as $c
+    | [ $d | keys_unsorted[] as $k
+        | select(($c | has($k) | not) or $c[$k] != $d[$k])
+        | "\($k) \(if ($c | has($k)) then ($c[$k] | tostring) else "unset" end)→\($d[$k] | tostring)" ]
+    | join(", ")'
+}
+
+# settings_item <label> <get-path> <method> <set-path> <desired-json>
+settings_item() {
+  local label="$1" get="$2" method="$3" set="$4" desired="$5" current diff
+  if [ "$NEW_REPO" = 1 ]; then
+    current='{}'
+  else
+    tg_api_try GET "$get"
+    if [ "$TG_RC" != 0 ]; then readfail "$label: could not read (HTTP ${TG_HTTP:-?}): $(first_line "$TG_ERR")"; return 0; fi
+    current="$TG_OUT"
+    printf '%s' "$current" | jq -e . >/dev/null 2>&1 || current='{}'
+  fi
+  diff=$(json_diff "$desired" "$current")
+  if [ -z "$diff" ]; then ok "$label"; else change update "$label: $diff" "$method" "$set" "$desired" || true; fi
+}
+
+# ------------------------------------------------------------ repository (and --create)
+
+MODE="plan only"
+[ "$TEAM_APPLY" = 1 ] && MODE="applying"
+printf 'team-bootstrap-repo: %s (profile %s, acting as %s) — %s\n' "$SLUG" "$PROFILE" "$TG_LOGIN" "$MODE"
+
+NEW_REPO=0
+REPO_JSON=""
+section "Repository"
+tg_api_try GET "repos/$SLUG"
+if [ "$TG_RC" = 0 ]; then
+  REPO_JSON="$TG_OUT"
+  ok "repository $SLUG exists"
+elif [ "$TG_HTTP" = 404 ]; then
+  [ "$CREATE" = 1 ] || team_die "$TEAM_EXIT_FAIL" "$SLUG not found (or $TG_LOGIN can't see it); to generate it from $TEAM_TEMPLATE_REPO add --create"
+  private=false
+  [ "$VISIBILITY" = private ] && private=true
+  body=$(jq -cn --arg o "$TG_LOGIN" --arg n "$NAME" --argjson p "$private" \
+    '{owner: $o, name: $n, private: $p, include_all_branches: false}')
+  change create "repository $SLUG ($VISIBILITY) from template $TEAM_TEMPLATE_REPO" \
+    POST "repos/$TEAM_TEMPLATE_REPO/generate" "$body" \
+    || team_die "$TEAM_EXIT_FAIL" "could not generate $SLUG from $TEAM_TEMPLATE_REPO"
+  if [ "$TEAM_APPLY" = 1 ]; then
+    tries=0
+    ready=0
+    while [ "$tries" -lt "$POLL_TRIES" ]; do
+      tries=$((tries + 1))
+      tg_api_try GET "repos/$SLUG"
+      if [ "$TG_RC" = 0 ]; then
+        REPO_JSON="$TG_OUT"
+        branch=$(printf '%s' "$REPO_JSON" | jq -r '.default_branch // empty')
+        if [ -n "$branch" ]; then
+          tg_api_try GET "repos/$SLUG/branches/$branch"
+          if [ "$TG_RC" = 0 ]; then ready=1; break; fi
+        fi
+      fi
+      [ "$tries" -ge "$POLL_TRIES" ] || sleep "$POLL_SLEEP"
+    done
+    [ "$ready" = 1 ] || team_die "$TEAM_EXIT_FAIL" "$SLUG was created but its default branch isn't ready yet; re-run without --create in a minute"
+    line "" "default branch ${branch} is ready"
+  else
+    NEW_REPO=1
+    note "the repo doesn't exist yet: the plan below assumes an empty repo; --apply reads the real state after creating it"
+  fi
+else
+  team_die "$TEAM_EXIT_FAIL" "reading $SLUG failed: $(first_line "$TG_ERR")"
+fi
+
+if [ "$NEW_REPO" = 1 ]; then
+  PRIVATE=false
+  [ "$VISIBILITY" = private ] && PRIVATE=true
+  OWNER_TYPE=User
+else
+  [ "$(printf '%s' "$REPO_JSON" | jq -r '.archived // false')" != true ] || team_die "$TEAM_EXIT_FAIL" "$SLUG is archived"
+  [ "$(printf '%s' "$REPO_JSON" | jq -r '.permissions.admin // false')" = true ] \
+    || team_die "$TEAM_EXIT_PREREQ" "$TG_LOGIN has no admin rights on $SLUG"
+  PRIVATE=$(printf '%s' "$REPO_JSON" | jq -r '.private // false')
+  OWNER_TYPE=$(printf '%s' "$REPO_JSON" | jq -r '.owner.type // "User"')
+fi
+
+FREE_PRIVATE=0
+if [ "$PRIVATE" = true ]; then
+  plan="unknown"
+  if [ "$OWNER_TYPE" = User ]; then
+    tg_api_try GET user
+    [ "$TG_RC" = 0 ] && plan=$(printf '%s' "$TG_OUT" | jq -r '.plan.name // "unknown"')
+  else
+    tg_api_try GET "orgs/$TG_LOGIN"
+    [ "$TG_RC" = 0 ] && plan=$(printf '%s' "$TG_OUT" | jq -r '.plan.name // "unknown"')
+  fi
+  case "$plan" in free|unknown|"") FREE_PRIVATE=1 ;; esac
+  if [ "$FREE_PRIVATE" = 1 ]; then
+    note "private repo on GitHub plan '$plan': rulesets, environments, secret and code scanning and auto-merge are not available (see the end)"
+  else
+    note "private repo on GitHub plan '$plan'"
+  fi
+fi
+
+# ------------------------------------------------------------ repository settings
+
+section "Repository settings"
+is_template=false
+[ "$PROFILE" = template ] && is_template=true
+DESIRED_SETTINGS=$(tg_desired_settings_json "$is_template" "$FREE_PRIVATE")
+[ "$FREE_PRIVATE" = 0 ] || skip "auto-merge: not available for private repos on GitHub Free"
+current='{}'
+[ "$NEW_REPO" = 1 ] || current="$REPO_JSON"
+diff=$(json_diff "$DESIRED_SETTINGS" "$current")
+if [ -z "$diff" ]; then
+  ok "merge settings: squash only (PR title, blank message), delete branch on merge, auto-merge, is_template=$is_template"
+else
+  change update "merge settings: $diff" PATCH "repos/$SLUG" "$DESIRED_SETTINGS" || true
+fi
+
+# ------------------------------------------------------------ security
+
+section "Security"
+if [ "$FREE_PRIVATE" = 1 ]; then
+  skip "secret scanning + push protection: not available for private repos on GitHub Free"
+else
+  ss="unset"
+  pp="unset"
+  if [ "$NEW_REPO" = 0 ]; then
+    ss=$(printf '%s' "$REPO_JSON" | jq -r '.security_and_analysis.secret_scanning.status // "unset"')
+    pp=$(printf '%s' "$REPO_JSON" | jq -r '.security_and_analysis.secret_scanning_push_protection.status // "unset"')
+  fi
+  if [ "$ss" = enabled ] && [ "$pp" = enabled ]; then
+    ok "secret scanning + push protection"
+  else
+    change update "secret scanning ${ss}→enabled, push protection ${pp}→enabled" PATCH "repos/$SLUG" \
+      '{"security_and_analysis":{"secret_scanning":{"status":"enabled"},"secret_scanning_push_protection":{"status":"enabled"}}}' || true
+  fi
+fi
+
+alerts=off
+if [ "$NEW_REPO" = 0 ]; then
+  tg_api_try GET "repos/$SLUG/vulnerability-alerts"
+  if [ "$TG_RC" = 0 ]; then alerts=on
+  elif [ "$TG_HTTP" = 404 ]; then alerts=off
+  else alerts=unknown; readfail "Dependabot alerts: could not read (HTTP ${TG_HTTP:-?})"
+  fi
+fi
+case "$alerts" in
+  on) ok "Dependabot alerts" ;;
+  off) change update "Dependabot alerts: off→on" PUT "repos/$SLUG/vulnerability-alerts" || true ;;
+esac
+
+fixes=false
+if [ "$NEW_REPO" = 0 ]; then
+  tg_api_try GET "repos/$SLUG/automated-security-fixes"
+  if [ "$TG_RC" = 0 ]; then fixes=$(printf '%s' "$TG_OUT" | jq -r '.enabled // false')
+  elif [ "$TG_HTTP" = 404 ]; then fixes=false
+  else fixes=unknown; readfail "Dependabot security updates: could not read (HTTP ${TG_HTTP:-?})"
+  fi
+fi
+case "$fixes" in
+  true) ok "Dependabot security updates" ;;
+  false) change update "Dependabot security updates: off→on" PUT "repos/$SLUG/automated-security-fixes" || true ;;
+esac
+
+if [ "$FREE_PRIVATE" = 1 ]; then
+  skip "CodeQL default setup: code scanning is not available for private repos on GitHub Free"
+elif [ "$NEW_REPO" = 1 ]; then
+  note "CodeQL default setup: decided after creation, once GitHub has detected the languages"
+else
+  tg_api_try GET "repos/$SLUG/code-scanning/default-setup"
+  if [ "$TG_RC" = 0 ]; then
+    cq_state=$(printf '%s' "$TG_OUT" | jq -r '.state // "not-configured"')
+    cq_langs=$(printf '%s' "$TG_OUT" | jq -r '(.languages // []) | join(" ")')
+    if [ "$cq_state" = configured ]; then
+      ok "CodeQL default setup (${cq_langs:-no languages})"
+    elif [ -n "$cq_langs" ]; then
+      change create "CodeQL default setup (detected: $cq_langs)" PATCH "repos/$SLUG/code-scanning/default-setup" \
+        '{"state":"configured","query_suite":"default"}' || true
+    else
+      skip "CodeQL default setup: no supported language detected yet"
+    fi
+  elif [ "$TG_HTTP" = 403 ] || [ "$TG_HTTP" = 404 ]; then
+    skip "CodeQL default setup: code scanning not available here (HTTP $TG_HTTP)"
+  else
+    readfail "CodeQL default setup: could not read (HTTP ${TG_HTTP:-?}): $(first_line "$TG_ERR")"
+  fi
+fi
+
+immutable=false
+if [ "$NEW_REPO" = 0 ]; then
+  tg_api_try GET "repos/$SLUG/immutable-releases"
+  if [ "$TG_RC" = 0 ]; then immutable=$(printf '%s' "$TG_OUT" | jq -r '.enabled // false')
+  elif [ "$TG_HTTP" = 404 ]; then immutable=false
+  else immutable=unknown; readfail "immutable releases: could not read (HTTP ${TG_HTTP:-?})"
+  fi
+fi
+case "$immutable" in
+  true) ok "immutable releases" ;;
+  false) change update "immutable releases: off→on" PUT "repos/$SLUG/immutable-releases" || true ;;
+esac
+
+# ------------------------------------------------------------ actions
+
+section "GitHub Actions"
+settings_item "Actions allowed, pinned to full commit SHAs" "repos/$SLUG/actions/permissions" PUT \
+  "repos/$SLUG/actions/permissions" '{"enabled":true,"allowed_actions":"all","sha_pinning_required":true}'
+if [ "$PRIVATE" = true ]; then
+  skip "fork PR approval policy: applies to public repos (private repos don't run fork PRs by default)"
+else
+  settings_item "fork PRs from all outside contributors need approval" \
+    "repos/$SLUG/actions/permissions/fork-pr-contributor-approval" PUT \
+    "repos/$SLUG/actions/permissions/fork-pr-contributor-approval" '{"approval_policy":"all_external_contributors"}'
+fi
+settings_item "default workflow token read-only, can't approve PRs" "repos/$SLUG/actions/permissions/workflow" PUT \
+  "repos/$SLUG/actions/permissions/workflow" '{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}'
+
+# ------------------------------------------------------------ rulesets
+
+describe_checks() {
+  printf '%s' "$CHECKS_JSON" | jq -r '[ .[] | if .integration_id == null then "\(.context) [any source]" else "\(.context) [GitHub Actions app \(.integration_id)]" end ] | join(", ")'
+}
+
+RULESETS='[]'
+ruleset_item() {
+  local desired="$1" desc="$2" name target id current d
+  name=$(printf '%s' "$desired" | jq -r .name)
+  target=$(printf '%s' "$desired" | jq -r .target)
+  id=$(printf '%s' "$RULESETS" | jq -r --arg n "$name" --arg t "$target" 'first(.[] | select(.name == $n and .target == $t) | .id) // empty')
+  if [ -z "$id" ]; then
+    change create "ruleset \"$name\": $desc" POST "repos/$SLUG/rulesets" "$desired" || ruleset_hint
+    return 0
+  fi
+  tg_api_try GET "repos/$SLUG/rulesets/$id"
+  if [ "$TG_RC" != 0 ]; then readfail "ruleset \"$name\": could not read (HTTP ${TG_HTTP:-?})"; return 0; fi
+  current="$TG_OUT"
+  if tg_ruleset_matches "$desired" "$current"; then
+    ok "ruleset \"$name\""
+  else
+    d=$(tg_ruleset_diff "$desired" "$current")
+    change update "ruleset \"$name\" (differs: $d): $desc" PUT "repos/$SLUG/rulesets/$id" "$desired" || ruleset_hint
+  fi
+}
+ruleset_hint() {
+  line "" "hint: a check bound to the GitHub Actions app needs at least one recent Actions run in this repo"
+}
+
+section "Rulesets"
+if [ "$FREE_PRIVATE" = 1 ]; then
+  skip "rulesets \"main\" and \"release-tags\": not enforced on private repos on GitHub Free"
+else
+  if [ "$NEW_REPO" = 0 ]; then
+    tg_api_try GET "repos/$SLUG/rulesets?includes_parents=false&per_page=100"
+    if [ "$TG_RC" = 0 ]; then RULESETS="$TG_OUT"; else readfail "rulesets: could not list (HTTP ${TG_HTTP:-?})"; fi
+  fi
+  ruleset_item "$(tg_branch_ruleset_json "$CHECKS_JSON")" \
+    "default branch: PR required (0 approvals, squash only), no force push, no deletion, repository admins bypass by PR only; required: $(describe_checks)"
+  ruleset_item "$(tg_tag_ruleset_json)" \
+    "refs/tags/v*: no create, update or delete except repository admins (release-please's token)"
+  others=$(printf '%s' "$RULESETS" | jq -r '[ .[]? | select(.name != "main" and .name != "release-tags") | "\(.name) (\(.target))" ] | join(", ")')
+  [ -z "$others" ] || note "other rulesets on this repo: $others (check they don't conflict)"
+fi
+
+# ------------------------------------------------------------ labels
+
+section "Labels"
+CURRENT_LABELS='[]'
+if [ "$NEW_REPO" = 0 ]; then
+  tg_api_try GET "repos/$SLUG/labels?per_page=100"
+  if [ "$TG_RC" = 0 ]; then CURRENT_LABELS="$TG_OUT"; else readfail "labels: could not list (HTTP ${TG_HTTP:-?})"; fi
+fi
+while IFS= read -r item; do
+  [ -n "$item" ] || continue
+  lname=$(printf '%s' "$item" | jq -r .name)
+  lcolor=$(printf '%s' "$item" | jq -r .color)
+  ldesc=$(printf '%s' "$item" | jq -r .description)
+  cur=$(printf '%s' "$CURRENT_LABELS" | jq -c --arg n "$(tg_lower "$lname")" 'first(.[]? | select((.name | ascii_downcase) == $n)) // empty')
+  if [ -z "$cur" ]; then
+    change create "label $lname (#$lcolor)" POST "repos/$SLUG/labels" \
+      "$(jq -cn --arg n "$lname" --arg c "$lcolor" --arg d "$ldesc" '{name: $n, color: $c, description: $d}')" || true
+    continue
+  fi
+  cname=$(printf '%s' "$cur" | jq -r .name)
+  ccolor=$(printf '%s' "$cur" | jq -r '.color // "" | ascii_downcase')
+  cdesc=$(printf '%s' "$cur" | jq -r '.description // ""')
+  if [ "$cname" = "$lname" ] && [ "$ccolor" = "$lcolor" ] && [ "$cdesc" = "$ldesc" ]; then
+    ok "label $lname"
+  else
+    what=""
+    [ "$cname" = "$lname" ] || what="$what name ${cname}→$lname;"
+    [ "$ccolor" = "$lcolor" ] || what="$what color ${ccolor}→$lcolor;"
+    [ "$cdesc" = "$ldesc" ] || what="$what description;"
+    change update "label $lname:${what%;}" PATCH "repos/$SLUG/labels/$(jq -rn --arg s "$cname" '$s | @uri')" \
+      "$(jq -cn --arg n "$lname" --arg c "$lcolor" --arg d "$ldesc" '{new_name: $n, color: $c, description: $d}')" || true
+  fi
+done <<EOF
+$(printf '%s' "$LABELS_JSON" | jq -c '.[]')
+EOF
+
+# ------------------------------------------------------------ environments
+
+BRANCH_POLICY='{"protected_branches":false,"custom_branch_policies":true}'
+env_item() {
+  local env="$1" rid="$2" body desc exists=0 cur problems="" policies extras
+  if [ -n "$rid" ]; then
+    body=$(jq -cn --argjson id "$rid" --argjson bp "$BRANCH_POLICY" \
+      '{wait_timer: 0, prevent_self_review: false, reviewers: [{type: "User", id: $id}], deployment_branch_policy: $bp}')
+    desc="environment $env: deploys from main only, $OWNER_VAR must approve (self-review allowed)"
+  else
+    body=$(jq -cn --argjson bp "$BRANCH_POLICY" '{wait_timer: 0, deployment_branch_policy: $bp}')
+    desc="environment $env: deploys from main only"
+  fi
+  if [ "$NEW_REPO" = 0 ]; then
+    tg_api_try GET "repos/$SLUG/environments/$env"
+    if [ "$TG_RC" = 0 ]; then exists=1; cur="$TG_OUT"
+    elif [ "$TG_HTTP" != 404 ]; then readfail "environment $env: could not read (HTTP ${TG_HTTP:-?})"; return 0
+    fi
+  fi
+  if [ "$exists" = 0 ]; then
+    change create "$desc" PUT "repos/$SLUG/environments/$env" "$body" || return 0
+    change create "environment $env: branch policy main" POST "repos/$SLUG/environments/$env/deployment-branch-policies" \
+      '{"name":"main","type":"branch"}' || true
+    return 0
+  fi
+  printf '%s' "$cur" | jq -e --argjson bp "$BRANCH_POLICY" '.deployment_branch_policy == $bp' >/dev/null || problems="$problems branch policy;"
+  printf '%s' "$cur" | jq -e '([.protection_rules[]? | select(.type == "wait_timer") | .wait_timer] | max // 0) == 0' >/dev/null || problems="$problems wait timer;"
+  if [ -n "$rid" ]; then
+    printf '%s' "$cur" | jq -e --argjson id "$rid" 'any(.protection_rules[]?; .type == "required_reviewers"
+        and ((.prevent_self_review // false) == false) and any(.reviewers[]?; .reviewer.id == $id))' >/dev/null \
+      || problems="$problems owner approval;"
+  elif printf '%s' "$cur" | jq -e 'any(.protection_rules[]?; .type == "required_reviewers")' >/dev/null; then
+    note "environment $env has required reviewers; staging deploys would wait (remove them in Settings → Environments)"
+  fi
+  if [ -z "$problems" ]; then
+    ok "environment $env"
+  else
+    change update "$desc (fix:${problems%;})" PUT "repos/$SLUG/environments/$env" "$body" || return 0
+  fi
+  policies='[]'
+  tg_api_try GET "repos/$SLUG/environments/$env/deployment-branch-policies?per_page=100"
+  [ "$TG_RC" = 0 ] && policies=$(printf '%s' "$TG_OUT" | jq -c '.branch_policies // []')
+  if printf '%s' "$policies" | jq -e 'any(.[]; .name == "main" and ((.type // "branch") == "branch"))' >/dev/null; then
+    ok "environment $env: branch policy main"
+  else
+    change create "environment $env: branch policy main" POST "repos/$SLUG/environments/$env/deployment-branch-policies" \
+      '{"name":"main","type":"branch"}' || true
+  fi
+  extras=$(printf '%s' "$policies" | jq -r '.[] | select((.name == "main" and ((.type // "branch") == "branch")) | not) | "\(.id)|\(.name)|\(.type // "branch")"')
+  while IFS='|' read -r pid pname ptype; do
+    [ -n "$pid" ] || continue
+    change delete "environment $env: remove branch policy $pname ($ptype); deploys come from main only" \
+      DELETE "repos/$SLUG/environments/$env/deployment-branch-policies/$pid" || true
+  done <<EOF
+$extras
+EOF
+}
+
+section "Environments"
+ENVS_EXIST=0
+if [ "$PROFILE" != project ]; then
+  skip "environments: only project repos deploy (profile $PROFILE)"
+elif [ "$FREE_PRIVATE" = 1 ]; then
+  skip "environments staging/production: not available for private repos on GitHub Free (production deploys run with team-deploy)"
+else
+  ENVS_EXIST=1
+  env_item staging ""
+  OWNER_ID=""
+  tg_api_try GET "users/$OWNER_VAR"
+  [ "$TG_RC" = 0 ] && OWNER_ID=$(printf '%s' "$TG_OUT" | jq -r '.id // empty')
+  if [ -n "$OWNER_ID" ]; then
+    env_item production "$OWNER_ID"
+  else
+    readfail "environment production: could not read the user id of $OWNER_VAR"
+  fi
+fi
+
+# ------------------------------------------------------------ variables
+
+section "Variables"
+# var_item <name> <value> : create or update one repo variable
+var_item() {
+  local name="$1" value="$2" vbody cur
+  vbody=$(jq -cn --arg n "$name" --arg v "$value" '{name: $n, value: $v}')
+  if [ "$NEW_REPO" = 1 ]; then
+    change create "variable $name=$value" POST "repos/$SLUG/actions/variables" "$vbody" || true
+    return 0
+  fi
+  tg_api_try GET "repos/$SLUG/actions/variables/$name"
+  if [ "$TG_RC" = 0 ]; then
+    cur=$(printf '%s' "$TG_OUT" | jq -r '.value // ""')
+    if [ "$cur" = "$value" ]; then
+      ok "variable $name=$value"
+    else
+      change update "variable $name: ${cur}→$value" PATCH "repos/$SLUG/actions/variables/$name" "$vbody" || true
+    fi
+  elif [ "$TG_HTTP" = 404 ]; then
+    change create "variable $name=$value" POST "repos/$SLUG/actions/variables" "$vbody" || true
+  else
+    readfail "variable $name: could not read (HTTP ${TG_HTTP:-?})"
+  fi
+}
+
+var_item OWNER_LOGIN "$OWNER_VAR"
+
+PC_TZ=""
+if git rev-parse --show-toplevel >/dev/null 2>&1 && git config --get remote.origin.url >/dev/null 2>&1 \
+   && tg_same_repo "$(team_origin_repo .)" "$SLUG"; then
+  PC_TZ=$(team_project_conf_get PROJECT_TIMEZONE "")
+fi
+if [ -n "$PC_TZ" ] && [ -n "$FLAG_TZ" ] && [ "$PC_TZ" != "$FLAG_TZ" ]; then
+  team_usage_error "--timezone $FLAG_TZ conflicts with PROJECT_TIMEZONE=$PC_TZ in ops/project.conf"
+fi
+TZV="${PC_TZ:-$FLAG_TZ}"
+if [ -n "$TZV" ] && ! tg_valid_tz "$TZV"; then
+  readfail "PROJECT_TIMEZONE: '$TZV' in ops/project.conf is not an IANA timezone"
+  TZV=""
+fi
+if [ -n "$TZV" ]; then
+  var_item PROJECT_TIMEZONE "$TZV"
+elif [ "$PROFILE" = project ]; then
+  skip "PROJECT_TIMEZONE: unknown (run inside the project with ops/project.conf, or pass --timezone <IANA>); team-verify-repo will fail until it's set"
+else
+  skip "PROJECT_TIMEZONE: not needed for profile $PROFILE (pass --timezone to set it)"
+fi
+
+# ------------------------------------------------------------ secrets (names only; values never read)
+
+section "Secrets"
+SECRET_NAMES='[]'
+if [ "$NEW_REPO" = 0 ]; then
+  tg_api_try GET "repos/$SLUG/actions/secrets?per_page=100"
+  if [ "$TG_RC" = 0 ]; then SECRET_NAMES=$(printf '%s' "$TG_OUT" | jq -c '[.secrets[]?.name]')
+  else readfail "secrets: could not list names (HTTP ${TG_HTTP:-?})"
+  fi
+fi
+has_secret() { printf '%s' "$1" | jq -e --arg n "$2" 'any(.[]; . == $n)' >/dev/null; }
+
+KEYCHAIN_ITEM="team-release-please-token"
+if [ "$PROFILE" = template ]; then
+  skip "secret RELEASE_PLEASE_TOKEN: the template repo never releases"
+elif has_secret "$SECRET_NAMES" RELEASE_PLEASE_TOKEN; then
+  ok "secret RELEASE_PLEASE_TOKEN (value never read back)"
+else
+  line "[create]" "secret RELEASE_PLEASE_TOKEN from keychain item $KEYCHAIN_ITEM (piped, never printed)"
+  N_CHANGE=$((N_CHANGE + 1))
+  if [ "$TEAM_APPLY" = 1 ]; then
+    if ! command -v security >/dev/null 2>&1; then
+      line "" "WAITING: no macOS keychain here; set the secret yourself: gh secret set RELEASE_PLEASE_TOKEN --repo $SLUG"
+      OWNER_ACTION=1
+    elif ! security find-generic-password -s "$KEYCHAIN_ITEM" >/dev/null 2>&1; then
+      line "" "WAITING: keychain item $KEYCHAIN_ITEM is missing; run team-store-token in a normal terminal, then re-run"
+      OWNER_ACTION=1
+    elif security find-generic-password -s "$KEYCHAIN_ITEM" -w 2>/dev/null | tr -d '\r\n' \
+         | team_gh_as "$TG_LOGIN" secret set RELEASE_PLEASE_TOKEN --repo "$SLUG" >/dev/null 2>"$TG_TMP/secret.err"; then
+      line "" "done"
+    else
+      N_FAIL=$((N_FAIL + 1))
+      line "" "FAILED: $(first_line "$(cat "$TG_TMP/secret.err")")"
+    fi
+  fi
+fi
+
+if [ "$PROFILE" = project ]; then
+  if has_secret "$SECRET_NAMES" PRODUCTION_HEALTH_URL; then
+    ok "secret PRODUCTION_HEALTH_URL"
+  else
+    missing "repo secret PRODUCTION_HEALTH_URL (team-provision production sets it)"
+  fi
+  if [ "$ENVS_EXIST" = 1 ]; then
+    for env in staging production; do
+      need="DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL"
+      [ "$env" = staging ] && need="$need BASIC_AUTH_USER BASIC_AUTH_PASSWORD"
+      have='[]'
+      if [ "$NEW_REPO" = 0 ]; then
+        tg_api_try GET "repos/$SLUG/environments/$env/secrets?per_page=100"
+        [ "$TG_RC" = 0 ] && have=$(printf '%s' "$TG_OUT" | jq -c '[.secrets[]?.name]')
+      fi
+      lack=""
+      for s in $need; do has_secret "$have" "$s" || lack="$lack $s"; done
+      if [ -z "$lack" ]; then ok "environment $env secrets"; else missing "environment $env secrets:$lack (team-provision $env sets them)"; fi
+    done
+  fi
+fi
+
+# ------------------------------------------------------------ agent account
+
+section "Agent account"
+AGENT=$(team_agent_login)
+if [ -z "$AGENT" ]; then
+  skip "no agent account in accounts.conf (optional; see docs/agent-account.md)"
+elif [ "$(tg_lower "$AGENT")" = "$(tg_lower "$TG_LOGIN")" ]; then
+  skip "agent account is the owner"
+elif [ "$NEW_REPO" = 1 ]; then
+  change create "invite $AGENT as a collaborator (write)" PUT "repos/$SLUG/collaborators/$AGENT" || true
+else
+  tg_api_try GET "repos/$SLUG/collaborators/$AGENT"
+  if [ "$TG_RC" = 0 ]; then
+    ok "agent $AGENT is a collaborator"
+  elif [ "$TG_HTTP" = 404 ]; then
+    tg_api_try GET "repos/$SLUG/invitations?per_page=100"
+    if [ "$TG_RC" = 0 ] && printf '%s' "$TG_OUT" | jq -e --arg a "$(tg_lower "$AGENT")" 'any(.[]?; ((.invitee.login // "") | ascii_downcase) == $a)' >/dev/null; then
+      ok "invitation for $AGENT is pending (accept it as $AGENT)"
+    else
+      change create "invite $AGENT as a collaborator (write)" PUT "repos/$SLUG/collaborators/$AGENT" || true
+    fi
+  else
+    readfail "agent $AGENT: could not read collaborator status (HTTP ${TG_HTTP:-?})"
+  fi
+fi
+
+# ------------------------------------------------------------ private fallback
+
+if [ "$FREE_PRIVATE" = 1 ]; then
+  section "Private repository on GitHub Free"
+  note "GitHub won't allow here: rulesets (main, release-tags), environments with required reviewers and environment secrets, secret scanning + push protection, code scanning, auto-merge"
+  note "everything else above was planned or applied as usual"
+  note "switch the project to the private fallback: agents merge with team-merge-if-green, production deploys run from the Mac with team-deploy production"
+  if git rev-parse --show-toplevel >/dev/null 2>&1 && [ -n "$(git config --get remote.origin.url 2>/dev/null)" ] \
+     && tg_same_repo "$(team_origin_repo .)" "$SLUG" \
+     && [ "$(team_project_conf_get VISIBILITY "")" != private ]; then
+    line "[action]" "set VISIBILITY=private in ops/project.conf"
+    OWNER_ACTION=1
+  fi
+fi
+
+# ------------------------------------------------------------ summary
+
+printf '\nSummary: %d ok, %d to change, %d failed\n' "$N_OK" "$N_CHANGE" "$N_FAIL"
+team_plan_footer
+[ "$N_FAIL" = 0 ] || exit "$TEAM_EXIT_FAIL"
+if [ "$TEAM_APPLY" = 1 ] && [ "$OWNER_ACTION" = 1 ]; then exit "$TEAM_EXIT_OWNER"; fi
+exit 0

@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
+# team-verify-repo: read a repo's GitHub settings back and print a pass/fail table. Read-only.
+set -euo pipefail
+
+TEAM_SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../lib/team-common.sh
+. "$TEAM_SELF_DIR/../lib/team-common.sh"
+# shellcheck source=../lib/team-github.sh
+. "$TEAM_SELF_DIR/../lib/team-github.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: team-verify-repo <owner/repo> [--profile project|standards|template]
+
+Reads everything team-bootstrap-repo sets and prints one row per setting, ruleset,
+required check, label, environment, variable and secret name:
+
+  PASS   as designed            FAIL   differs or missing (exit 1)
+  WARN   worth a look           N/A    not applicable to this repo or profile
+
+Also warns about workflows GitHub disabled: public repos stop scheduled workflows after
+60 days without activity (state disabled_inactivity).
+
+The owner (variable OWNER_LOGIN, production reviewer) is OWNER_LOGIN from defaults.conf,
+else the repo owner. Changes nothing. Acts as the repo owner's login from accounts.conf (secret names and
+rulesets need admin rights to read). Environment secrets are required only once
+team-provision has set STAGING_READY / PRODUCTION_READY; before that they are WARN.
+
+Exit codes: 0 no FAIL; 1 at least one FAIL (or the repo can't be read); 2 usage;
+5 missing prerequisite (account, gh login, config).
+EOF
+}
+
+SLUG=""
+PROFILE="project"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --profile) [ $# -ge 2 ] || team_usage_error "--profile needs a value"; PROFILE="$2"; shift ;;
+    --profile=*) PROFILE="${1#--profile=}" ;;
+    -*) team_usage_error "unknown option $1" ;;
+    *) [ -z "$SLUG" ] || team_usage_error "only one repo"; SLUG="$1" ;;
+  esac
+  shift
+done
+[ -n "$SLUG" ] || team_usage_error "missing <owner/repo>"
+tg_valid_slug "$SLUG" || team_usage_error "not an owner/repo: $SLUG"
+tg_valid_profile "$PROFILE" || team_usage_error "profile must be one of: $TG_PROFILES"
+
+team_require_cmd jq
+OWNER="${SLUG%%/*}"
+TG_LOGIN=""
+while IFS='|' read -r kind login rest; do
+  [ "$kind" = "account" ] || continue
+  if [ "$(tg_lower "$login")" = "$(tg_lower "$OWNER")" ]; then TG_LOGIN="$login"; break; fi
+done <<EOF
+$(team_accounts)
+EOF
+[ -n "$TG_LOGIN" ] || team_die "$TEAM_EXIT_PREREQ" "$OWNER has no account| line in $TEAM_CONFIG_DIR/accounts.conf"
+SLUG="$TG_LOGIN/${SLUG#*/}"
+tg_require_login "$TG_LOGIN"
+tg_tmp_init
+OWNER_VAR=$(team_default OWNER_LOGIN "")
+[ -n "$OWNER_VAR" ] || OWNER_VAR="$TG_LOGIN"
+
+tg_config_file required-checks.json
+tg_config_file labels.json
+CHECKS_JSON=$(tg_required_checks_json "$PROFILE")
+LABELS_JSON=$(tg_labels_json)
+
+N_PASS=0
+N_FAIL=0
+N_WARN=0
+row() {
+  local st="$1" item="$2" detail="${3-}"
+  case "$st" in PASS) N_PASS=$((N_PASS + 1)) ;; FAIL) N_FAIL=$((N_FAIL + 1)) ;; WARN) N_WARN=$((N_WARN + 1)) ;; esac
+  printf '%-5s  %-52s  %s\n' "$st" "$item" "$detail"
+}
+first_line() { tg_printable "$1" | head -n 1; }
+# expect <item> <expected> <actual>
+expect() { if [ "$2" = "$3" ]; then row PASS "$1" "$3"; else row FAIL "$1" "expected $2, got ${3:-unset}"; fi; }
+unreadable() { row FAIL "$1" "could not read (HTTP ${TG_HTTP:-?}): $(first_line "$TG_ERR")"; }
+
+printf 'team-verify-repo: %s (profile %s, read as %s)\n\n' "$SLUG" "$PROFILE" "$TG_LOGIN"
+printf '%-5s  %-52s  %s\n' "STATE" "ITEM" "DETAIL"
+
+# ------------------------------------------------------------ repository
+
+tg_api_try GET "repos/$SLUG"
+if [ "$TG_RC" != 0 ]; then
+  row FAIL "repository" "not readable as $TG_LOGIN (HTTP ${TG_HTTP:-?})"
+  printf '\n%d passed, %d failed, %d warnings\n' "$N_PASS" "$N_FAIL" "$N_WARN"
+  exit "$TEAM_EXIT_FAIL"
+fi
+REPO_JSON="$TG_OUT"
+PRIVATE=$(printf '%s' "$REPO_JSON" | jq -r '.private // false')
+ADMIN=$(printf '%s' "$REPO_JSON" | jq -r '.permissions.admin // false')
+FREE_PRIVATE=0
+if [ "$PRIVATE" = true ]; then
+  plan="unknown"
+  tg_api_try GET user
+  [ "$TG_RC" = 0 ] && plan=$(printf '%s' "$TG_OUT" | jq -r '.plan.name // "unknown"')
+  case "$plan" in free|unknown|"") FREE_PRIVATE=1 ;; esac
+fi
+row PASS "repository" "$(printf '%s' "$REPO_JSON" | jq -r '.visibility // (if .private then "private" else "public" end)')"
+expect "admin rights for $TG_LOGIN" true "$ADMIN"
+if [ "$FREE_PRIVATE" = 1 ]; then
+  row WARN "private repo on GitHub Free" "use the private fallback (team-merge-if-green, team-deploy)"
+fi
+
+# ------------------------------------------------------------ merge settings
+
+is_template=false
+[ "$PROFILE" = template ] && is_template=true
+DESIRED=$(tg_desired_settings_json "$is_template" "$FREE_PRIVATE")
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  expect "setting $key" "$(printf '%s' "$DESIRED" | jq -r --arg k "$key" '.[$k] | tostring')" \
+    "$(printf '%s' "$REPO_JSON" | jq -r --arg k "$key" 'if has($k) then (.[$k] | tostring) else "" end')"
+done <<EOF
+$(printf '%s' "$DESIRED" | jq -r 'keys_unsorted[]')
+EOF
+[ "$FREE_PRIVATE" = 0 ] || row N/A "setting allow_auto_merge" "not available for private repos on GitHub Free"
+
+# ------------------------------------------------------------ security
+
+if [ "$FREE_PRIVATE" = 1 ]; then
+  row N/A "secret scanning" "not available for private repos on GitHub Free"
+  row N/A "secret scanning push protection" "not available for private repos on GitHub Free"
+else
+  expect "secret scanning" enabled "$(printf '%s' "$REPO_JSON" | jq -r '.security_and_analysis.secret_scanning.status // ""')"
+  expect "secret scanning push protection" enabled "$(printf '%s' "$REPO_JSON" | jq -r '.security_and_analysis.secret_scanning_push_protection.status // ""')"
+fi
+
+tg_api_try GET "repos/$SLUG/vulnerability-alerts"
+if [ "$TG_RC" = 0 ]; then row PASS "Dependabot alerts" "enabled"
+elif [ "$TG_HTTP" = 404 ]; then row FAIL "Dependabot alerts" "disabled"
+else unreadable "Dependabot alerts"
+fi
+
+tg_api_try GET "repos/$SLUG/automated-security-fixes"
+if [ "$TG_RC" = 0 ]; then expect "Dependabot security updates" true "$(printf '%s' "$TG_OUT" | jq -r '.enabled // false')"
+elif [ "$TG_HTTP" = 404 ]; then row FAIL "Dependabot security updates" "disabled"
+else unreadable "Dependabot security updates"
+fi
+
+if [ "$FREE_PRIVATE" = 1 ]; then
+  row N/A "CodeQL default setup" "code scanning is not available for private repos on GitHub Free"
+else
+  tg_api_try GET "repos/$SLUG/code-scanning/default-setup"
+  if [ "$TG_RC" = 0 ]; then
+    cq_state=$(printf '%s' "$TG_OUT" | jq -r '.state // "not-configured"')
+    cq_langs=$(printf '%s' "$TG_OUT" | jq -r '(.languages // []) | join(" ")')
+    if [ "$cq_state" = configured ]; then row PASS "CodeQL default setup" "configured (${cq_langs:-no languages})"
+    elif [ -n "$cq_langs" ]; then row FAIL "CodeQL default setup" "not configured; detected: $cq_langs"
+    else row N/A "CodeQL default setup" "no supported language detected"
+    fi
+  elif [ "$TG_HTTP" = 403 ] || [ "$TG_HTTP" = 404 ]; then
+    row N/A "CodeQL default setup" "code scanning not available (HTTP $TG_HTTP)"
+  else
+    unreadable "CodeQL default setup"
+  fi
+fi
+
+tg_api_try GET "repos/$SLUG/immutable-releases"
+if [ "$TG_RC" = 0 ]; then expect "immutable releases" true "$(printf '%s' "$TG_OUT" | jq -r '.enabled // false')"
+elif [ "$TG_HTTP" = 404 ]; then row FAIL "immutable releases" "disabled"
+else unreadable "immutable releases"
+fi
+
+# ------------------------------------------------------------ actions
+
+tg_api_try GET "repos/$SLUG/actions/permissions"
+if [ "$TG_RC" = 0 ]; then
+  expect "actions enabled" true "$(printf '%s' "$TG_OUT" | jq -r '.enabled | tostring')"
+  expect "actions allowed_actions" all "$(printf '%s' "$TG_OUT" | jq -r '.allowed_actions // ""')"
+  expect "actions pinned to full commit SHA" true "$(printf '%s' "$TG_OUT" | jq -r '.sha_pinning_required // false | tostring')"
+else
+  unreadable "actions permissions"
+fi
+if [ "$PRIVATE" = true ]; then
+  row N/A "fork PR approval policy" "public repos only"
+else
+  tg_api_try GET "repos/$SLUG/actions/permissions/fork-pr-contributor-approval"
+  if [ "$TG_RC" = 0 ]; then expect "fork PR approval policy" all_external_contributors "$(printf '%s' "$TG_OUT" | jq -r '.approval_policy // ""')"
+  else unreadable "fork PR approval policy"
+  fi
+fi
+tg_api_try GET "repos/$SLUG/actions/permissions/workflow"
+if [ "$TG_RC" = 0 ]; then
+  expect "default workflow token" read "$(printf '%s' "$TG_OUT" | jq -r '.default_workflow_permissions // ""')"
+  expect "workflow token can approve PRs" false "$(printf '%s' "$TG_OUT" | jq -r '.can_approve_pull_request_reviews | tostring')"
+else
+  unreadable "default workflow token"
+fi
+
+# ------------------------------------------------------------ rulesets
+
+verify_ruleset() {
+  local desired="$1" name target id current d
+  name=$(printf '%s' "$desired" | jq -r .name)
+  target=$(printf '%s' "$desired" | jq -r .target)
+  id=$(printf '%s' "$RULESETS" | jq -r --arg n "$name" --arg t "$target" 'first(.[]? | select(.name == $n and .target == $t) | .id) // empty')
+  if [ -z "$id" ]; then row FAIL "ruleset $name" "missing"; return 0; fi
+  tg_api_try GET "repos/$SLUG/rulesets/$id"
+  if [ "$TG_RC" != 0 ]; then unreadable "ruleset $name"; return 0; fi
+  current="$TG_OUT"
+  if tg_ruleset_matches "$desired" "$current"; then
+    row PASS "ruleset $name" "$(printf '%s' "$current" | jq -r '.enforcement') (id $id)"
+  else
+    d=$(tg_ruleset_diff "$desired" "$current")
+    row FAIL "ruleset $name" "differs: $d"
+  fi
+  if [ "$target" = branch ]; then
+    while IFS= read -r chk; do
+      [ -n "$chk" ] || continue
+      ctx=$(printf '%s' "$chk" | jq -r .context)
+      iid=$(printf '%s' "$chk" | jq -r '.integration_id // "any"')
+      got=$(printf '%s' "$current" | jq -r --arg c "$ctx" '
+        [ .rules[]? | select(.type == "required_status_checks") | .parameters.required_status_checks[]? | select(.context == $c) | (.integration_id // "any" | tostring) ] | first // "missing"')
+      src="GitHub Actions app $iid"
+      [ "$iid" = any ] && src="any source"
+      if [ "$got" = "$iid" ]; then row PASS "required check $ctx" "$src"
+      elif [ "$got" = missing ]; then row FAIL "required check $ctx" "not required"
+      else row FAIL "required check $ctx" "bound to $got, expected $src"
+      fi
+    done <<EOF
+$(printf '%s' "$CHECKS_JSON" | jq -c '.[]')
+EOF
+  fi
+}
+
+RULESETS='[]'
+if [ "$FREE_PRIVATE" = 1 ]; then
+  row N/A "ruleset main" "not enforced on private repos on GitHub Free"
+  row N/A "ruleset release-tags" "not enforced on private repos on GitHub Free"
+else
+  tg_api_try GET "repos/$SLUG/rulesets?includes_parents=false&per_page=100"
+  if [ "$TG_RC" = 0 ]; then
+    RULESETS="$TG_OUT"
+    verify_ruleset "$(tg_branch_ruleset_json "$CHECKS_JSON")"
+    verify_ruleset "$(tg_tag_ruleset_json)"
+  else
+    unreadable "rulesets"
+  fi
+fi
+
+# ------------------------------------------------------------ labels
+
+tg_api_try GET "repos/$SLUG/labels?per_page=100"
+if [ "$TG_RC" = 0 ]; then
+  CURRENT_LABELS="$TG_OUT"
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    lname=$(printf '%s' "$item" | jq -r .name)
+    lcolor=$(printf '%s' "$item" | jq -r .color)
+    ldesc=$(printf '%s' "$item" | jq -r .description)
+    cur=$(printf '%s' "$CURRENT_LABELS" | jq -c --arg n "$lname" 'first(.[]? | select(.name == $n)) // empty')
+    if [ -z "$cur" ]; then row FAIL "label $lname" "missing"; continue; fi
+    ccolor=$(printf '%s' "$cur" | jq -r '.color // "" | ascii_downcase')
+    cdesc=$(printf '%s' "$cur" | jq -r '.description // ""')
+    if [ "$ccolor" = "$lcolor" ] && [ "$cdesc" = "$ldesc" ]; then row PASS "label $lname" "#$ccolor"
+    else row WARN "label $lname" "exists; color or description differs from config (re-run team-bootstrap-repo)"
+    fi
+  done <<EOF
+$(printf '%s' "$LABELS_JSON" | jq -c '.[]')
+EOF
+else
+  unreadable "labels"
+fi
+
+# ------------------------------------------------------------ environments
+
+var_value() {
+  tg_api_try GET "repos/$SLUG/actions/variables/$1"
+  if [ "$TG_RC" = 0 ]; then printf '%s' "$TG_OUT" | jq -r '.value // ""'; fi
+}
+
+STAGING_READY=""
+PRODUCTION_READY=""
+ENV_OK=0
+if [ "$PROFILE" != project ]; then
+  row N/A "environments staging, production" "profile $PROFILE doesn't deploy"
+elif [ "$FREE_PRIVATE" = 1 ]; then
+  row N/A "environments staging, production" "not available for private repos on GitHub Free"
+else
+  ENV_OK=1
+  OWNER_ID=""
+  tg_api_try GET "users/$OWNER_VAR"
+  [ "$TG_RC" = 0 ] && OWNER_ID=$(printf '%s' "$TG_OUT" | jq -r '.id // empty')
+  for env in staging production; do
+    tg_api_try GET "repos/$SLUG/environments/$env"
+    if [ "$TG_RC" != 0 ]; then
+      if [ "$TG_HTTP" = 404 ]; then row FAIL "environment $env" "missing"; else unreadable "environment $env"; fi
+      continue
+    fi
+    cur="$TG_OUT"
+    if printf '%s' "$cur" | jq -e '.deployment_branch_policy == {"protected_branches": false, "custom_branch_policies": true}' >/dev/null; then
+      tg_api_try GET "repos/$SLUG/environments/$env/deployment-branch-policies?per_page=100"
+      pols=""
+      [ "$TG_RC" = 0 ] && pols=$(printf '%s' "$TG_OUT" | jq -r '[.branch_policies[]? | "\(.type // "branch"):\(.name)"] | sort | join(" ")')
+      expect "environment $env deploys from" "branch:main" "$pols"
+    else
+      row FAIL "environment $env deploys from" "branch policy is not custom (main only)"
+    fi
+    if [ "$env" = production ]; then
+      if [ -n "$OWNER_ID" ] && printf '%s' "$cur" | jq -e --argjson id "$OWNER_ID" 'any(.protection_rules[]?; .type == "required_reviewers"
+            and ((.prevent_self_review // false) == false) and any(.reviewers[]?; .reviewer.id == $id))' >/dev/null; then
+        row PASS "environment production reviewer" "$OWNER_VAR, self-review allowed"
+      else
+        row FAIL "environment production reviewer" "$OWNER_VAR must be a required reviewer with self-review allowed"
+      fi
+    else
+      if printf '%s' "$cur" | jq -e 'any(.protection_rules[]?; .type == "required_reviewers")' >/dev/null; then
+        row WARN "environment staging reviewer" "staging has required reviewers; deploys will wait"
+      else
+        row PASS "environment staging" "no approval needed"
+      fi
+    fi
+  done
+  STAGING_READY=$(var_value STAGING_READY)
+  PRODUCTION_READY=$(var_value PRODUCTION_READY)
+fi
+
+# ------------------------------------------------------------ variables
+
+tg_api_try GET "repos/$SLUG/actions/variables/OWNER_LOGIN"
+if [ "$TG_RC" = 0 ]; then
+  expect "variable OWNER_LOGIN" "$OWNER_VAR" "$(printf '%s' "$TG_OUT" | jq -r '.value // ""')"
+elif [ "$TG_HTTP" = 404 ]; then
+  row FAIL "variable OWNER_LOGIN" "missing (team-bootstrap-repo --apply sets it to $OWNER_VAR)"
+else
+  unreadable "variable OWNER_LOGIN"
+fi
+
+PC_TZ=""
+if git rev-parse --show-toplevel >/dev/null 2>&1 && [ -n "$(git config --get remote.origin.url 2>/dev/null)" ] \
+   && tg_same_repo "$(team_origin_repo .)" "$SLUG"; then
+  PC_TZ=$(team_project_conf_get PROJECT_TIMEZONE "")
+fi
+tg_api_try GET "repos/$SLUG/actions/variables/PROJECT_TIMEZONE"
+if [ "$TG_RC" = 0 ]; then
+  tzv=$(printf '%s' "$TG_OUT" | jq -r '.value // ""')
+  if [ -n "$PC_TZ" ]; then expect "variable PROJECT_TIMEZONE" "$PC_TZ" "$tzv"
+  elif tg_valid_tz "$tzv"; then row PASS "variable PROJECT_TIMEZONE" "$tzv"
+  else row FAIL "variable PROJECT_TIMEZONE" "'$tzv' is not an IANA timezone"
+  fi
+elif [ "$TG_HTTP" = 404 ]; then
+  if [ "$PROFILE" = project ]; then row FAIL "variable PROJECT_TIMEZONE" "missing"
+  else row N/A "variable PROJECT_TIMEZONE" "not needed for profile $PROFILE"
+  fi
+else
+  unreadable "variable PROJECT_TIMEZONE"
+fi
+
+# ------------------------------------------------------------ secrets (names only)
+
+tg_api_try GET "repos/$SLUG/actions/secrets?per_page=100"
+if [ "$TG_RC" = 0 ]; then
+  SECRETS=$(printf '%s' "$TG_OUT" | jq -c '[.secrets[]?.name]')
+  has() { printf '%s' "$1" | jq -e --arg n "$2" 'any(.[]; . == $n)' >/dev/null; }
+  if [ "$PROFILE" = template ]; then
+    row N/A "secret RELEASE_PLEASE_TOKEN" "the template never releases"
+  elif has "$SECRETS" RELEASE_PLEASE_TOKEN; then
+    row PASS "secret RELEASE_PLEASE_TOKEN" "set"
+  else
+    row FAIL "secret RELEASE_PLEASE_TOKEN" "missing (team-store-token, then team-bootstrap-repo --apply)"
+  fi
+  if [ "$PROFILE" = project ]; then
+    if has "$SECRETS" PRODUCTION_HEALTH_URL; then row PASS "secret PRODUCTION_HEALTH_URL" "set"
+    elif [ "$PRODUCTION_READY" = true ]; then row FAIL "secret PRODUCTION_HEALTH_URL" "missing although PRODUCTION_READY=true"
+    else row WARN "secret PRODUCTION_HEALTH_URL" "missing (team-provision production sets it)"
+    fi
+  fi
+else
+  unreadable "secret names"
+fi
+
+if [ "$ENV_OK" = 1 ]; then
+  for env in staging production; do
+    need="DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL"
+    ready="$PRODUCTION_READY"
+    if [ "$env" = staging ]; then need="$need BASIC_AUTH_USER BASIC_AUTH_PASSWORD"; ready="$STAGING_READY"; fi
+    tg_api_try GET "repos/$SLUG/environments/$env/secrets?per_page=100"
+    if [ "$TG_RC" != 0 ]; then
+      if [ "$TG_HTTP" = 404 ]; then continue; fi
+      unreadable "environment $env secrets"
+      continue
+    fi
+    have=$(printf '%s' "$TG_OUT" | jq -c '[.secrets[]?.name]')
+    for s in $need; do
+      if printf '%s' "$have" | jq -e --arg n "$s" 'any(.[]; . == $n)' >/dev/null; then
+        row PASS "$env secret $s" "set"
+      elif [ "$ready" = true ]; then
+        row FAIL "$env secret $s" "missing although the environment is marked ready"
+      else
+        row WARN "$env secret $s" "missing (team-provision $env sets it)"
+      fi
+    done
+  done
+fi
+
+# ------------------------------------------------------------ agent account
+
+AGENT=$(team_agent_login)
+if [ -n "$AGENT" ] && [ "$(tg_lower "$AGENT")" != "$(tg_lower "$TG_LOGIN")" ]; then
+  tg_api_try GET "repos/$SLUG/collaborators/$AGENT"
+  if [ "$TG_RC" = 0 ]; then
+    row PASS "agent $AGENT collaborator" "yes"
+  elif [ "$TG_HTTP" = 404 ]; then
+    tg_api_try GET "repos/$SLUG/invitations?per_page=100"
+    if [ "$TG_RC" = 0 ] && printf '%s' "$TG_OUT" | jq -e --arg a "$(tg_lower "$AGENT")" 'any(.[]?; ((.invitee.login // "") | ascii_downcase) == $a)' >/dev/null; then
+      row WARN "agent $AGENT collaborator" "invitation pending: accept it as $AGENT"
+    else
+      row FAIL "agent $AGENT collaborator" "not invited"
+    fi
+  else
+    unreadable "agent $AGENT collaborator"
+  fi
+fi
+
+# ------------------------------------------------------------ disabled workflows
+
+tg_api_try GET "repos/$SLUG/actions/workflows?per_page=100"
+if [ "$TG_RC" = 0 ]; then
+  disabled=$(printf '%s' "$TG_OUT" | jq -r '.workflows[]? | select(.state == "disabled_inactivity" or .state == "disabled_manually") | "\(.state)|\(.name)|\(.path)"')
+  if [ -z "$disabled" ]; then
+    row PASS "workflows enabled" "$(printf '%s' "$TG_OUT" | jq -r '[.workflows[]?] | length') workflow(s), none disabled"
+  else
+    while IFS='|' read -r st wname wpath; do
+      [ -n "$st" ] || continue
+      if [ "$st" = disabled_inactivity ]; then
+        row WARN "workflow $(tg_printable "$wname")" "disabled after 60 days without activity; re-enable: gh workflow enable $(basename "$wpath") -R $SLUG"
+      else
+        row WARN "workflow $(tg_printable "$wname")" "disabled manually ($wpath)"
+      fi
+    done <<EOF
+$disabled
+EOF
+  fi
+else
+  unreadable "workflows"
+fi
+
+printf '\n%d passed, %d failed, %d warnings\n' "$N_PASS" "$N_FAIL" "$N_WARN"
+[ "$N_FAIL" = 0 ] || exit "$TEAM_EXIT_FAIL"
+exit 0
