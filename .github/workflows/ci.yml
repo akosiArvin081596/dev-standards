@@ -84,6 +84,14 @@ jobs:
         if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
         run: bash "$TEAM_STANDARDS_DIR/scripts/ci/pii-guard.sh" --base "$BASE_SHA" --head "$HEAD_SHA"
 
+      - name: Anonymisation rules (ops/anonymize)
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' }}
+        run: |
+          rc=0
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/anonymize-lint.sh" ops/anonymize || rc=$?
+          if [ "$rc" = 3 ]; then echo "::notice::ops/anonymize is not configured yet"; exit 0; fi
+          exit "$rc"
+
       - name: Secret scan (gitleaks, the PR's commits)
         if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
         working-directory: .
