@@ -1,0 +1,133 @@
+# Reusable: the `ci` check for every pull request (reported as `ci / ci`).
+# Callers: `jobs.ci.uses: akosiArvin081596/dev-standards/.github/workflows/ci.yml@v1`
+# with `permissions: {contents: read, issues: read, pull-requests: write}`.
+# Scripts and config come from dev-standards at the exact commit the caller pinned.
+name: ci
+
+on:
+  workflow_call:
+    inputs:
+      standards-ref:
+        description: dev-standards ref for scripts/ci and config (empty = the commit this workflow was called at)
+        type: string
+        required: false
+        default: ''
+      working-directory:
+        description: project folder inside the repo (where the Makefile and ops/ live)
+        type: string
+        required: false
+        default: '.'
+      allow-unreleased-lock:
+        description: accept lock release "unreleased" when it matches the standards checkout (dev-standards self-test only)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    concurrency:
+      group: team-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      TEAM_STANDARDS_DIR: ${{ github.workspace }}/.team-standards
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PROJECT_TIMEZONE: ${{ vars.PROJECT_TIMEZONE }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Prepare
+        id: prep
+        working-directory: .
+        run: |
+          printf '.team-standards/\n' >> .git/info/exclude
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "::notice::not a pull request ($GITHUB_EVENT_NAME): stop-the-line, test guard, PII guard, secret scan and code scan run on pull requests only"
+          fi
+
+      - name: Stop the line (main-red)
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/stop-the-line.sh" --pr "$PR_NUMBER"
+
+      - name: Test guard
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/test-guard.sh" --base "$BASE_SHA" --head "$HEAD_SHA" --pr "$PR_NUMBER" --label
+
+      - name: PII guard
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/pii-guard.sh" --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      - name: Secret scan (gitleaks, the PR's commits)
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
+        working-directory: .
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/gitleaks.sh" git --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      # Semgrep's --baseline-commit refuses a dirty tree: run it before make touches anything.
+      - name: Code scan (Semgrep CE, new findings only)
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' && github.event_name == 'pull_request' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/semgrep.sh" --base "$BASE_SHA" .
+
+      - name: Context check
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' }}
+        env:
+          ALLOW_UNRELEASED: ${{ inputs.allow-unreleased-lock }}
+        run: |
+          if [ "$ALLOW_UNRELEASED" = "true" ]; then
+            bash "$TEAM_STANDARDS_DIR/scripts/ci/context-check.sh" --allow-unreleased-lock
+          else
+            bash "$TEAM_STANDARDS_DIR/scripts/ci/context-check.sh"
+          fi
+
+      - name: make setup
+        id: setup
+        if: ${{ !cancelled() && steps.prep.outcome == 'success' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" setup
+
+      - name: make lint
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" lint
+
+      - name: make test (TZ=UTC)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          TZ: UTC
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" test
+
+      - name: make build
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" build
+
+      - name: make audit (dependencies)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" audit
+
+      - name: make anonymize-check
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" anonymize-check

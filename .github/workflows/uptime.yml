@@ -1,0 +1,54 @@
+# Reusable: production uptime check (callers schedule it every 15 minutes).
+# Two failed health checks ~60 s apart open one `incident` issue; recovery closes it.
+# The health URL is the repo-level secret PRODUCTION_HEALTH_URL, because an environment
+# would make every run wait for approval. Callers: `on: schedule: - cron: '*/15 * * * *'`
+# (+ workflow_dispatch), `secrets: inherit`, `permissions: {contents: read, issues: write}`.
+name: uptime
+
+on:
+  workflow_call:
+    inputs:
+      standards-ref:
+        description: dev-standards ref for scripts/ci and config (empty = the commit this workflow was called at)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  uptime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: team-uptime-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      TEAM_STANDARDS_DIR: ${{ github.workspace }}/.team-standards
+      READY: ${{ vars.PRODUCTION_READY }}
+      PROJECT_TIMEZONE: ${{ vars.PROJECT_TIMEZONE }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Production not provisioned yet
+        if: ${{ env.READY != 'true' }}
+        run: echo "::notice::production is not provisioned yet (repo variable PRODUCTION_READY is not true), so there is nothing to watch."
+
+      - name: Check out dev-standards (scripts and config)
+        if: ${{ env.READY == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Health check, twice before an incident
+        if: ${{ env.READY == 'true' }}
+        shell: bash
+        env:
+          HEALTH_URL: ${{ secrets.PRODUCTION_HEALTH_URL }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/incident.sh" check

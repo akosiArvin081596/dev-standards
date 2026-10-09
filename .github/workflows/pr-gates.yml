@@ -1,0 +1,102 @@
+# Reusable: the PR gates `guarded-paths` and `pr-title` (reported as `gates / guarded-paths`
+# and `gates / pr-title`). Callers run it on pull_request types
+# [opened, edited, synchronize, reopened, labeled, unlabeled] with
+# `permissions: {contents: read, issues: write, pull-requests: write, checks: read}`.
+# No secrets: it works with the read-only token of fork PRs (label writes become notices).
+name: pr-gates
+
+on:
+  workflow_call:
+    inputs:
+      standards-ref:
+        description: dev-standards ref for scripts/ci and config (empty = the commit this workflow was called at)
+        type: string
+        required: false
+        default: ''
+      profile:
+        description: project, standards (every path guarded) or template
+        type: string
+        required: false
+        default: project
+
+permissions: {}
+
+jobs:
+  guarded-paths:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      checks: read
+    # Safe to cancel: approval freshness is checked against the head commit's arrival,
+    # so a cancelled `synchronize` run can't leave an old approval counting.
+    concurrency:
+      group: team-gates-paths-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      TEAM_STANDARDS_DIR: ${{ github.workspace }}/.team-standards
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      EVENT_ACTION: ${{ github.event.action }}
+      PROFILE: ${{ inputs.profile }}
+      OWNER_LOGIN: ${{ vars.OWNER_LOGIN || github.repository_owner }}
+    steps:
+      - name: Check out the project
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out dev-standards (scripts and config)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Guarded paths and owner approval
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "::notice::not a pull request ($GITHUB_EVENT_NAME): nothing to gate"
+            exit 0
+          fi
+          printf '.team-standards/\n' >> .git/info/exclude
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/guarded-paths.sh"
+
+  pr-title:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      group: team-gates-title-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      TEAM_STANDARDS_DIR: ${{ github.workspace }}/.team-standards
+      PR_TITLE: ${{ github.event.pull_request.title }}
+    steps:
+      - name: Check out dev-standards (scripts and config)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Conventional Commits title
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "::notice::not a pull request ($GITHUB_EVENT_NAME): no title to check"
+            exit 0
+          fi
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/pr-title.sh"

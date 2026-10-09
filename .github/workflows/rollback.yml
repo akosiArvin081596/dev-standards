@@ -1,0 +1,126 @@
+# Reusable: roll production back to an earlier release vX.Y.Z (run by the owner;
+# waits for the production environment's approval). It switches to the release when
+# the server still has it, otherwise rebuilds that tag and deploys it the same way.
+# Callers: `on: workflow_dispatch: inputs: tag`, `jobs.rollback.uses: …/rollback.yml@v1`
+# with `tag: ${{ inputs.tag }}`, `secrets: inherit`, `permissions: {contents: read}`.
+name: rollback
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: the release to go back to, e.g. v1.4.2
+        type: string
+        required: true
+      standards-ref:
+        description: dev-standards ref for scripts/ci and config (empty = the commit this workflow was called at)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+    # Same group as pipeline.yml's deploy-production: never two production changes at once.
+    concurrency:
+      group: team-deploy-production-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      TEAM_STANDARDS_DIR: ${{ github.workspace }}/.team-standards
+      TAG: ${{ inputs.tag }}
+      READY: ${{ vars.PRODUCTION_READY }}
+      PROJECT_TIMEZONE: ${{ vars.PROJECT_TIMEZONE }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check the tag
+        run: |
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag must look like v1.2.3"
+            exit 2
+          fi
+
+      - name: Production not provisioned yet
+        if: ${{ env.READY != 'true' }}
+        run: echo "::notice::production is not provisioned yet (repo variable PRODUCTION_READY is not true), so there is nothing to roll back."
+
+      - name: Check out the release
+        if: ${{ env.READY == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Check out dev-standards (scripts and config)
+        if: ${{ env.READY == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Switch to the release kept on the server
+        id: switch
+        if: ${{ env.READY == 'true' }}
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          printf '.team-standards/\n' >> .git/info/exclude
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          set +e
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/deploy.sh" production --rollback "$sha"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "rebuild=false" >> "$GITHUB_OUTPUT" ;;
+            7) echo "rebuild=true" >> "$GITHUB_OUTPUT"; echo "::notice::$TAG is no longer on the server: rebuilding it" ;;
+            *) exit "$rc" ;;
+          esac
+
+      - name: Rebuild the release (make setup, make build)
+        if: ${{ env.READY == 'true' && steps.switch.outputs.rebuild == 'true' }}
+        run: |
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" setup
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" build
+          art=$(bash "$TEAM_STANDARDS_DIR/scripts/ci/conf.sh" get ops/project.conf ARTIFACT_DIR .team/artifact)
+          if [ ! -d "$art" ]; then
+            echo "::error::make build is not configured for $TAG, so it can't be rebuilt"
+            exit 1
+          fi
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/package.sh" "$art" "$RUNNER_TEMP/release-$SHA.tar.gz"
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP/release-$SHA.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/gitleaks.sh" dir "$RUNNER_TEMP/unpacked"
+        env:
+          SHA: ${{ steps.switch.outputs.sha }}
+
+      - name: Deploy the rebuilt release
+        if: ${{ env.READY == 'true' && steps.switch.outputs.rebuild == 'true' }}
+        env:
+          SHA: ${{ steps.switch.outputs.sha }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/deploy.sh" production "$RUNNER_TEMP/release-$SHA.tar.gz" --sha "$SHA"
+
+      - name: Smoke test production
+        if: ${{ env.READY == 'true' }}
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/smoke.sh" "$HEALTH_URL"

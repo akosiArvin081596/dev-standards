@@ -1,0 +1,352 @@
+# Reusable: the main pipeline, run on every push to main.
+#   build → scan-artifact → deploy-staging → e2e-staging → release → deploy-production → smoke-production
+#   main-red (always): opens one main-red issue on failure, closes it when green.
+# Callers: `on: push: branches: [main]`, `jobs.pipeline.uses: …/pipeline.yml@v1`,
+# `secrets: inherit`, `permissions: {contents: read, issues: write}`, and NO workflow-level
+# cancel-in-progress (it would cancel a running deploy). Deploy jobs serialize per
+# environment and are never cancelled.
+name: pipeline
+
+on:
+  workflow_call:
+    inputs:
+      standards-ref:
+        description: dev-standards ref for scripts/ci and config (empty = the commit this workflow was called at)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  TEAM_STANDARDS_DIR: ${{ github.workspace }}/.team-standards
+  PROJECT_TIMEZONE: ${{ vars.PROJECT_TIMEZONE }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    concurrency:
+      group: team-pipeline-build-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+    outputs:
+      configured: ${{ steps.result.outputs.configured }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: make setup
+        shell: bash
+        run: |
+          printf '.team-standards/\n' >> .git/info/exclude
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" setup
+
+      - name: make build
+        id: make
+        shell: bash
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" build
+
+      - name: Package the release
+        if: ${{ steps.make.outputs.status == 'ok' }}
+        shell: bash
+        run: |
+          art=$(bash "$TEAM_STANDARDS_DIR/scripts/ci/conf.sh" get ops/project.conf ARTIFACT_DIR .team/artifact)
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/package.sh" "$art" "$RUNNER_TEMP/release-$GITHUB_SHA.tar.gz"
+
+      - name: Upload the release artifact
+        if: ${{ steps.make.outputs.status == 'ok' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/release-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Result
+        id: result
+        shell: bash
+        env:
+          STATUS: ${{ steps.make.outputs.status }}
+        run: |
+          if [ "$STATUS" = "not-configured" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::make build is not configured yet: nothing to scan, deploy or release (this doesn't open main-red)"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  scan-artifact:
+    needs: build
+    if: ${{ needs.build.outputs.configured == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the project (for .gitleaks.toml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Download the release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/artifact
+
+      - name: Secret scan of the built artifact (gitleaks)
+        shell: bash
+        run: |
+          printf '.team-standards/\n' >> .git/info/exclude
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP/artifact/release-$GITHUB_SHA.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/gitleaks.sh" dir "$RUNNER_TEMP/unpacked"
+
+  deploy-staging:
+    needs: [build, scan-artifact]
+    if: ${{ needs.build.outputs.configured == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: staging
+    permissions:
+      contents: read
+    concurrency:
+      group: team-deploy-staging-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    env:
+      READY: ${{ vars.STAGING_READY }}
+    steps:
+      - name: Staging not provisioned yet
+        if: ${{ env.READY != 'true' }}
+        run: echo "::notice::staging is not provisioned yet (repo variable STAGING_READY is not true), so the deploy is skipped. team-provision staging --apply sets it up."
+
+      - name: Check out dev-standards (scripts and config)
+        if: ${{ env.READY == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Download the release artifact
+        if: ${{ env.READY == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/artifact
+
+      - name: Deploy to staging
+        id: deploy
+        if: ${{ env.READY == 'true' }}
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/deploy.sh" staging "$RUNNER_TEMP/artifact/release-$GITHUB_SHA.tar.gz" --sha "$GITHUB_SHA"
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+
+  e2e-staging:
+    needs: [build, deploy-staging]
+    if: ${{ needs.deploy-staging.outputs.deployed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: staging
+    permissions:
+      contents: read
+    concurrency:
+      group: team-e2e-staging-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: make e2e against staging
+        shell: bash
+        env:
+          BASE_URL: ${{ secrets.APP_URL }}
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+          BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
+        run: |
+          printf '.team-standards/\n' >> .git/info/exclude
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/make-target.sh" e2e
+
+      - name: Smoke test staging
+        shell: bash
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+          BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/smoke.sh" "$HEALTH_URL" --noindex
+
+  release:
+    needs: [build, scan-artifact, deploy-staging, e2e-staging]
+    if: >-
+      ${{ always()
+          && needs.build.outputs.configured == 'true'
+          && needs.scan-artifact.result == 'success'
+          && needs.deploy-staging.result == 'success'
+          && (needs.e2e-staging.result == 'success' || needs.e2e-staging.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: team-release-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    env:
+      HAS_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN != '' }}
+      PRODUCTION_READY: ${{ vars.PRODUCTION_READY }}
+    steps:
+      - name: No release token yet
+        if: ${{ env.HAS_TOKEN != 'true' }}
+        run: echo "::notice::the RELEASE_PLEASE_TOKEN secret is not set, so release-please is skipped. Run team-store-token once, then team-bootstrap-repo --apply."
+
+      - name: release-please
+        id: rp
+        if: ${{ env.HAS_TOKEN == 'true' }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Production not provisioned yet
+        if: ${{ steps.rp.outputs.release_created == 'true' && env.PRODUCTION_READY != 'true' }}
+        env:
+          TAG: ${{ steps.rp.outputs.tag_name }}
+        run: echo "::notice::release $TAG was created, but production is not provisioned yet (repo variable PRODUCTION_READY is not true), so it is not deployed."
+
+  deploy-production:
+    needs: [build, release]
+    if: ${{ needs.release.outputs.release_created == 'true' && vars.PRODUCTION_READY == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+    concurrency:
+      group: team-deploy-production-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.deploy.outputs.deployed }}
+    steps:
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Download the release artifact (the one staging got)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ github.sha }}
+          path: ${{ runner.temp }}/artifact
+
+      - name: Deploy to production
+        id: deploy
+        shell: bash
+        env:
+          TAG: ${{ needs.release.outputs.tag_name }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          echo "deploying $TAG ($GITHUB_SHA) to production"
+          bash "$TEAM_STANDARDS_DIR/scripts/ci/deploy.sh" production "$RUNNER_TEMP/artifact/release-$GITHUB_SHA.tar.gz" --sha "$GITHUB_SHA"
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+
+  smoke-production:
+    needs: deploy-production
+    if: ${{ needs.deploy-production.outputs.deployed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      # Repo-level secret, so this job needs no second production approval.
+      - name: Smoke test production
+        shell: bash
+        env:
+          HEALTH_URL: ${{ secrets.PRODUCTION_HEALTH_URL }}
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/smoke.sh" "$HEALTH_URL"
+
+  main-red:
+    needs: [build, scan-artifact, deploy-staging, e2e-staging, release, deploy-production, smoke-production]
+    if: ${{ always() && needs.build.outputs.configured != 'false' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out dev-standards (scripts and config)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.standards-ref || job.workflow_sha }}
+          path: .team-standards
+          persist-credentials: false
+
+      - name: Open or update main-red
+        if: ${{ contains(needs.*.result, 'failure') }}
+        shell: bash
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/main-red.sh" open
+
+      - name: Close main-red
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+        shell: bash
+        run: bash "$TEAM_STANDARDS_DIR/scripts/ci/main-red.sh" close
