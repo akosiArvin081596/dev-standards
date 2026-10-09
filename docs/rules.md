@@ -50,7 +50,7 @@ Required workflows never use `paths:` filters. The `ci / ci` check comes from a 
 | 0 | success (a plan shown without `--apply` is success) |
 | 1 | failure |
 | 2 | usage error (bad or missing arguments) |
-| 3 | not configured (Makefile target or config not filled in yet: "not configured: fill in for your stack"). A recipe that exits 3 makes GNU make itself exit 2 and print `*** [<target>] Error 3`; callers detect "not configured" from that line or the message text. |
+| 3 | not configured (Makefile target or config not filled in yet: "not configured: fill in for your stack"). A recipe that exits 3 makes GNU make itself exit 2 and print `*** [<target>] Error 3`; callers treat a target as not configured only when that line AND the message text are both present (a real tool exiting 3 is a failure). |
 | 4 | refused by policy (release PR, forbidden subcommand, wrong agent, would reuse a foreign resource) |
 | 5 | missing prerequisite (tool not installed, not in a git repo, config file missing) |
 | 6 | waiting for the owner (needs `--apply` with my yes, or a manual step I must do) |
@@ -73,7 +73,7 @@ All config files are `KEY=value` lines (or `|` tables), **parsed, never sourced*
 | `projects/<project>-<env>.deploy.pub`, `projects/<project>.known_hosts` | the deploy key's public half (reuse check) and the pinned VPS host key (`team-deploy`) |
 | `ports.registry` | `port|worktree_path|project|created_utc` |
 | `databases.registry` | `engine|host|port|name|project|worktree_path|created_utc` (the only DBs the pack may drop) |
-| `locks/<name>.lock/` | `mkdir` locks (`ports`, `databases`); stale after 120 s |
+| `locks/<name>.lock/` | `mkdir` locks (`ports`, `databases`, `worktrees`); stale after 120 s |
 | `fence.log` | `utc_ts<TAB>rule_id<TAB>agent_type|main<TAB>redacted command or path` |
 
 Local Postgres credentials come from the standard `PGUSER`/`PGPASSWORD` (default: the macOS user, no password). Caches outside it: `~/.cache/team-snapshots/<project>/` (sanitized dumps), keychain items `team-release-please-token` and `team-staging-<project>`.
@@ -201,7 +201,7 @@ Installed root-owned to `/usr/local/lib/team/`. Scripts: `discover`, `provision`
 `team-provision <env> [--apply]` (run in a project root):
 1. Builds a bundle in `mktemp -d`: `server/*`, the project's `ops/`, and `inputs.conf` (chmod 600): `PROJECT ENV HOST BASIC_AUTH_USER BASIC_AUTH_PASSWORD(staging) DEPLOY_PUBKEY DBPULL_PUBKEY(production) TIMEZONE LOW_TRAFFIC_HOUR ACME_EMAIL`. Keys are generated locally with `ssh-keygen` in the temp dir.
 2. One connection: `tar -cz … | ssh <VPS_ALIAS> 'd=$(mktemp -d) && tar -xz -C "$d" && sudo bash "$d/provision" --bundle "$d" [--apply]; rc=$?; rm -rf "${d:?}"; exit $rc'`.
-3. `provision` prints a plan (`[create]`, `[update]`, `[ok]`, `[skip]` lines) and, with `--apply`, applies it; last line `TEAM-RESULT ok` or `TEAM-RESULT fail <reason>`.
+3. `provision` prints a plan (`[create]`, `[update]`, `[ok]`, `[skip]` lines) and, with `--apply`, applies it; it prints `TEAM-HOSTKEY <keytype> <base64>` (the server's host key, for pinning, so no second connection is needed) and ends with `TEAM-RESULT ok` or `TEAM-RESULT fail <reason>`.
 4. On success with `--apply`, `team-provision` sets environment secrets `DEPLOY_HOST DEPLOY_USER DEPLOY_PORT DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS APP_URL HEALTH_URL` (+ staging `BASIC_AUTH_USER BASIC_AUTH_PASSWORD`), repo secret `PRODUCTION_HEALTH_URL` (production), repo variable `STAGING_READY=true` / `PRODUCTION_READY=true`, keychain `team-staging-<project>`, and installs the db-pull private key at `~/.ssh/team-dbpull-<project>` (600). Values are piped into `gh secret set` on stdin, never printed.
 
 ## 13. The fence (`plugins/team/hooks/fence`)

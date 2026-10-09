@@ -32,6 +32,8 @@ The nightly snapshot refuses to store a dump when a column whose name looks pers
 ## Private repositories on GitHub Free
 Rulesets, environments, required reviewers, secret scanning and code scanning aren't available on private repos under GitHub Free. Such a project switches to the private fallback: agents merge only through `team-merge-if-green`, production deploys run from your Mac with `team-deploy production`, and CI keeps to the essentials.
 
+On private repos the uptime check is off too (it needs `PRODUCTION_READY` and the production health secret, which stay off GitHub there), and `team-deploy` doesn't run the gitleaks scan of the built artifact that `pipeline.yml` runs; run `gitleaks dir <artifact>` yourself before a production deploy.
+
 ## Background sessions
 Writers started by `/team:start-issue` need the project folder trusted (once, interactively; worktrees inherit it) and the bypass-mode disclaimer accepted. The managed settings set `worktree.bgIsolation: "none"` because writers always start inside a pack worktree; a background session you start by hand in the main checkout would edit the main checkout.
 
