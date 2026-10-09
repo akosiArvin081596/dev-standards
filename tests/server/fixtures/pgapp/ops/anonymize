@@ -1,0 +1,13 @@
+# Fake project anonymization rules (rules.md §8)
+rule|customers|full_name|name
+rule|customers|email|email
+rule|customers|phone|phone
+rule|customers|address|address
+rule|customers|birth_date|null
+rule|users|email|email
+rule|users|display_name|first_name
+rule|users|password_hash|redact|$2y$10$redactedredactedredactedredacted
+rule|users|remember_token|null
+rule|orders|customer_email|email
+ignore|orders|shipping_city|city only, needed for reports
+devlogin|users|id|1|email=dev@example.test;password_hash=$2y$10$knownDevLoginHashForLocalUseOnly00
