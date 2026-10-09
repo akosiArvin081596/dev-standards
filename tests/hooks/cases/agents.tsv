@@ -1,0 +1,190 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# agent-bash, agent-tool, post-check-agent: every agent_type
+# review agents: team:team-reviewer team:team-security team:team-qa team:team-health
+# general-purpose / Explore are subagents but not review agents: no Bash allowlist, still no owner-approved.
+#
+# --- agent-tool: review agents get no file-writing tools and no Agent ---
+deny	agent-tool	team:team-reviewer	Write	project	{PROJ}/src/app.txt	reviewer Write
+deny	agent-tool	team:team-security	Edit	project	{PROJ}/src/app.txt	security Edit
+deny	agent-tool	team:team-qa	MultiEdit	project	{PROJ}/src/app.txt	qa MultiEdit
+deny	agent-tool	team:team-health	NotebookEdit	project	{PROJ}/nb.ipynb	health NotebookEdit
+deny	agent-tool	team:team-qa	Agent	project	write the tests for me	qa spawning an Agent
+deny	agent-tool	team:team-reviewer	Agent	project	fix the bug	reviewer spawning an Agent
+deny	agent-tool	team:team-health	Write	project	/tmp/report.md	health Write outside the repo
+deny	agent-tool|fence-file	team:team-security	Write	project	{PROJ}/.claude/settings.json	security Write to a fence file
+allow	agent-tool	team:team-reviewer	Read	project	{PROJ}/src/app.txt	reviewer Read
+allow	agent-tool	team:team-qa	Glob	project	**/*.ts	qa Glob
+allow	agent-tool	team:team-security	Grep	project	password	security Grep
+allow	agent-tool	team:team-reviewer	WebFetch	project	https://example.test/docs	reviewer WebFetch
+allow	agent-tool	general-purpose	Write	project	{PROJ}/src/app.txt	general-purpose may write
+allow	agent-tool	general-purpose	Agent	project	do x	general-purpose may spawn
+allow	agent-tool	main	Agent	project	do x	main may spawn
+#
+# --- team-post-check context matrix (sha = 40 hex) ---
+allow	post-check-agent	team:team-reviewer	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "review ok"	reviewer -> ai-review
+allow	post-check-agent	team:team-security	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-security pending "waiting for owner-approved"	security -> ai-security
+allow	post-check-agent	team:team-qa	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa failure "e2e failed"	qa -> ai-qa
+allow	post-check-agent	team:team-reviewer	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "ok" --target-url https://example.test/r	reviewer with --target-url
+allow	post-check-agent	team:team-reviewer	Bash	project	{PLUGIN}/bin/team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "ok"	plugin bin path
+deny	post-check-agent	team:team-reviewer	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-security success "x"	reviewer -> ai-security
+deny	post-check-agent	team:team-reviewer	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa success "x"	reviewer -> ai-qa
+deny	post-check-agent	team:team-security	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "x"	security -> ai-review
+deny	post-check-agent	team:team-security	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa success "x"	security -> ai-qa
+deny	post-check-agent	team:team-qa	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "x"	qa -> ai-review
+deny	post-check-agent	team:team-qa	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-security success "x"	qa -> ai-security
+deny	post-check-agent	team:team-health	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "x"	health has no context
+deny	post-check-agent	team:team-health	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa success "x"	health has no context
+deny	post-check-agent	main	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "x"	main -> ai-review
+deny	post-check-agent	main	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-security success "x"	main -> ai-security
+deny	post-check-agent	main	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa success "x"	main -> ai-qa
+deny	post-check-agent	main	Bash	project	{PLUGIN}/bin/team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "x"	main via plugin bin path
+deny	post-check-agent	main	Bash	project	env team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa success "x"	main via env wrapper
+deny	post-check-agent	general-purpose	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-review success "x"	general-purpose -> ai-review
+deny	post-check-agent	general-purpose	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-qa success "x"	general-purpose -> ai-qa
+deny	post-check-agent	Explore	Bash	project	team-post-check 0123456789abcdef0123456789abcdef01234567 ai-security success "x"	other subagent -> ai-security
+#
+# --- team:team-reviewer Bash allowlist ---
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git status	git status
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git diff origin/main...HEAD	git diff
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git log --oneline -5	git log
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git show HEAD	git show
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git rev-parse HEAD	git rev-parse
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git ls-files	git ls-files
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git ls-tree HEAD	git ls-tree
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git cat-file -p HEAD	git cat-file
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git blame README.md	git blame
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git branch	git branch (list)
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git branch -a	git branch -a
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git branch --list 'feat/*'	git branch --list
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git describe --always	git describe
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git merge-base HEAD main	git merge-base
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git shortlog -s	git shortlog
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git grep fixture	git grep
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git fetch origin	git fetch
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git remote -v	git remote -v
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git remote show origin	git remote show
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git remote get-url origin	git remote get-url
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git config --get user.name	git config read
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git for-each-ref refs/heads	git for-each-ref
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git rev-list --count HEAD	git rev-list
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git name-rev HEAD	git name-rev
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git worktree list	git worktree list
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git check-ignore x	git check-ignore
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git show-ref	git show-ref
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git symbolic-ref --short HEAD	git symbolic-ref (read)
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git -C {FEAT} log -1	git -C read
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git fetch origin && git diff origin/main...HEAD	compound of allowed commands
+allow	agent-bash	team:team-reviewer	Bash	feat-repo	git log | head -5	pipe into a plain reader
+allow	agent-bash	team:team-reviewer	Bash	project	cat src/app.txt	cat
+allow	agent-bash	team:team-reviewer	Bash	project	grep -rn fixture src	grep
+allow	agent-bash	team:team-reviewer	Bash	project	rg fixture	rg
+allow	agent-bash	team:team-reviewer	Bash	project	find . -name '*.md'	find
+allow	agent-bash	team:team-reviewer	Bash	project	wc -l notes.md	wc
+allow	agent-bash	team:team-reviewer	Bash	project	head -20 notes.md	head
+allow	agent-bash	team:team-reviewer	Bash	project	jq . .mcp.json	jq
+allow	agent-bash	team:team-reviewer	Bash	project	sed -n 1,10p notes.md	sed -n
+allow	agent-bash	team:team-reviewer	Bash	project	ls -la	ls
+allow	agent-bash	team:team-reviewer	Bash	project	diff notes.md src/app.txt	diff
+allow	agent-bash	team:team-reviewer	Bash	project	gh pr view 5	gh pr view
+allow	agent-bash	team:team-reviewer	Bash	project	gh pr diff 5	gh pr diff
+allow	agent-bash	team:team-reviewer	Bash	project	gh pr checks 5	gh pr checks
+allow	agent-bash	team:team-reviewer	Bash	project	gh run view 1 --log-failed	gh run view --log-failed
+allow	agent-bash	team:team-reviewer	Bash	project	gh api repos/o/r/pulls/5/files --paginate --jq '.[].filename'	gh api read
+allow	agent-bash	team:team-reviewer	Bash	project	gh pr view 5 --json files | jq '.files[].path'	gh read piped into jq
+allow	agent-bash	team:team-reviewer	Bash	project	team-gh pr view 5 --json files	team-gh read
+allow	agent-bash	team:team-reviewer	Bash	project	team-gh pr comment 5 --body-file /tmp/r.md	reviewer extra: pr comment
+allow	agent-bash	team:team-reviewer	Bash	project	team-gh pr review 5 --comment --body-file /tmp/r.md	reviewer extra: review --comment
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git commit -m x	commit
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git checkout -b x	checkout -b
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git branch -D x	branch -D (not a list form)
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git branch -m new	branch -m (not a list form)
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git merge origin/main	merge
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git push origin feat/12-login	push of a feature branch
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git stash	stash
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git reset --hard	reset
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git worktree add ../x	worktree add
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git symbolic-ref HEAD refs/heads/x	symbolic-ref write
+deny	agent-bash|git-config	team:team-reviewer	Bash	feat-repo	git remote add x /tmp/y	remote add
+deny	agent-bash|git-config	team:team-reviewer	Bash	feat-repo	git config user.name x	config write
+deny	agent-bash|push-main	team:team-reviewer	Bash	feat-repo	git push origin main	push to main
+deny	agent-bash	team:team-reviewer	Bash	feat-repo	git status; rm -rf x	allowed then not allowed
+deny	agent-bash	team:team-reviewer	Bash	project	rm -rf build	rm
+deny	agent-bash	team:team-reviewer	Bash	project	echo x > /tmp/r.md	echo with redirect
+deny	agent-bash	team:team-reviewer	Bash	project	npm test	npm
+deny	agent-bash	team:team-reviewer	Bash	project	make test	make (not a reviewer extra)
+deny	agent-bash	team:team-reviewer	Bash	project	python3 -c 'print(1)'	interpreter
+deny	agent-bash|disguised	team:team-reviewer	Bash	project	cat notes.md | sh	pipe into sh
+deny	agent-bash	team:team-reviewer	Bash	project	team-gh pr merge 5 --auto --squash	merge
+deny	agent-bash	team:team-reviewer	Bash	project	team-gh pr edit 5 --title x	pr edit
+deny	agent-bash	team:team-reviewer	Bash	project	team-gh issue create --title x --body-file /tmp/b	issue create (health only)
+deny	agent-bash|gh-write	team:team-reviewer	Bash	project	team-gh pr review 5 --approve	approve
+deny	agent-bash|gh-write	team:team-reviewer	Bash	project	gh pr create --title x	raw gh write
+deny	agent-bash	team:team-reviewer	Bash	project	team-app up	team-app (qa only)
+deny	agent-bash	team:team-reviewer	Bash	project	curl http://localhost:3000	curl (qa only)
+deny	agent-bash	team:team-reviewer	Bash	project	make e2e	make e2e (qa only)
+deny	agent-bash	team:team-reviewer	Bash	project	make audit	make audit (health only)
+#
+# --- team:team-security ---
+allow	agent-bash	team:team-security	Bash	feat-repo	git diff origin/main...HEAD	read-only git
+allow	agent-bash	team:team-security	Bash	project	grep -rn password src	plain reader
+allow	agent-bash	team:team-security	Bash	project	gh pr diff 5	read-only gh
+allow	agent-bash	team:team-security	Bash	project	team-gh pr comment 5 --body "needs owner-approved"	security extra: pr comment
+allow	agent-bash	team:team-security	Bash	project	team-gh pr review 5 --comment -b "x"	security extra: review --comment
+deny	agent-bash	team:team-security	Bash	project	team-app up	team-app
+deny	agent-bash	team:team-security	Bash	project	make audit	make audit
+deny	agent-bash	team:team-security	Bash	project	team-gh issue create --title x --body-file /tmp/b	issue create
+deny	agent-bash	team:team-security	Bash	feat-repo	git commit -m x	commit
+deny	agent-bash	team:team-security	Bash	project	npm audit fix	npm
+deny	agent-bash|gh-write	team:team-security	Bash	project	team-gh pr review 5 --request-changes -b x	request changes
+#
+# --- team:team-qa ---
+allow	agent-bash	team:team-qa	Bash	project	team-app up	team-app up
+allow	agent-bash	team:team-qa	Bash	project	team-app down	team-app down
+allow	agent-bash	team:team-qa	Bash	project	team-app status	team-app status
+allow	agent-bash	team:team-qa	Bash	project	make e2e	make e2e
+allow	agent-bash	team:team-qa	Bash	project	cd "{PROJ}" && make e2e	cd then make e2e
+allow	agent-bash	team:team-qa	Bash	plain	cd "{PROJ}" && team-app up	cd then team-app up
+allow	agent-bash	team:team-qa	Bash	project	ls -la	ls
+allow	agent-bash	team:team-qa	Bash	project	curl http://localhost:3000/health	curl GET localhost
+allow	agent-bash	team:team-qa	Bash	project	curl -s http://127.0.0.1:8080/api/items	curl GET 127.0.0.1
+allow	agent-bash	team:team-qa	Bash	feat-repo	git diff	read-only git
+allow	agent-bash	team:team-qa	Bash	project	gh pr checks 5	read-only gh
+deny	agent-bash	team:team-qa	Bash	project	make test	make target other than e2e
+deny	agent-bash	team:team-qa	Bash	project	make e2e && make deploy	e2e chained with another target
+deny	agent-bash	team:team-qa	Bash	project	cd "{PROJ}" && make test	cd then another target
+deny	agent-bash	team:team-qa	Bash	project	team-app up && npm test	team-app chained with npm
+deny	agent-bash	team:team-qa	Bash	project	npx playwright test	npx
+deny	agent-bash	team:team-qa	Bash	project	curl -X POST http://localhost:3000/api	curl POST to localhost
+deny	agent-bash	team:team-qa	Bash	project	curl -d x=1 http://localhost:3000/api	curl data to localhost
+deny	agent-bash	team:team-qa	Bash	project	curl https://example.com	curl to a remote host
+deny	agent-bash	team:team-qa	Bash	project	curl http://localhost.evil.example/x	look-alike localhost host
+deny	agent-bash	team:team-qa	Bash	project	team-gh pr comment 5 --body x	pr comment is not a qa extra
+deny	agent-bash	team:team-qa	Bash	feat-repo	git commit -m "test: add e2e"	commit
+deny	agent-bash|script-scan|push-main	team:team-qa	Bash	project	bash scripts/deploy.sh	script
+deny	agent-bash	team:team-qa	Bash	project	rm -rf node_modules	rm
+#
+# --- team:team-health ---
+allow	agent-bash	team:team-health	Bash	project	team-gh issue create --title "health: deps" --body-file /tmp/b --label health	health extra: issue create
+allow	agent-bash	team:team-health	Bash	project	team-gh issue list	health extra: issue list
+allow	agent-bash	team:team-health	Bash	project	team-gh issue list --label health	issue list with a filter
+allow	agent-bash	team:team-health	Bash	project	make audit	health extra: make audit
+allow	agent-bash	team:team-health	Bash	feat-repo	git log --since=30.days	read-only git
+allow	agent-bash	team:team-health	Bash	project	gh run list	read-only gh
+deny	agent-bash	team:team-health	Bash	project	team-gh issue comment 3 --body x	issue comment is not a health extra
+deny	agent-bash	team:team-health	Bash	project	team-gh pr comment 5 --body x	pr comment
+deny	agent-bash	team:team-health	Bash	project	make e2e	make e2e
+deny	agent-bash	team:team-health	Bash	project	make test	make test
+deny	agent-bash	team:team-health	Bash	project	team-app up	team-app
+deny	agent-bash|gh-write	team:team-health	Bash	project	team-gh issue create --title x --label guarded	issue create with a disallowed label
+deny	agent-bash	team:team-health	Bash	project	npm update	npm
+#
+# --- general-purpose / other subagents behave like main for Bash ---
+allow	agent-bash	general-purpose	Bash	feat-repo	git commit -m x	commit
+allow	agent-bash	general-purpose	Bash	project	npm test	npm
+allow	agent-bash	general-purpose	Bash	project	make test	make
+allow	agent-bash	general-purpose	Bash	project	echo hi > /tmp/x	redirect
+allow	agent-bash	general-purpose	Bash	feat-repo	git push -u origin HEAD	feature push
+allow	agent-bash	Explore	Bash	feat-repo	git status	other subagent read
+deny	push-main	general-purpose	Bash	feat-repo	git push origin main	push to main
+deny	merge-admin	general-purpose	Bash	project	team-gh pr merge 5 --admin	--admin
+deny	push-main	Explore	Bash	main-repo	git push	bare push on main from another subagent

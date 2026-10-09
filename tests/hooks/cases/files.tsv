@@ -1,0 +1,161 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# fence-file, workflow-edit (file tools and Bash)
+# standards-repo / std-https: origin path ends /dev-standards(.git); std-fork ends /dev-standards-fork.git
+#
+# --- file tools: fence files ---
+deny	fence-file	main	Write	project	{PROJ}/.claude/settings.json	Write settings.json
+deny	fence-file	main	Edit	project	{PROJ}/.claude/settings.local.json	Edit settings.local.json
+deny	fence-file	main	MultiEdit	project	{PROJ}/.claude/settings.json	MultiEdit settings.json
+deny	fence-file	main	Write	project	{PROJ}/.claude/settings.team.json	settings*.json
+deny	fence-file	main	Write	project	{PROJ}/.claude/agents/helper.md	.claude/agents/**
+deny	fence-file	main	Write	project	{PROJ}/.claude/agents/new/x.md	nested under .claude/agents
+deny	fence-file	main	Edit	project	{PROJ}/.claude/hooks/check.sh	.claude/hooks/**
+deny	fence-file	main	Write	project	{PROJ}/.mcp.json	.mcp.json
+deny	fence-file	main	Edit	project	{PROJ}/.git/config	.git/config
+deny	fence-file	main	Write	project	{PROJ}/.git/hooks/pre-commit	.git/hooks/**
+deny	fence-file	main	Write	project	{HOME}/.claude/settings.json	~/.claude/settings.json
+deny	fence-file	main	Write	project	{HOME}/.claude/CLAUDE.md	anything under ~/.claude
+deny	fence-file	main	Write	project	{HOME}/.claude/agents/x.md	~/.claude/agents
+deny	fence-file	main	NotebookEdit	project	{HOME}/.claude/nb.ipynb	NotebookEdit under ~/.claude
+deny	fence-file	main	Write	project	{PROJ}/.claude/../.claude/settings.json	.. normalisation
+deny	fence-file	main	Write	project	{PROJ}/src/../.claude/settings.json	.. from a subdirectory
+deny	fence-file	main	Write	project	{PROJ}/./.claude/./settings.json	. normalisation
+deny	fence-file	main	Write	plain	{PLAIN}/.claude/settings.json	non-repo folder
+deny	fence-file	general-purpose	Write	project	{PROJ}/.claude/settings.json	from a general subagent
+deny	fence-file	main	Write	standards-repo	{STD}/.claude/settings.json	standards repo's own settings are still fence files
+deny	fence-file	main	Write	project	{FX}/std-fork/managed/.claude/settings.json	managed/ exemption only in the standards repo
+deny	fence-file	main	Write	project	{PROJ}/managed/.claude/settings.json	managed/ in a project is not exempt
+deny	fence-file	main	Write	wt-feat	{FX}/wt-feat/.claude/settings.json	fence file in a linked worktree
+deny	fence-file	main	Bash	wt-feat	echo x > .claude/settings.local.json	Bash write to a fence file in a linked worktree
+deny	fence-file	main	Bash	wt-feat	echo x > .git	overwrite the worktree's .git file
+allow	fence-file	main	Write	project	{PROJ}/src/app.txt	ordinary file
+allow	fence-file	main	Edit	project	{PROJ}/notes.md	ordinary file
+allow	fence-file	main	Write	project	{PROJ}/.claude/rules/style.md	.claude/rules is not a fence path
+allow	fence-file	main	Write	project	{PROJ}/.claude-notes/settings.json	.claude-notes is not .claude
+allow	fence-file	main	Write	project	{PROJ}/docs/claude/settings.json	claude without a dot
+allow	fence-file	main	Write	standards-repo	{STD}/managed/.claude/settings.json	standards exemption managed/
+allow	fence-file	main	Edit	standards-repo	{STD}/tests/fixture-project/.claude/settings.json	standards exemption tests/
+allow	fence-file	main	Write	standards-repo	{STD}/managed/.claude/agents/team-qa.md	standards exemption managed agents
+allow	fence-file	main	Write	standards-repo	{STD}/managed/.mcp.json	standards exemption managed .mcp.json
+allow	fence-file	main	Read	project	{PROJ}/.claude/settings.json	Read tool is not a write
+allow	fence-file	main	Glob	project	.claude/**	Glob tool
+#
+# --- file tools: workflows ---
+deny	workflow-edit	main	Write	project	{PROJ}/.github/workflows/ci.yml	Write project workflow
+deny	workflow-edit	main	Edit	project	{PROJ}/.github/workflows/ci.yml	Edit project workflow
+deny	workflow-edit	main	Write	project	{PROJ}/.github/workflows/new.yml	new project workflow
+deny	workflow-edit	main	Write	project	{FX}/std-fork/.github/workflows/ci.yml	dev-standards-fork is not the standards repo
+deny	workflow-edit	main	Write	plain	{PLAIN}/.github/workflows/x.yml	no origin at all
+allow	workflow-edit	main	Write	standards-repo	{STD}/.github/workflows/ci.yml	standards repo workflow
+allow	workflow-edit	main	Edit	project	{FX}/std-https/.github/workflows/ci.yml	standards repo via https URL without .git
+allow	workflow-edit	main	Write	project	{PROJ}/.github/CODEOWNERS	.github outside workflows
+#
+# --- Bash: writes to fence files ---
+deny	fence-file	main	Bash	project	echo x > .claude/settings.json	redirect
+deny	fence-file	main	Bash	project	echo x >> .claude/settings.local.json	append redirect
+deny	fence-file	main	Bash	project	printf '{}' >| .claude/settings.json	>| clobber
+deny	fence-file	main	Bash	project	echo x &> .claude/settings.json	&> redirect
+deny	fence-file	main	Bash	project	cd .claude && echo x > settings.json	virtual cwd inside .claude
+deny	fence-file	main	Bash	plain	cd {PROJ}/.claude && echo '{}' > settings.json	absolute cd then relative write
+deny	fence-file	main	Bash	plain	cd ~ && echo x > .claude/settings.json	cd ~ then write ~/.claude
+deny	fence-file	main	Bash	project	echo x | tee .claude/settings.json	tee
+deny	fence-file	main	Bash	project	echo x | tee -a .claude/settings.local.json >/dev/null	tee -a
+deny	fence-file	main	Bash	project	sed -i '' 's/a/b/' .claude/settings.json	sed -i
+deny	fence-file	main	Bash	project	sed -i.bak 's/a/b/' .mcp.json	sed -i.bak on .mcp.json
+deny	fence-file	main	Bash	project	cp /tmp/s.json .claude/settings.json	cp onto
+deny	fence-file	main	Bash	project	cp .claude/settings.json /tmp/s.json	cp is not a plain read
+deny	fence-file	main	Bash	project	mv /tmp/s.json .claude/settings.json	mv onto
+deny	fence-file	main	Bash	project	install -m 644 /tmp/x .claude/settings.json	install
+deny	fence-file	main	Bash	project	dd if=/tmp/x of=.claude/settings.json	dd of=
+deny	fence-file	main	Bash	project	rm -rf .claude	remove the whole .claude
+deny	fence-file	main	Bash	project	rm -rf ./.claude/	remove ./.claude/
+deny	fence-file	main	Bash	project	mv .claude /tmp/x	move .claude away
+deny	fence-file	main	Bash	project	rm -rf .git	remove .git
+deny	fence-file	main	Bash	project	rm .git/config	remove .git/config
+deny	fence-file	main	Bash	project	echo '[core]' >> .git/config	append to .git/config
+deny	fence-file	main	Bash	project	echo x > .git/hooks/pre-commit	write a git hook
+deny	fence-file	main	Bash	project	chmod +x .git/hooks/pre-push	chmod a git hook
+deny	fence-file	main	Bash	project	ln -sf /tmp/h .git/hooks/pre-commit	symlink a git hook
+deny	fence-file	main	Bash	project	mkdir -p .claude/hooks	mkdir under .claude/hooks
+deny	fence-file	main	Bash	project	echo x > .claude/agents/new.md	write an agent file
+deny	fence-file	main	Bash	project	echo x > .cl*/settings.json	glob .cl*
+deny	fence-file	main	Bash	project	echo x > .clau?e/settings.json	glob .clau?e
+deny	fence-file	main	Bash	project	cp x .claude/settings*.json	glob settings*.json
+deny	fence-file	main	Bash	project	echo x | tee .claude/settings*.json	tee writes every file the glob matches
+deny	fence-file	main	Bash	project	echo x > .claude/settings.l*.json	redirect to a glob matching one fence file
+deny	fence-file	main	Bash	project	echo x > ~/.claude/x	~/.claude
+deny	fence-file	main	Bash	project	echo x > $HOME/.claude/settings.json	$HOME/.claude
+deny	fence-file	main	Bash	project	echo x > {HOME}/.claude/CLAUDE.md	absolute HOME/.claude
+deny	fence-file	main	Bash	project	touch ~/.claude/x	touch under ~/.claude
+deny	fence-file	main	Bash	project	rm -rf ~/.claude	remove ~/.claude
+deny	fence-file	main	Bash	project	cat /tmp/x > .claude/settings.json	plain reader redirected into a fence file
+deny	fence-file	main	Bash	project	jq '.a=1' .claude/settings.json > /tmp/t && mv /tmp/t .claude/settings.json	jq then mv back
+deny	fence-file	main	Bash	project	sed -n p .claude/settings.json > .mcp.json	sed -n redirected into .mcp.json
+deny	fence-file	main	Bash	project	cat <<'EOF' > .claude/settings.json{NL}{}{NL}EOF	heredoc into a fence file
+deny	fence-file	main	Bash	project	git checkout -- .claude/settings.json	git checkout overwrites it
+deny	fence-file	main	Bash	project	git restore .claude/settings.json	git restore overwrites it
+deny	fence-file	main	Bash	project	vim .claude/settings.json	editor
+deny	fence-file	main	Bash	project	find .claude -name '*.json' -delete	find -delete
+deny	fence-file	main	Bash	project	find .claude -name '*.json' -exec rm {} \;	find -exec rm
+deny	fence-file|script-scan	main	Bash	project	python3 -c "open('.claude/settings.local.json','w').write('{}')"	python3 -c writes settings.local.json
+deny	fence-file|script-scan	main	Bash	project	node -e "require('fs').writeFileSync('.claude/settings.json','{}')"	node -e writes settings.json
+deny	fence-file|script-scan	main	Bash	project	perl -i -pe 's/a/b/' .claude/settings.json	perl -i
+deny	fence-file|script-scan	main	Bash	project	ruby -e 'File.write(".mcp.json", "{}")'	ruby -e writes .mcp.json
+deny	fence-file	main	Bash	standards-repo	echo x > .claude/settings.json	standards repo's own settings
+allow	fence-file	main	Bash	standards-repo	echo x > managed/.claude/settings.json	standards exemption managed/
+allow	fence-file	main	Bash	standards-repo	cp managed/.claude/settings.json tests/fixture-project/.claude/settings.json	standards exemption managed -> tests
+allow	fence-file	main	Bash	standards-repo	sed -i '' 's/a/b/' managed/.mcp.json	standards exemption sed -i
+allow	fence-file	main	Bash	project	touch .claude/rules/x.md	.claude/rules is not a fence path
+#
+# --- Bash: plain reads of fence files (allowed) ---
+allow	fence-file	main	Bash	project	cat .claude/settings.json	cat
+allow	fence-file	main	Bash	project	head -5 .claude/settings.local.json	head
+allow	fence-file	main	Bash	project	tail .mcp.json	tail
+allow	fence-file	main	Bash	project	less .claude/settings.json	less
+allow	fence-file	main	Bash	project	wc -l .claude/settings.json	wc
+allow	fence-file	main	Bash	project	ls -la .claude	ls
+allow	fence-file	main	Bash	project	ls .claude/agents	ls agents
+allow	fence-file	main	Bash	project	grep -r hooks .claude/settings.json	grep
+allow	fence-file	main	Bash	project	rg owner .claude	rg
+allow	fence-file	main	Bash	project	find .claude -name '*.json'	find without -exec/-delete
+allow	fence-file	main	Bash	project	diff .claude/settings.json /tmp/x	diff
+allow	fence-file	main	Bash	project	cmp .mcp.json /tmp/y	cmp
+allow	fence-file	main	Bash	project	file .mcp.json	file
+allow	fence-file	main	Bash	project	stat .claude/settings.json	stat
+allow	fence-file	main	Bash	project	shasum .claude/settings.json	shasum
+allow	fence-file	main	Bash	project	md5 .mcp.json	md5
+allow	fence-file	main	Bash	project	jq . .claude/settings.json	jq
+allow	fence-file	main	Bash	project	jq '.hooks' .claude/settings.json > /tmp/hooks.json	jq redirected to a non-fence path
+allow	fence-file	main	Bash	project	sed -n 1,5p .claude/settings.json	sed -n
+allow	fence-file	main	Bash	project	git diff .claude/settings.json	git diff
+allow	fence-file	main	Bash	project	git show HEAD:.claude/settings.json	git show
+allow	fence-file	main	Bash	project	git log -- .claude/	git log
+allow	fence-file	main	Bash	project	git status .claude	git status
+allow	fence-file	main	Bash	project	git ls-files .claude	git ls-files
+allow	fence-file	main	Bash	project	git check-ignore .claude/settings.local.json	git check-ignore
+allow	fence-file	main	Bash	project	git blame .mcp.json	git blame
+allow	fence-file	main	Bash	project	test -f .claude/settings.json	test
+allow	fence-file	main	Bash	project	[ -f .mcp.json ]	[
+allow	fence-file	main	Bash	project	[ -d .claude ] && cat .claude/settings.json	[ then a plain read
+allow	disguised	main	Bash	project	[ -f package.json ] && echo yes	[ is the test command, not a glob-built name
+allow	disguised	main	Bash	feat-repo	[ -n "$(git status --porcelain)" ] && echo dirty	[ with git inside $( )
+allow	fence-file	main	Bash	project	realpath .claude/settings.json	realpath
+allow	fence-file	main	Bash	project	dirname .claude/settings.json	dirname
+allow	fence-file	main	Bash	project	basename .mcp.json	basename
+allow	fence-file	main	Bash	project	cat .claude/settings.json | jq .permissions	cat piped into jq
+allow	fence-file	main	Bash	project	cat ~/.claude/settings.json	read ~/.claude
+allow	fence-file	main	Bash	project	ls ~/.claude	ls ~/.claude
+allow	fence-file	main	Bash	project	cat .git/config	read .git/config
+allow	fence-file	main	Bash	project	ls .git/hooks	ls .git/hooks
+allow	fence-file	main	Bash	project	grep -c x .claude/settings.json 2>/dev/null	stderr redirect to /dev/null
+#
+# --- Bash: workflows ---
+deny	workflow-edit	main	Bash	project	echo x > .github/workflows/ci.yml	redirect into a project workflow
+deny	workflow-edit	main	Bash	project	sed -i '' 's/a/b/' .github/workflows/ci.yml	sed -i on a project workflow
+deny	workflow-edit	main	Bash	project	rm .github/workflows/ci.yml	remove a project workflow
+deny	workflow-edit	main	Bash	project	cp /tmp/x.yml .github/workflows/	copy into project workflows
+deny	workflow-edit	main	Bash	project	mv .github/workflows/ci.yml /tmp/	move a project workflow away
+deny	workflow-edit	main	Bash	plain	cd {PROJ} && echo x >> .github/workflows/ci.yml	via cd
+allow	workflow-edit	main	Bash	project	cat .github/workflows/ci.yml	read a project workflow
+allow	workflow-edit	main	Bash	standards-repo	echo x >> .github/workflows/ci.yml	write a standards workflow
+allow	workflow-edit	main	Bash	standards-repo	sed -i '' 's/a/b/' .github/workflows/ci.yml	sed -i a standards workflow

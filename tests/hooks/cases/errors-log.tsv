@@ -1,0 +1,59 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# malformed-input, internal-error, timeout; fence.log redaction and length
+# tool RAW = the command/path column is fed to stdin as-is ({EMPTY} = nothing at all).
+# expect "block" = deny or error-deny (both fail closed).
+#
+# --- malformed input -> exit 2, [fence:malformed-input] ---
+error	malformed-input	main	RAW	plain	{EMPTY}	empty stdin
+error	malformed-input	main	RAW	plain	not json	not JSON
+error	malformed-input	main	RAW	plain	{"session_id":"t","hook_event_name":"PreToolUse","cwd":"/tmp","tool_input":{"command":"ls"}}	JSON without tool_name
+error	malformed-input	main	RAW	plain	{"session_id":"t","tool_name":"Bash","tool_input":{"command":"git push origin main"	truncated JSON
+error	malformed-input	main	RAW	plain	[]	JSON array
+error	malformed-input	main	RAW	plain	null	JSON null
+error	malformed-input	main	RAW	plain	"Bash"	JSON string
+error	malformed-input	main	RAW	plain	{"tool_name":"","tool_input":{}}	empty tool_name
+error	malformed-input	main	RAW	plain	{"tool_name":"Bash","tool_input":"git push origin main"}	tool_input is a string
+error	malformed-input	main	RAW	plain	{"tool_name":"Bash","tool_input":{"command":"ls"}} trailing	trailing garbage after the object
+error	malformed-input	main	RAW	plain	{"tool_name":"Read","tool_input":{}}{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}	two concatenated objects
+error	malformed-input	main	RAW	plain	{"tool_name":"Bash","cwd":"/tmp","tool_input":{"command":"git push origin main"}}{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}	two objects, push first (the last one must not win)
+error	malformed-input	main	RAW	plain	{"tool_name":"Bash","tool_input":{"command":"ls"}	unbalanced braces
+#
+# --- RAW but well-formed: subagent identity comes from agent_id ---
+deny	owner-approved	main	RAW	plain	{"session_id":"t","hook_event_name":"PreToolUse","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"team-gh pr edit 5 --add-label owner-approved"},"agent_id":"a9"}	agent_id without agent_type is still a subagent
+allow	malformed-input	main	RAW	plain	{"session_id":"t","hook_event_name":"PreToolUse","cwd":"/tmp","tool_name":"Bash","tool_input":{"command":"ls -la"}}	minimal well-formed input
+#
+# --- internal error (TEAM_FENCE_TEST_FAULT=1) -> exit 2, [fence:internal-error] ---
+error	internal-error	main	Bash	project	ls	forced fault on a harmless command	TEAM_FENCE_TEST_FAULT=1
+error	internal-error	main	Write	project	{PROJ}/src/app.txt	forced fault on a file tool	TEAM_FENCE_TEST_FAULT=1
+error	internal-error	team:team-qa	Bash	project	git status	forced fault in a subagent	TEAM_FENCE_TEST_FAULT=1
+block	internal-error|push-main	main	Bash	feat-repo	git push origin main	fault can never turn a deny into an allow	TEAM_FENCE_TEST_FAULT=1
+deny	push-main	main	Bash	feat-repo	git push origin main	FAULT=0 changes nothing	TEAM_FENCE_TEST_FAULT=0
+#
+allow	internal-error	main	Bash	project	ls	FAULT=0 is not a fault	TEAM_FENCE_TEST_FAULT=0
+allow	internal-error	main	Bash	project	git status	no fault variable at all
+#
+# --- watchdog (TEAM_FENCE_WATCHDOG / TEAM_FENCE_TEST_DELAY) ---
+error	timeout	main	Bash	project	ls	delay 5 > watchdog 2: timeout within 3 s, no sleep left behind	TEAM_FENCE_WATCHDOG=2 TEAM_FENCE_TEST_DELAY=5
+block	timeout|push-main	main	Bash	feat-repo	git push origin main	timeout can never turn a deny into an allow	TEAM_FENCE_WATCHDOG=2 TEAM_FENCE_TEST_DELAY=5
+error	timeout	main	Bash	project	ls	watchdog 1 s	TEAM_FENCE_WATCHDOG=1 TEAM_FENCE_TEST_DELAY=4
+allow	timeout	main	Bash	project	ls	delay 1 < watchdog 3: decision still made	TEAM_FENCE_WATCHDOG=3 TEAM_FENCE_TEST_DELAY=1
+block	push-main|internal-error	main	Bash	feat-repo	git push origin main	garbage watchdog value can never allow a push to main	TEAM_FENCE_WATCHDOG=abc
+#
+# --- fence.log: one line per deny, secrets redacted, <= 300 chars (checked for every deny) ---
+deny	merge-admin	main	Bash	project	GH_TOKEN=ghp_s3cr3tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA gh pr merge 5 --admin	ghp_ token in prefix
+deny	release-write	main	Bash	project	GITHUB_TOKEN=s3cr3tvalue gh release create v1	*TOKEN*= value
+deny	push-main	main	Bash	feat-repo	MY_SECRET=s3cr3tvalue git push origin main	*SECRET*= value
+deny	force-push	main	Bash	feat-repo	DB_PASSWORD=s3cr3tvalue git push --force	*PASSWORD*= value
+deny	gh-write	main	Bash	project	API_KEY=s3cr3tvalue gh repo delete someone/x --yes	*KEY*= value
+deny	push-main	main	Bash	feat-repo	git push https://x-access-token:github_pat_s3cr3tBBBBBBBBBBBBBBBBBBBBBB@github.com/o/r.git HEAD:main	github_pat_ in a URL
+deny	push-main	main	Bash	feat-repo	git push https://ghp_s3cr3tCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC@github.com/o/r.git HEAD:main	ghp_ in a URL
+deny	curl-github-write	main	Bash	project	curl -H 'Authorization: Bearer s3cr3tDDDDDD' -d x https://api.github.com/x	Bearer header
+deny	gh-write	main	Bash	project	gh secret set API_TOKEN --body gho_s3cr3tEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE	gho_ token as an argument
+deny	push-main	main	Bash	feat-repo	echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; git push origin main	long command: log text <= 300 chars
+deny	agent-tool|fence-file	team:team-reviewer	Write	project	{PROJ}/.claude/settings.json	log records the agent_type
+#
+# --- size and encoding ---
+deny	push-main	main	Bash	feat-repo	{ECHO500}git push origin main	push to main after 500 chained commands (parser must scale, not time out)
+allow	push-main	main	Bash	feat-repo	{ECHO500}git status	500 chained harmless commands
+allow	push-main	main	Bash	feat-repo	git commit -m "fix: ñandú — día 日本語"	non-ASCII commit message
+deny	push-main	main	Bash	feat-repo	echo "ñandú" && git push origin main	non-ASCII text before a push to main

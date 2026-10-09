@@ -1,0 +1,97 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# script-scan (scripts, interpreters, make recipes) and message text that must pass
+# project fixtures: scripts/deploy.sh (pushes main), scripts/clean.sh (harmless), scripts/settings.sh (writes .claude),
+#   scripts/admin-merge.sh (gh pr merge --admin), scripts/release.py (subprocess + git push), scripts/ok.py,
+#   scripts/write-settings.py, scripts/env.py (.env.production), scripts/tool.js (child_process + gh), scripts/ok.js,
+#   scripts/api.rb (system + curl POST api.github.com), scripts/gh-api.py (api.github.com + POST), scripts/gh-get.py,
+#   scripts/push-feat.sh (git push -u origin HEAD), Makefile (harmless), bad.mk (git push origin main),
+#   sub/Makefile (G=git; $$G push origin main), tag.mk (git tag + push tag), ./team-gh and {FX}/tmpbin/team-gh (push main)
+#
+# --- shell scripts ---
+deny	script-scan|push-main	main	Bash	project	bash scripts/deploy.sh	bash <file> that pushes to main
+deny	script-scan|push-main	main	Bash	project	sh scripts/deploy.sh	sh <file>
+deny	script-scan|push-main	main	Bash	project	zsh scripts/deploy.sh --dry-run	zsh <file> with args
+deny	script-scan|push-main	main	Bash	project	bash -x scripts/deploy.sh	bash option before the file
+deny	script-scan|push-main	main	Bash	project	./scripts/deploy.sh	path-invoked ./
+deny	script-scan|push-main	main	Bash	project	scripts/deploy.sh	path-invoked relative
+deny	script-scan|push-main	main	Bash	plain	{PROJ}/scripts/deploy.sh	path-invoked absolute
+deny	script-scan|push-main	main	Bash	project	source scripts/deploy.sh	source <file>
+deny	script-scan|push-main	main	Bash	project	. scripts/deploy.sh	. <file>
+deny	script-scan|push-main	main	Bash	project	cd scripts && ./deploy.sh	path-invoked after cd
+deny	script-scan|push-main	main	Bash	project	echo start && bash scripts/deploy.sh && echo done	inside a compound command
+deny	script-scan|fence-file	main	Bash	project	bash scripts/settings.sh	script writes .claude/settings.json
+deny	script-scan|merge-admin	main	Bash	project	bash scripts/admin-merge.sh 5	script merges with --admin
+deny	script-scan|push-main	main	Bash	project	./team-gh pr view 5	./team-gh is not trusted, it is scanned
+deny	script-scan|push-main	main	Bash	project	{FX}/tmpbin/team-gh pr view 5	team-gh outside the plugin bin is not trusted
+allow	script-scan	main	Bash	project	bash scripts/clean.sh	harmless script
+allow	script-scan	main	Bash	project	./scripts/clean.sh	harmless path-invoked script
+allow	script-scan	main	Bash	project	bash scripts/push-feat.sh	script pushes the feature branch
+allow	script-scan	main	Bash	project	bash scripts/missing.sh	missing file is allowed
+allow	script-scan	main	Bash	project	./scripts/missing.sh	missing path-invoked file is allowed
+allow	script-scan	main	Bash	project	team-gh pr view 5	bare team-gh is trusted (not the ./team-gh in cwd)
+allow	script-scan	main	Bash	project	{PLUGIN}/bin/team-gh pr view 5	team-gh in the plugin bin is trusted
+allow	script-scan	main	Bash	project	{PLUGIN}/bin/team-hooks --check	plugin bin path is trusted
+allow	script-scan	main	Bash	plain	./run.sh	harmless script in a plain folder
+#
+# --- non-shell code ---
+deny	script-scan	main	Bash	project	python3 scripts/release.py	python subprocess + git push
+deny	script-scan	main	Bash	project	python scripts/release.py	python (unversioned)
+deny	script-scan	main	Bash	project	python3 -u scripts/release.py	python option before the file
+deny	script-scan|fence-file	main	Bash	project	python3 scripts/write-settings.py	python names a fence path
+deny	script-scan|credential-read	main	Bash	project	python3 scripts/env.py	python names a production env file
+deny	script-scan	main	Bash	project	python3 scripts/gh-api.py	python api.github.com with POST
+deny	script-scan	main	Bash	project	node scripts/tool.js	node child_process + gh
+deny	script-scan	main	Bash	project	ruby scripts/api.rb	ruby system( + curl POST to api.github.com
+deny	script-scan	main	Bash	project	python3 -c 'import os; os.system("git push origin main")'	python3 -c os.system git
+deny	script-scan	main	Bash	project	python3 -c "import subprocess; subprocess.run(['gh','pr','merge','5','--admin'])"	python3 -c subprocess gh
+deny	script-scan	main	Bash	project	node -e "require('child_process').execSync('gh pr merge 5 --admin')"	node -e child_process + gh
+deny	script-scan	main	Bash	project	node -e "require('child_process').spawnSync('git',['push','origin','main'])"	node -e spawnSync git
+deny	script-scan	main	Bash	project	perl -e 'system("git push origin main")'	perl -e system(
+deny	script-scan	main	Bash	project	perl -e 'qx(git push origin main)'	perl -e qx
+deny	script-scan	main	Bash	project	ruby -e '`git push origin main`'	ruby -e backticks
+deny	script-scan	main	Bash	project	ruby -e 'require "open3"; Open3.capture2("ssh 192.0.2.10")'	ruby -e Open3 + ssh
+deny	script-scan|credential-read	main	Bash	project	python3 -c "print(open('.env.production').read())"	python3 -c reads a production env file
+allow	script-scan	main	Bash	project	python3 scripts/ok.py	harmless python
+allow	script-scan	main	Bash	project	python3 scripts/gh-get.py	python GET from api.github.com
+allow	script-scan	main	Bash	project	node scripts/ok.js	harmless node
+allow	script-scan	main	Bash	project	python3 scripts/missing.py	missing python file is allowed
+allow	script-scan	main	Bash	project	python3 -c 'print(1)'	harmless python3 -c
+allow	script-scan	main	Bash	project	node -e 'console.log(1)'	harmless node -e
+allow	script-scan	main	Bash	project	python3 -c "import subprocess; subprocess.run(['ls'])"	spawn primitive without a sensitive tool word
+allow	script-scan	main	Bash	project	python3 -c "print('git push origin main')"	sensitive word without a spawn primitive
+#
+# --- make ---
+allow	script-scan	main	Bash	project	make test	harmless recipe
+allow	script-scan	main	Bash	project	make	default target is harmless
+allow	script-scan	main	Bash	project	make lint e2e	several harmless targets
+allow	script-scan	main	Bash	plain	make -C {PROJ} test	make -C into the project
+allow	script-scan	main	Bash	project	make -f missing.mk x	missing makefile is allowed
+deny	script-scan|push-main	main	Bash	project	make -f bad.mk ship	recipe pushes to main
+deny	script-scan|push-main	main	Bash	project	make -f bad.mk	default target pushes to main
+deny	script-scan|push-main	main	Bash	plain	make -C {PROJ} -f bad.mk ship	-C plus -f
+deny	script-scan|disguised|push-main	main	Bash	project	make -C sub	$$G becomes $G: name from a variable
+deny	script-scan|disguised|push-main	main	Bash	project	make -C sub all	explicit target
+deny	script-scan|disguised|push-main	main	Bash	project	cd sub && make	make after cd
+deny	script-scan|tag-write|push-tags	main	Bash	project	make -f tag.mk release	recipe creates and pushes a tag
+#
+# --- message text must ALLOW ---
+allow	push-main	main	Bash	feat-repo	git commit -m "never git push origin main --force"	commit message mentions a forbidden push
+allow	push-main	main	Bash	feat-repo	git commit -m 'docs: explain why we never git push --force'	single-quoted message
+allow	merge-admin	main	Bash	feat-repo	git commit -m "fix: gh pr merge --admin is fenced"	message mentions --admin
+allow	fence-file	main	Bash	feat-repo	git commit -m "chore: update .claude/settings.json allowlist"	message names a fence file
+allow	owner-approved	main	Bash	feat-repo	git commit -m "bump" -m "owner-approved later; ssh 192.0.2.10 is blocked"	second -m paragraph
+allow	curl-github-write	main	Bash	feat-repo	git commit -m "curl -X POST https://api.github.com"	message mentions a curl POST
+allow	release-write	main	Bash	feat-repo	git commit -F - <<'EOF'{NL}fix: never git push origin main --force{NL}gh release create v1 is not ours{NL}EOF	heredoc commit message
+allow	merge-admin	main	Bash	feat-repo	git commit -m "$(cat <<'EOF'{NL}fix: stop gh pr merge --admin{NL}EOF{NL})"	heredoc inside $( ) message
+allow	push-main	main	Bash	project	team-gh pr create --title "fix: push to main bug" --body-file /tmp/b	PR title mentions push to main
+allow	fence-file	main	Bash	project	team-gh pr create --title "chore: drop git tag v1 and gh release create" --body "never rm -rf .claude"	title and body mention forbidden actions
+allow	nested-claude	main	Bash	project	team-gh pr create --title "claude -p is fenced" --body-file /tmp/b	title mentions nested claude
+allow	ssh-dest	main	Bash	project	team-gh issue create --title "ssh 192.0.2.10 is blocked" --body-file /tmp/b --label bug	issue title mentions the VPS IP
+allow	owner-approved	main	Bash	project	team-gh pr comment 5 --body "owner: please run team-gh pr edit 5 --add-label owner-approved"	comment mentions owner-approved
+allow	push-main	main	Bash	project	team-gh pr comment 5 --body-file - <<'EOF'{NL}Please do not git push origin main or eval anything{NL}EOF	comment body from a heredoc
+allow	merge-admin	main	Bash	project	cat > /tmp/body.md <<'EOF'{NL}Ran gh pr merge 5 --admin? No. git push --force? No. curl -X POST https://api.github.com? No.{NL}EOF	heredoc body to a temp file
+allow	push-main	main	Bash	project	echo "git push origin main"	echo argument is data
+allow	release-write	main	Bash	project	printf '%s\n' 'gh release create v1'	printf argument is data
+allow	push-main	main	Bash	feat-repo	git log --grep="push to main"	grep pattern mentions main
+allow	push-main	main	Bash	project	grep -rn "git push origin main" src	grep pattern mentions a push
+allow	push-main	main	Bash	feat-repo	git commit -m "x" # git push origin main	push only inside a comment

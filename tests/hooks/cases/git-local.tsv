@@ -1,0 +1,113 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# skip-hooks, hooks-path, git-config, tag-write
+#
+# --- skip-hooks ---
+deny	skip-hooks	main	Bash	feat-repo	git commit --no-verify -m "x"	commit --no-verify
+deny	skip-hooks	main	Bash	feat-repo	git commit -m "fix" --no-verify	--no-verify after the message
+deny	skip-hooks	main	Bash	feat-repo	git commit -n -m "x"	commit -n
+deny	skip-hooks	main	Bash	feat-repo	git commit -nm "x"	short group -nm
+deny	skip-hooks	main	Bash	feat-repo	git commit -anm "wip"	short group -anm
+deny	skip-hooks	main	Bash	feat-repo	git commit -am "x" -n	-n after -am
+deny	skip-hooks	main	Bash	feat-repo	git push --no-verify origin feat/12-login	push --no-verify
+deny	skip-hooks	main	Bash	feat-repo	git merge --no-verify origin/main	merge --no-verify
+deny	skip-hooks	main	Bash	main-repo	git -C {FEAT} commit --no-verify -m x	-C plus --no-verify
+deny	skip-hooks	main	Bash	feat-repo	git add -A && git commit --no-verify -m x	compound
+allow	skip-hooks	main	Bash	feat-repo	git commit -m "x"	plain commit
+allow	skip-hooks	main	Bash	feat-repo	git commit -am "x"	commit -am
+allow	skip-hooks	main	Bash	feat-repo	git commit -m "skip --no-verify next time"	--no-verify only inside the message
+allow	skip-hooks	main	Bash	feat-repo	git commit -m "-n flag"	-n only inside the message
+allow	skip-hooks	main	Bash	feat-repo	git commit --amend --no-edit	amend
+allow	skip-hooks	main	Bash	feat-repo	git commit -s -v -m x	other short flags
+allow	skip-hooks	main	Bash	feat-repo	git log -n 5	-n on log is not skip-hooks
+#
+# --- hooks-path ---
+deny	hooks-path	main	Bash	feat-repo	git config core.hooksPath /tmp/h	set core.hooksPath
+deny	hooks-path	main	Bash	feat-repo	git config --local core.hooksPath .githooks	--local
+deny	hooks-path	main	Bash	feat-repo	git config --global core.hooksPath /tmp/h	--global
+deny	hooks-path|git-config	main	Bash	feat-repo	git config core.hookspath /tmp/h	key is case-insensitive
+deny	hooks-path|git-config	main	Bash	feat-repo	git config --unset core.hooksPath	unset is a write
+deny	hooks-path	main	Bash	feat-repo	git -c core.hooksPath=/dev/null commit -m x	-c override
+deny	hooks-path	main	Bash	feat-repo	git -c core.hooksPath= commit -m x	-c empty override
+deny	hooks-path	main	Bash	feat-repo	git -c CORE.HOOKSPATH=/tmp commit -m x	-c key upper case
+deny	hooks-path	main	Bash	plain	git -C {FEAT} config core.hooksPath /tmp/h	via -C
+allow	hooks-path	main	Bash	feat-repo	git config --get core.hooksPath	read
+allow	hooks-path	main	Bash	feat-repo	team-hooks	team-hooks is the only setter
+allow	hooks-path	main	Bash	feat-repo	team-hooks --check	team-hooks --check
+#
+# --- git-config ---
+deny	git-config	main	Bash	feat-repo	git config user.email x@example.test	write of an ordinary key
+deny	git-config	main	Bash	feat-repo	git config --global user.name X	--global write
+deny	git-config	main	Bash	feat-repo	git config --unset user.name	--unset
+deny	git-config	main	Bash	feat-repo	git config --add remote.origin.push HEAD:main	--add
+deny	git-config	main	Bash	feat-repo	git config remote.origin.url git@github.com:evil/x.git	rewrite origin URL
+deny	git-config	main	Bash	feat-repo	git config --replace-all user.name x	--replace-all
+deny	git-config	main	Bash	feat-repo	git config --edit	--edit
+deny	git-config	main	Bash	feat-repo	git config set user.name x	new-style set subcommand
+deny	git-config	main	Bash	feat-repo	git config alias.p "push origin main"	alias write
+deny	git-config	main	Bash	feat-repo	git remote add evil git@github.com:evil/x.git	remote add
+deny	git-config	main	Bash	feat-repo	git remote set-url origin git@github.com:evil/x.git	remote set-url
+deny	git-config	main	Bash	feat-repo	git remote set-url --push origin x	remote set-url --push
+deny	git-config	main	Bash	feat-repo	git remote rename origin old	remote rename
+deny	git-config	main	Bash	feat-repo	git remote remove origin	remote remove
+deny	git-config	main	Bash	feat-repo	git remote rm origin	remote rm
+deny	git-config	main	Bash	feat-repo	git remote set-head origin main	remote set-head
+deny	git-config	main	Bash	feat-repo	git -c credential.helper= fetch	-c key outside the allowlist
+deny	git-config|ssh-form	main	Bash	feat-repo	git -c core.sshCommand="ssh -F /tmp/x" fetch	-c core.sshCommand
+deny	git-config	main	Bash	feat-repo	git -c remote.origin.url=/tmp/other push origin HEAD	-c remote url override
+deny	git-config	main	Bash	feat-repo	git -c protocol.allow=always fetch	-c protocol.allow
+deny	git-config	main	Bash	feat-repo	git -c core.pager=cat log	-c core.pager is not allowlisted
+deny	git-config	main	Bash	feat-repo	git -c alias.st=!sh status	-c alias
+deny	git-config	main	Bash	feat-repo	git -c http.extraHeader="Authorization: Bearer s3cr3tAbcDef123" fetch	-c http header; log must redact the token
+allow	git-config	main	Bash	feat-repo	git -c user.name=Bot -c user.email=bot@example.test commit -m x	allowlisted user.*
+allow	git-config	main	Bash	feat-repo	git -c color.ui=always log	color.*
+allow	git-config	main	Bash	feat-repo	git -c advice.detachedHead=false status	advice.*
+allow	git-config	main	Bash	plain	git -c init.defaultBranch=main init x	init.defaultbranch
+allow	git-config	main	Bash	feat-repo	git -c core.quotepath=off status	core.quotepath
+allow	git-config	main	Bash	feat-repo	git -c core.autocrlf=false diff	core.autocrlf
+allow	git-config	main	Bash	feat-repo	git -c push.default=current push origin HEAD	push.default on a feature branch
+allow	git-config	main	Bash	feat-repo	git -c push.autoSetupRemote=true push	push.autosetupremote on a feature branch
+allow	git-config	main	Bash	feat-repo	git -c pull.rebase=false pull	pull.rebase
+allow	git-config	main	Bash	feat-repo	git -c commit.gpgsign=false commit -m x	commit.gpgsign
+allow	git-config	main	Bash	feat-repo	git -c log.showSignature=false log	log.*
+allow	git-config	main	Bash	feat-repo	git -c format.pretty=oneline log	format.*
+allow	git-config	main	Bash	feat-repo	git -c diff.renames=true diff	diff.renames
+allow	git-config	main	Bash	feat-repo	git -c USER.NAME=x commit -m y	allowlist is case-insensitive
+allow	git-config	main	Bash	feat-repo	git config --get remote.origin.url	--get
+allow	git-config	main	Bash	feat-repo	git config --get-all remote.origin.fetch	--get-all
+allow	git-config	main	Bash	feat-repo	git config --get-regexp '^user\.'	--get-regexp
+allow	git-config	main	Bash	feat-repo	git config --list --show-origin	--list --show-origin
+allow	git-config	main	Bash	feat-repo	git config -l	-l
+allow	git-config	main	Bash	feat-repo	git config --show-scope --get user.name	--show-scope
+allow	git-config	main	Bash	feat-repo	git remote -v	remote -v
+allow	git-config	main	Bash	feat-repo	git remote	remote list
+allow	git-config	main	Bash	feat-repo	git remote show origin	remote show
+allow	git-config	main	Bash	feat-repo	git remote get-url origin	remote get-url
+#
+# --- tag-write ---
+deny	tag-write	main	Bash	feat-repo	git tag v1.0.0	lightweight tag
+deny	tag-write	main	Bash	feat-repo	git tag -a v1.0.0 -m "release"	annotated tag
+deny	tag-write	main	Bash	main-repo	git tag -d v9.9.9	delete tag
+deny	tag-write	main	Bash	main-repo	git tag --delete v9.9.9	--delete
+deny	tag-write	main	Bash	main-repo	git tag -f v9.9.9	move tag
+deny	tag-write	main	Bash	feat-repo	git tag -s v1 -m x	signed tag
+deny	tag-write	main	Bash	feat-repo	git tag v1.0.0 HEAD~1	tag a commit
+deny	tag-write	main	Bash	feat-repo	git update-ref refs/tags/v2 HEAD	update-ref refs/tags
+deny	tag-write	main	Bash	main-repo	git update-ref -d refs/tags/v9.9.9	update-ref -d refs/tags
+deny	tag-write	main	Bash	feat-repo	git -C {MAIN} tag v2	via -C
+deny	tag-write	main	Bash	feat-repo	cd {MAIN} && git tag v2	via cd
+deny	tag-write	main	Bash	feat-repo	git tag -l 'v*' && git tag v2	list then create
+allow	tag-write	main	Bash	main-repo	git tag	list
+allow	tag-write	main	Bash	main-repo	git tag -l	-l
+allow	tag-write	main	Bash	main-repo	git tag --list 'v*'	--list pattern
+allow	tag-write	main	Bash	main-repo	git tag --contains HEAD	--contains
+allow	tag-write	main	Bash	main-repo	git tag --points-at HEAD	--points-at
+allow	tag-write	main	Bash	main-repo	git tag -n	-n
+allow	tag-write	main	Bash	main-repo	git tag --sort=-v:refname	--sort
+allow	tag-write	main	Bash	main-repo	git tag -v v9.9.9	-v verify
+allow	tag-write	main	Bash	main-repo	git tag --merged main	--merged
+allow	tag-write	main	Bash	main-repo	git tag --no-merged main	--no-merged
+allow	tag-write	main	Bash	main-repo	git tag -l --sort=-creatordate 'v*'	-l --sort pattern
+allow	tag-write	main	Bash	main-repo	git describe --tags	describe
+allow	tag-write	main	Bash	main-repo	git show v9.9.9	show a tag
+allow	tag-write	main	Bash	main-repo	git show-ref --tags	show-ref --tags
+allow	tag-write	main	Bash	feat-repo	git update-ref refs/heads/feat/x HEAD	update-ref on a branch ref is not tag-write

@@ -1,0 +1,228 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# gh-write, gh-api-write, gh-credential, owner-approved, release-write, merge-admin, merge-no-auto
+# The three gh forms: raw `gh`, `team-gh`, and `GH_TOKEN=… gh` (= raw gh).
+#
+# --- raw gh reads (allowed) ---
+allow	gh-write	main	Bash	project	gh pr view 5	pr view
+allow	gh-write	main	Bash	project	gh pr list --state all --limit 5 --json author	pr list
+allow	gh-write	main	Bash	project	gh pr diff 5	pr diff
+allow	gh-write	main	Bash	project	gh pr checks 5	pr checks
+allow	gh-write	main	Bash	project	gh pr status	pr status
+allow	gh-write	main	Bash	project	gh pr checkout 5	pr checkout
+allow	gh-write	main	Bash	project	gh issue view 3 --comments	issue view
+allow	gh-write	main	Bash	project	gh issue list --label bug	issue list
+allow	gh-write	main	Bash	project	gh issue status	issue status
+allow	gh-write	main	Bash	project	gh repo view	repo view
+allow	gh-write	main	Bash	project	gh repo list someone	repo list
+allow	gh-write	main	Bash	plain	gh repo clone someone/project	repo clone
+allow	gh-write	main	Bash	project	gh run view 123 --log-failed	run view --log-failed
+allow	gh-write	main	Bash	project	gh run list	run list
+allow	gh-write	main	Bash	project	gh run watch 123	run watch
+allow	gh-write	main	Bash	project	gh run download 123	run download
+allow	gh-write	main	Bash	project	gh workflow view ci.yml	workflow view
+allow	gh-write	main	Bash	project	gh workflow list	workflow list
+allow	release-write	main	Bash	project	gh release view v1.0.0	release view
+allow	release-write	main	Bash	project	gh release list	release list
+allow	release-write	main	Bash	project	gh release download v1.0.0	release download
+allow	gh-write	main	Bash	project	gh label list	label list
+allow	gh-write	main	Bash	project	gh search issues "push to main"	search issues
+allow	gh-write	main	Bash	project	gh search prs --author @me	search prs
+allow	gh-write	main	Bash	project	gh status	status
+allow	gh-write	main	Bash	project	gh browse --no-browser	browse --no-browser
+allow	gh-write	main	Bash	project	gh ruleset list	ruleset list
+allow	gh-write	main	Bash	project	gh ruleset view 1	ruleset view
+allow	gh-write	main	Bash	project	gh ruleset check	ruleset check
+allow	gh-write	main	Bash	project	gh secret list	secret list
+allow	gh-write	main	Bash	project	gh variable list	variable list
+allow	gh-write	main	Bash	project	gh variable get OWNER_LOGIN	variable get
+allow	gh-write	main	Bash	project	gh cache list	cache list
+allow	gh-write	main	Bash	project	gh gist view abc123	gist view
+allow	gh-write	main	Bash	project	gh gist list	gist list
+allow	gh-credential	main	Bash	project	gh auth status	auth status without token
+allow	gh-write	main	Bash	project	gh --version	--version
+allow	gh-write	main	Bash	project	gh help	help
+allow	gh-api-write	main	Bash	project	gh api user --jq .login	api read
+allow	gh-api-write	main	Bash	project	gh api repos/o/r/pulls --paginate --jq '.[].number'	api --paginate --jq
+allow	gh-write	main	Bash	project	GH_TOKEN=x gh pr view 5	GH_TOKEN form, read
+allow	gh-write	main	Bash	project	team-gh pr view 5	team-gh read
+allow	gh-write	main	Bash	project	team-gh pr list --json number	team-gh read
+allow	release-write	main	Bash	project	team-gh release list	team-gh release list
+allow	owner-approved	main	Bash	project	gh pr view 5 --json labels --jq '.labels[].name' | grep -c owner-approved	read mentioning owner-approved
+#
+# --- raw gh writes (gh-write) ---
+deny	gh-write	main	Bash	project	gh pr create --title t --body b	raw pr create
+deny	gh-write	main	Bash	project	gh pr comment 5 --body hi	raw pr comment
+deny	gh-write	main	Bash	project	gh pr edit 5 --add-label bug	raw pr edit
+deny	gh-write	main	Bash	project	gh pr close 5	pr close
+deny	gh-write	main	Bash	project	gh pr reopen 5	pr reopen
+deny	gh-write	main	Bash	project	gh pr ready 5	pr ready
+deny	gh-write	main	Bash	project	gh pr review 5 --approve	raw pr review
+deny	gh-write	main	Bash	project	gh issue create --title t --body b	raw issue create
+deny	gh-write	main	Bash	project	gh issue close 3	issue close
+deny	gh-write	main	Bash	project	gh issue comment 3 --body x	raw issue comment
+deny	gh-write	main	Bash	project	gh label create foo	label create
+deny	gh-write	main	Bash	project	gh repo edit --default-branch x	repo edit
+deny	gh-write	main	Bash	project	gh repo create x --private	repo create
+deny	gh-write	main	Bash	project	gh repo delete someone/x --yes	repo delete
+deny	gh-write	main	Bash	project	gh repo fork	repo fork
+deny	gh-write	main	Bash	project	gh secret set FOO	secret set
+deny	gh-write	main	Bash	project	gh variable set FOO --body x	variable set
+deny	gh-write	main	Bash	project	gh workflow run ci.yml	workflow run
+deny	gh-write	main	Bash	project	gh workflow disable ci.yml	workflow disable
+deny	gh-write	main	Bash	project	gh run rerun 123	run rerun
+deny	gh-write	main	Bash	project	gh run cancel 123	run cancel
+deny	gh-write	main	Bash	project	gh cache delete --all	cache delete
+deny	gh-write	main	Bash	project	gh gist create a.txt	gist create
+deny	gh-write	main	Bash	project	gh alias set p 'pr merge --admin'	alias set
+deny	gh-write	main	Bash	project	gh extension install someone/gh-x	extension install
+deny	gh-write	main	Bash	project	gh browse	browse without --no-browser is not on the read list
+deny	gh-write	main	Bash	project	gh pr merge 5 --auto --squash	raw gh may not merge even with --auto
+deny	gh-write|merge-no-auto	main	Bash	project	gh pr merge 5 --squash	raw merge without --auto
+deny	gh-write	main	Bash	project	GH_TOKEN=x gh pr create --title t	GH_TOKEN form write
+deny	gh-write	main	Bash	project	GH_TOKEN=x gh issue close 3	GH_TOKEN form write
+deny	gh-write	main	Bash	project	/opt/homebrew/bin/gh pr close 5	gh by absolute path
+deny	gh-write	main	Bash	project	gh pr view 5 && gh pr close 5	read then write
+#
+# --- team-gh allowed writes ---
+allow	gh-write	main	Bash	project	team-gh pr create --title "feat: x" --body-file /tmp/b --base main	pr create
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --title "feat: better title"	pr edit title
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --body-file /tmp/b	pr edit body-file
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --base main	pr edit base
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --add-label needs-info	allowed label needs-info
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --add-label fixes-main	allowed label fixes-main
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --add-label bug	allowed label bug
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --add-label feature	allowed label feature
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --add-label client-request	allowed label client-request
+allow	gh-write	main	Bash	project	team-gh pr edit 5 --add-label health	allowed label health
+allow	gh-write	main	Bash	project	team-gh pr comment 5 --body "looks good"	pr comment
+allow	gh-write	main	Bash	project	team-gh pr comment 5 --body-file /tmp/c	pr comment body-file
+allow	gh-write	main	Bash	project	team-gh pr review 5 --comment --body "nit"	pr review --comment
+allow	merge-no-auto	main	Bash	project	team-gh pr merge 5 --auto --squash	auto squash merge
+allow	merge-no-auto	main	Bash	project	team-gh pr merge 5 --auto --squash --delete-branch	auto squash merge, delete branch
+allow	merge-no-auto	main	Bash	project	team-gh pr merge --auto --squash 5	number last
+allow	merge-no-auto	main	Bash	project	team-gh pr merge 5 --squash --auto	flag order swapped
+allow	gh-write	main	Bash	project	team-gh issue create --title t --body-file /tmp/b --label bug	issue create with allowed label
+allow	gh-write	main	Bash	project	team-gh issue create --title t --body-file /tmp/b	issue create no label
+allow	gh-write	main	Bash	project	team-gh issue comment 3 --body x	issue comment
+allow	gh-write	main	Bash	project	team-gh issue edit 3 --add-label bug	issue edit add allowed label
+allow	merge-admin	main	Bash	project	team-merge-if-green 5	trusted pack command
+#
+# --- team-gh refused writes (gh-write) ---
+deny	gh-write	main	Bash	project	team-gh pr edit 5 --add-label guarded	label not on the allowed list
+deny	gh-write	main	Bash	project	team-gh pr edit 5 --add-label release	label not on the allowed list
+deny	gh-write	main	Bash	project	team-gh pr edit 5 --add-label bug,guarded	comma list with a disallowed label
+deny	gh-write	main	Bash	project	team-gh pr edit 5 --remove-label bug	remove-label is not an allowed edit
+deny	gh-write	main	Bash	project	team-gh pr review 5 --approve	approve
+deny	gh-write	main	Bash	project	team-gh pr review 5 --request-changes -b x	request changes
+deny	gh-write	main	Bash	project	team-gh pr review 5 -a	approve short flag
+deny	gh-write	main	Bash	project	team-gh pr review 5 --comment --approve	comment plus approve
+deny	gh-write	main	Bash	project	team-gh issue create --title t --label guarded	issue label not allowed
+deny	gh-write	main	Bash	project	team-gh issue edit 3 --add-label guarded	issue edit label not allowed
+deny	gh-write	main	Bash	project	team-gh issue edit 3 --title x	issue edit other than add-label
+deny	gh-write	main	Bash	project	team-gh issue close 3	issue close
+deny	gh-write	main	Bash	project	team-gh pr close 5	pr close
+deny	gh-write	main	Bash	project	team-gh repo edit --visibility public	repo settings
+deny	gh-write	main	Bash	project	team-gh secret set X	secrets
+deny	gh-write	main	Bash	project	team-gh variable set X --body y	variables
+deny	gh-write	main	Bash	project	team-gh workflow run ci.yml	workflow run
+deny	gh-write	main	Bash	project	team-gh label create x	label create
+deny	gh-write	main	Bash	project	team-gh run rerun 1	run rerun
+deny	gh-write	main	Bash	project	team-gh alias set x y	alias
+deny	gh-write	main	Bash	project	team-gh extension install x/y	extension
+deny	gh-write	main	Bash	project	team-gh pr merge 5 --merge --auto	merge strategy other than squash
+deny	gh-write	main	Bash	project	team-gh pr merge 5 --rebase --auto	rebase merge
+#
+# --- merge-admin / merge-no-auto ---
+deny	merge-admin	main	Bash	project	gh pr merge 5 --admin	raw --admin
+deny	merge-admin	main	Bash	project	team-gh pr merge 5 --admin --squash	team-gh --admin
+deny	merge-admin	main	Bash	project	team-gh pr merge 5 --auto --squash --admin	--admin even with --auto
+deny	merge-admin	main	Bash	project	GH_TOKEN=x gh pr merge 5 --admin	GH_TOKEN form --admin
+deny	merge-no-auto	main	Bash	project	team-gh pr merge 5 --squash	team-gh merge without --auto
+deny	merge-no-auto	main	Bash	project	team-gh pr merge 5	team-gh merge, no flags
+deny	merge-no-auto	main	Bash	project	cd {PROJ} && team-gh pr merge 5 --squash --delete-branch	after cd
+#
+# --- release-write ---
+deny	release-write	main	Bash	project	gh release create v1.0.0	raw release create
+deny	release-write	main	Bash	project	gh release edit v1.0.0 --draft=false	release edit
+deny	release-write	main	Bash	project	gh release delete v1.0.0 -y	release delete
+deny	release-write	main	Bash	project	gh release upload v1.0.0 a.zip	release upload
+deny	release-write	main	Bash	project	team-gh release create v1.0.0	team-gh release create
+deny	release-write	main	Bash	project	GH_TOKEN=x gh release create v1.0.0	GH_TOKEN form release create
+deny	release-write|gh-write	main	Bash	project	gh release delete-asset v1.0.0 a.zip	release delete-asset
+#
+# --- gh-api-write ---
+deny	gh-api-write	main	Bash	project	gh api -X POST repos/o/r/issues	-X POST
+deny	gh-api-write	main	Bash	project	gh api -XPOST repos/o/r/issues	-XPOST glued
+deny	gh-api-write	main	Bash	project	gh api --method=put repos/o/r/topics	--method=put lower case
+deny	gh-api-write	main	Bash	project	gh api --method PATCH repos/o/r	--method PATCH
+deny	gh-api-write	main	Bash	project	gh api -X DELETE repos/o/r/git/refs/tags/v1	-X DELETE
+deny	gh-api-write	main	Bash	project	gh api -X post repos/o/r/issues	-X post lower case
+deny	gh-api-write	main	Bash	project	gh api --method=Delete repos/o/r	--method=Delete mixed case
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/issues -f title=x	-f without -X GET
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/issues -ftitle=x	-f glued
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/labels -F name=x	-F
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/labels --field name=x	--field
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/labels --raw-field name=x	--raw-field
+deny	gh-api-write	main	Bash	project	gh api repos/o/r/labels --input body.json	--input
+deny	gh-api-write	main	Bash	project	gh api graphql -f query='mutation { addStar(input:{starrableId:"x"}) { clientMutationId } }'	graphql mutation
+deny	gh-api-write	main	Bash	project	gh api graphql -X GET -f query='mutation { addStar(input:{starrableId:"x"}) { clientMutationId } }'	mutation even with -X GET
+deny	gh-api-write	main	Bash	project	gh api -X GET graphql -f query='mutation { addStar(input:{starrableId:"x"}) { clientMutationId } }'	-X GET before the endpoint, mutation
+deny	gh-api-write	main	Bash	project	gh api graphql --method GET -f query='mutation{addStar(input:{starrableId:"x"}){clientMutationId}}'	--method GET, compact mutation
+deny	gh-api-write	main	Bash	project	gh api graphql -f query='query { viewer { login } }'	-f without -X GET is a write (POST), even for a query
+deny	gh-api-write	main	Bash	project	team-gh api -X POST repos/o/r/issues	team-gh api write
+deny	gh-api-write	main	Bash	project	GH_TOKEN=x gh api -X POST repos/o/r/statuses/abc	GH_TOKEN form api write
+deny	gh-api-write	main	Bash	project	GH_TOKEN=ghp_s3cr3tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA gh api -X POST repos/o/r/issues	token in env prefix; log must redact
+allow	gh-api-write	main	Bash	project	gh api -X GET repos/o/r/issues -f state=open	-X GET with -f
+allow	gh-api-write	main	Bash	project	gh api repos/o/r/issues -f state=open -X GET	-f then -X GET
+allow	gh-api-write	main	Bash	project	gh api --method GET search/issues -f q=x	--method GET with -f
+allow	gh-api-write	main	Bash	project	gh api -X HEAD repos/o/r	-X HEAD
+allow	gh-api-write	main	Bash	project	gh api repos/o/r/pulls	plain GET
+allow	gh-api-write	main	Bash	project	team-gh api repos/o/r/pulls --jq '.[].number'	team-gh api read
+#
+# --- gh-credential ---
+deny	gh-credential	main	Bash	project	gh auth token	auth token
+deny	gh-credential	main	Bash	project	gh auth token -u owner-test	auth token -u
+deny	gh-credential	main	Bash	project	gh auth status -t	auth status -t
+deny	gh-credential	main	Bash	project	gh auth status --show-token	auth status --show-token
+deny	gh-credential	main	Bash	project	gh auth switch -u work-test	auth switch
+deny	gh-credential	main	Bash	project	gh auth login --with-token < /tmp/t	auth login
+deny	gh-credential	main	Bash	project	gh auth logout	auth logout
+deny	gh-credential	main	Bash	project	gh auth refresh -s repo	auth refresh
+deny	gh-credential	main	Bash	project	gh auth setup-git	auth setup-git
+deny	gh-credential	main	Bash	project	gh config set editor vim	config set
+deny	gh-credential	main	Bash	project	team-gh auth token	team-gh auth token
+deny	gh-credential	main	Bash	project	echo "$(gh auth token)"	auth token inside $( )
+deny	gh-credential	main	Bash	project	T=$(gh auth token -u owner-test); echo ok	auth token in an assignment
+deny	gh-credential	main	Bash	project	GH_TOKEN="$(gh auth token -u owner-test)" gh pr view 5	auth token inside an env prefix
+#
+# --- owner-approved ---
+allow	owner-approved	main	Bash	project	team-gh pr edit 5 --add-label owner-approved	canonical form from the main session
+allow	owner-approved	main	Bash	project	team-gh pr edit 123 --add-label owner-approved	canonical form, other PR number
+deny	owner-approved	general-purpose	Bash	project	team-gh pr edit 5 --add-label owner-approved	canonical form from a non-review subagent
+deny	owner-approved	Explore	Bash	project	team-gh pr edit 5 --add-label owner-approved	canonical form from another subagent type
+deny	owner-approved|agent-bash	team:team-reviewer	Bash	project	team-gh pr edit 5 --add-label owner-approved	from team-reviewer
+deny	owner-approved|agent-bash	team:team-security	Bash	project	team-gh pr edit 5 --add-label owner-approved	from team-security
+deny	owner-approved|agent-bash	team:team-qa	Bash	project	team-gh pr edit 5 --add-label owner-approved	from team-qa
+deny	owner-approved|agent-bash	team:team-health	Bash	project	team-gh pr edit 5 --add-label owner-approved	from team-health
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --add-label owner-approved --title x	extra flag is not canonical
+deny	owner-approved	main	Bash	project	team-gh pr edit --add-label owner-approved 5	number after the flag is not canonical
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --add-label=owner-approved	--add-label= form
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --add-label bug,owner-approved	inside a comma list
+deny	owner-approved|gh-write	main	Bash	project	team-gh pr edit 5 --add-label Owner-Approved	label names are case-insensitive on GitHub
+deny	owner-approved	main	Bash	project	team-gh pr edit abc --add-label owner-approved	PR id not digits
+deny	owner-approved|gh-write	main	Bash	project	gh pr edit 5 --add-label owner-approved	raw gh
+deny	owner-approved|gh-write	main	Bash	project	GH_TOKEN=x gh pr edit 5 --add-label owner-approved	GH_TOKEN form
+deny	owner-approved|gh-write	main	Bash	project	team-gh issue edit 5 --add-label owner-approved	issue edit form
+deny	owner-approved|gh-write	main	Bash	project	team-gh issue create --title t --label owner-approved	issue create with the label
+deny	owner-approved|gh-api-write	main	Bash	project	gh api -X POST repos/o/r/issues/5/labels -f 'labels[]=owner-approved'	api form
+deny	owner-approved|gh-api-write	main	Bash	project	gh api repos/o/r/issues/5/labels -f labels[]=owner-approved	api form without -X
+deny	owner-approved|curl-github-write	main	Bash	project	curl -X POST -d '{"labels":["owner-approved"]}' https://api.github.com/repos/o/r/issues/5/labels	curl form
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --remove-label owner-approved	remove owner-approved
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --remove-label guarded	remove guarded
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --remove-label high-risk	remove high-risk
+deny	owner-approved	main	Bash	project	team-gh pr edit 5 --remove-label tests-changed	remove tests-changed
+deny	owner-approved|gh-write	main	Bash	project	gh pr edit 5 --remove-label guarded	raw remove guarded
+allow	owner-approved	main	Bash	project	gh pr view 5 --json labels	read labels
+allow	owner-approved	main	Bash	project	gh pr list --label owner-approved	list by label
+allow	owner-approved	main	Bash	project	gh search prs --label owner-approved	search by label
+allow	owner-approved	general-purpose	Bash	project	gh pr view 5 --json labels --jq '.labels[].name'	subagent read of labels

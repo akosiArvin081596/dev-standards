@@ -1,0 +1,136 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# push-main, push-release-branch, force-push, push-tags
+# fixtures: main-repo is on main (local tag v9.9.9); feat-repo is on feat/12-login.
+#
+# --- allowed pushes ---
+allow	push-main	main	Bash	feat-repo	git push -u origin HEAD	push current feature branch
+allow	push-main	main	Bash	feat-repo	git push	bare push on a feature branch
+allow	push-main	main	Bash	feat-repo	git push origin	push <remote> on a feature branch
+allow	push-main	main	Bash	feat-repo	git push origin HEAD	push <remote> HEAD on a feature branch
+allow	push-main	main	Bash	feat-repo	git push origin feat/12-login	explicit feature branch
+allow	push-main	main	Bash	feat-repo	git push origin HEAD:feat/12-login	HEAD:feature refspec
+allow	push-main	main	Bash	feat-repo	git push origin HEAD:refs/heads/feat/12-login	full refs/heads feature destination
+allow	push-main	main	Bash	feat-repo	git push --set-upstream origin feat/12-login	--set-upstream
+allow	push-main	main	Bash	feat-repo	git push origin feat/12-login:feat/12-login	src:dst feature
+allow	push-main	main	Bash	feat-repo	git push origin mainline	branch named mainline is not main
+allow	push-main	main	Bash	feat-repo	git push origin feat/main	branch ending in /main is not main
+allow	push-main	main	Bash	feat-repo	git push origin HEAD:main-fix	destination main-fix is not main
+allow	push-main	main	Bash	main-repo	git -C {FEAT} push origin HEAD	-C into a feature-branch repo from main-repo
+allow	push-main	main	Bash	main-repo	cd {FEAT} && git push	virtual cwd moves to feature repo
+allow	push-main	main	Bash	plain	cd "{FEAT}" && git push -u origin HEAD	quoted cd target, feature repo
+allow	push-main	main	Bash	feat-repo	git pull origin main	pull from main is fine
+allow	push-main	main	Bash	feat-repo	git fetch origin main	fetch main is fine
+allow	push-main	main	Bash	feat-repo	git merge origin/main	merge origin/main into feature (no rebase)
+allow	push-main	main	Bash	feat-repo	git log origin/main..HEAD	read
+allow	force-push	main	Bash	feat-repo	git fetch -f origin	-f on fetch is not a force-push
+allow	force-push	main	Bash	feat-repo	git clean -fd	-f on clean is not a force-push
+allow	push-main	main	Bash	feat-repo	git push -q origin HEAD	quiet push of feature
+allow	push-release-branch	main	Bash	feat-repo	git push origin release-notes	branch release-notes is not release-please--*
+allow	push-release-branch	main	Bash	feat-repo	git push origin HEAD:feat/release-please-docs	not a release-please-- destination
+allow	push-main	main	Bash	feat-repo	# git push origin main	comment only
+allow	push-main	main	Monitor	feat-repo	git push -u origin HEAD	Monitor tool, feature push
+#
+allow	push-tags	main	Bash	feat-repo	git fetch --tags	fetching tags is fine
+allow	push-tags	main	Bash	feat-repo	git push origin HEAD:refs/heads/feat/12-login	refs/heads destination is not a tag
+allow	push-tags	main	Bash	main-repo	git -C {FEAT} push origin feat/12-login	branch push from a cwd that has local tags
+allow	push-tags	main	Bash	feat-repo	git push origin feat/12-login # --tags later	--tags only in a comment
+allow	push-main	main	Bash	wt-feat	git push	bare push in a linked worktree on a feature branch
+allow	push-main	main	Bash	wt-feat	git push -u origin HEAD	first push from a linked worktree
+#
+# --- push-main ---
+deny	push-main	main	Bash	feat-repo	git push origin main	explicit main
+deny	push-main	main	Bash	feat-repo	git push origin HEAD:main	HEAD:main
+deny	push-main	main	Bash	feat-repo	git push origin HEAD:refs/heads/main	HEAD:refs/heads/main
+deny	push-main	main	Bash	feat-repo	git push origin refs/heads/main	refs/heads/main
+deny	push-main	main	Bash	feat-repo	git push origin feat/12-login:main	branch:main
+deny	push-main	main	Bash	feat-repo	git push origin :main	:main (delete main)
+deny	push-main|force-push	main	Bash	feat-repo	git push origin +main	+main
+deny	push-main	main	Bash	feat-repo	git push origin @:main	@:main
+deny	push-main	main	Bash	feat-repo	git push origin src:refs/heads/main	src:refs/heads/main
+deny	push-main	main	Bash	feat-repo	git push origin main:main	main:main
+deny	push-main	main	Bash	feat-repo	git push upstream main	other remote name
+deny	push-main	main	Bash	feat-repo	git push git@github.com:someone/project.git HEAD:main	URL as remote
+deny	push-main	main	Bash	feat-repo	git push origin feat/12-login main	second refspec is main
+deny	push-main	main	Bash	feat-repo	git push origin 'HEAD:main'	single-quoted refspec
+deny	push-main	main	Bash	feat-repo	git push origin "HEAD:main"	double-quoted refspec
+deny	push-main	main	Bash	feat-repo	git push origin HEAD:ma""in	quote-split refspec
+deny	push-main	main	Bash	feat-repo	git push origin HEAD:m\ain	backslash inside refspec
+deny	push-main	main	Bash	feat-repo	git push origin $'HEAD:main'	ANSI-C quoted refspec
+deny	push-main	main	Bash	feat-repo	git --no-pager push origin main	--no-pager global option
+deny	push-main	main	Bash	feat-repo	git -P push origin main	-P global option
+deny	push-main	main	Bash	feat-repo	git -c push.default=current push origin main	allowed -c key, still main
+deny	push-main	main	Bash	feat-repo	git push --porcelain origin main	option before remote
+deny	push-main	main	Bash	feat-repo	git push origin HEAD:main --dry-run	dry-run is still denied
+deny	push-main	main	Bash	feat-repo	git push -q origin main	quiet
+deny	push-main	main	Bash	main-repo	git push	bare push while on main
+deny	push-main	main	Bash	main-repo	git push origin	push <remote> while on main
+deny	push-main	main	Bash	main-repo	git push origin HEAD	push <remote> HEAD while on main
+deny	push-main	main	Bash	main-repo	git push origin @	push <remote> @ while on main
+deny	push-main	main	Bash	main-repo	git push -u origin HEAD	push -u origin HEAD while on main
+deny	push-main	main	Bash	main-repo	git push origin main	explicit main from main
+deny	push-main	main	Bash	feat-repo	git -C {MAIN} push origin HEAD	-C into repo on main
+deny	push-main	main	Bash	plain	git -C {MAIN} push	-C bare push from a non-repo cwd
+deny	push-main	main	Bash	feat-repo	git -C {MAIN} -c color.ui=never push	-C plus -c then bare push
+deny	push-main	main	Bash	feat-repo	git --git-dir={MAIN}/.git --work-tree={MAIN} push origin main	--git-dir/--work-tree with explicit main
+deny	push-main	main	Bash	feat-repo	cd {MAIN} && git push	virtual cwd into repo on main
+deny	push-main	main	Bash	feat-repo	cd {FEAT} && cd {MAIN} && git push origin HEAD	two cds, last one is main
+deny	push-main	main	Bash	feat-repo	(cd {MAIN} && git push)	subshell cd into main repo
+deny	push-main	main	Bash	feat-repo	echo hi; git push origin main	after ;
+deny	push-main	main	Bash	feat-repo	true && git push origin main || true	inside && ||
+deny	push-main	main	Bash	feat-repo	git status | cat; git push origin main	after a pipeline
+deny	push-main	main	Bash	feat-repo	git push origin main &	background job
+deny	push-main	main	Bash	feat-repo	git push origin main > /dev/null 2>&1	with redirections
+deny	push-main	main	Bash	feat-repo	git push origin main 2>&1 | tee /tmp/push.log	piped into tee
+deny	push-main	main	Bash	feat-repo	if true; then git push origin main; fi	inside if/then
+deny	push-main	main	Bash	feat-repo	for r in origin; do git push "$r" main; done	inside for loop
+deny	push-main	main	Bash	feat-repo	{ git push origin main; }	brace group
+deny	push-main	main	Bash	feat-repo	x=$(git push origin main)	inside $( )
+deny	push-main	main	Bash	feat-repo	echo `git push origin main`	inside backticks
+deny	push-main	main	Bash	feat-repo	cat <(git push origin main)	inside process substitution
+deny	push-main	main	Bash	feat-repo	echo a{NL}git push origin main	second line
+deny	push-main	main	Bash	feat-repo	git push origin main # trailing comment	trailing comment
+deny	push-main	main	Bash	feat-repo	f() { git push origin main; }; f	function body
+deny	push-main	main	Bash	feat-repo	git commit -m "wip" && git push origin HEAD:main	message then push
+deny	push-main	main	Monitor	feat-repo	git push origin main	Monitor tool is analysed too
+deny	push-main	main	Bash	wt-feat	git push origin HEAD:main	HEAD:main from a linked worktree
+deny	push-main	main	Bash	wt-feat	cd {MAIN} && git push	worktree session cds into the main checkout (on main)
+#
+# --- push-release-branch ---
+deny	push-release-branch	main	Bash	feat-repo	git push origin HEAD:release-please--branches--main	HEAD:release-please--*
+deny	push-release-branch	main	Bash	feat-repo	git push origin release-please--branches--main	release-please--* branch
+deny	push-release-branch	main	Bash	feat-repo	git push origin feat/12-login:refs/heads/release-please--branches--main--components--team	refs/heads/release-please--*
+deny	push-release-branch	main	Bash	feat-repo	git -C {FEAT} push origin HEAD:release-please--x	via -C
+#
+# --- force-push ---
+deny	force-push	main	Bash	feat-repo	git push -f origin feat/12-login	-f
+deny	force-push	main	Bash	feat-repo	git push --force origin feat/12-login	--force
+deny	force-push	main	Bash	feat-repo	git push --force-with-lease origin feat/12-login	--force-with-lease
+deny	force-push	main	Bash	feat-repo	git push --force-with-lease=feat/12-login:abc123 origin feat/12-login	--force-with-lease=ref:sha
+deny	force-push	main	Bash	feat-repo	git push --force-if-includes origin feat/12-login	--force-if-includes
+deny	force-push	main	Bash	feat-repo	git push origin +feat/12-login	+refspec on feature
+deny	force-push	main	Bash	feat-repo	git push origin +HEAD:feat/12-login	+HEAD:feature
+deny	force-push	main	Bash	feat-repo	git push -uf origin feat/12-login	combined -uf
+deny	force-push	main	Bash	feat-repo	git push -fu origin HEAD	combined -fu
+deny	force-push	main	Bash	feat-repo	git push -qf origin HEAD	combined -qf
+deny	force-push	main	Bash	feat-repo	git push origin feat/12-login -f	-f after the refspec
+deny	force-push	main	Bash	feat-repo	git push --force	bare force push on feature
+deny	force-push	main	Bash	feat-repo	git -C {FEAT} push -f	-C plus -f
+deny	force-push|push-main	main	Bash	main-repo	git push --force	force while on main
+deny	force-push|push-main	main	Bash	feat-repo	git push --force origin main	force to main
+#
+# --- push-tags ---
+deny	push-tags	main	Bash	feat-repo	git push --tags	--tags
+deny	push-tags	main	Bash	feat-repo	git push origin --tags	remote then --tags
+deny	push-tags	main	Bash	feat-repo	git push --follow-tags origin feat/12-login	--follow-tags with a feature branch
+deny	push-tags|force-push	main	Bash	feat-repo	git push --mirror origin	--mirror
+deny	push-tags	main	Bash	feat-repo	git push --all origin	--all
+deny	push-tags	main	Bash	feat-repo	git push origin refs/tags/v1.0.0	refs/tags/* source
+deny	push-tags	main	Bash	feat-repo	git push origin HEAD:refs/tags/v1.0.0	refs/tags/* destination
+deny	push-tags	main	Bash	main-repo	git push origin v9.9.9	local tag as source
+deny	push-tags	main	Bash	main-repo	git push origin v9.9.9:v9.9.9	local tag src:dst
+deny	push-tags	main	Bash	feat-repo	git -C {MAIN} push origin v9.9.9	local tag via -C
+deny	push-tags	main	Bash	main-repo	git push origin tag v9.9.9	tag <name> syntax
+deny	push-tags	main	Bash	feat-repo	git push origin --delete feat/old	--delete
+deny	push-tags	main	Bash	feat-repo	git push origin -d feat/old	-d
+deny	push-tags	main	Bash	feat-repo	git push -d origin v9.9.9	-d before remote
+deny	push-tags	main	Bash	feat-repo	git push origin :refs/tags/v9.9.9	delete a remote tag via refspec

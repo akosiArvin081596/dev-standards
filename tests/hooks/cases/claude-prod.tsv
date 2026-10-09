@@ -1,0 +1,83 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# nested-claude, prod-action
+# Fake config BACKGROUND_PERMISSION_MODE=bypassPermissions; {CFG_NOBYPASS} has it empty.
+#
+# --- nested-claude: the allowed background form and management commands ---
+allow	nested-claude	main	Bash	project	claude --bg "/team:ship 12 background-writer"	bg with a /team: prompt
+allow	nested-claude	main	Bash	project	claude --bg --name 12-login "/team:ship 12 background-writer"	bg with --name
+allow	nested-claude	main	Bash	project	claude --bg --name 12-login --permission-mode bypassPermissions "/team:ship 12 background-writer"	full bg form
+allow	nested-claude	main	Bash	project	cd "{FEAT}" && claude --bg --name 12-login --permission-mode bypassPermissions "/team:ship 12 background-writer"	exact start-issue form with quoted cd
+allow	nested-claude	main	Bash	project	cd {FEAT} && claude --bg "/team:ship 12 background-writer"	unquoted cd, minimal bg
+allow	nested-claude	main	Bash	project	claude --bg 'fix the login bug'	single-quoted prompt
+allow	nested-claude	main	Bash	project	claude agents --json --all	list background agents
+allow	nested-claude	main	Bash	project	claude agents --json	list background agents
+allow	nested-claude	main	Bash	project	claude logs abc123	logs
+allow	nested-claude	main	Bash	project	claude stop abc123	stop
+allow	nested-claude	main	Bash	project	claude rm abc123	rm
+allow	nested-claude	main	Bash	project	claude --version	--version
+allow	nested-claude	main	Bash	project	claude plugin list	plugin list
+allow	nested-claude	main	Bash	project	claude plugin validate .	plugin validate
+allow	nested-claude	main	Bash	project	claude plugin validate ./plugins/team	plugin validate a path
+allow	nested-claude	main	Bash	project	claude --bg "/team:ship 12 background-writer"	no permission flag when the config value is empty	TEAM_CONFIG_DIR={CFG_NOBYPASS}
+allow	nested-claude	main	Bash	project	echo "claude -p is not allowed"	text only
+#
+# --- nested-claude: denied ---
+deny	nested-claude	main	Bash	project	claude -p "hi"	-p
+deny	nested-claude	main	Bash	project	claude --print hi	--print
+deny	nested-claude	main	Bash	project	claude -p --permission-mode bypassPermissions "x"	-p with bypass
+deny	nested-claude	main	Bash	project	claude --bg --agent team-qa "x"	--agent
+deny	nested-claude	main	Bash	project	claude --agents '{}' --bg "x"	--agents
+deny	nested-claude	main	Bash	project	claude --bg --plugin-dir ./plugins/team "x"	--plugin-dir
+deny	nested-claude	main	Bash	project	claude --bg --plugin-url https://example.test/p.zip "x"	--plugin-url
+deny	nested-claude	main	Bash	project	claude --bg --settings /tmp/s.json "x"	--settings
+deny	nested-claude	main	Bash	project	claude --bg --setting-sources project "x"	--setting-sources
+deny	nested-claude	main	Bash	project	claude --bg --mcp-config m.json "x"	--mcp-config
+deny	nested-claude	main	Bash	project	claude --bg --add-dir /tmp "x"	--add-dir
+deny	nested-claude	main	Bash	project	claude --bg --bare "x"	--bare
+deny	nested-claude	main	Bash	project	claude --bg --safe-mode "x"	--safe-mode
+deny	nested-claude	main	Bash	project	claude --bg --dangerously-skip-permissions "x"	--dangerously-skip-permissions
+deny	nested-claude	main	Bash	project	claude --bg --allow-dangerously-skip-permissions "x"	--allow-dangerously-skip-permissions
+deny	nested-claude	main	Bash	project	claude --bg --permission-mode acceptEdits "x"	wrong permission mode
+deny	nested-claude	main	Bash	project	claude --bg --permission-mode plan "x"	other wrong permission mode
+deny	nested-claude	main	Bash	project	claude --bg --permission-mode bypassPermissions "x"	permission flag when the config value is empty	TEAM_CONFIG_DIR={CFG_NOBYPASS}
+deny	nested-claude	main	Bash	project	claude "hi"	interactive session
+deny	nested-claude	main	Bash	project	claude	bare claude
+deny	nested-claude	main	Bash	project	claude --continue	--continue
+deny	nested-claude	main	Bash	project	claude --resume abc	--resume
+deny	nested-claude	main	Bash	project	claude -c	-c
+deny	nested-claude	main	Bash	project	claude --bg "a" "b"	two prompts
+deny	nested-claude	main	Bash	project	claude --bg "x" --print	--print after the prompt
+deny	nested-claude	main	Bash	project	claude mcp add x -- /bin/true	mcp add
+deny	nested-claude	main	Bash	project	claude config set x y	config set
+deny	nested-claude	main	Bash	project	claude plugin install team@dev-standards	plugin install
+deny	nested-claude	main	Bash	project	claude plugin marketplace add someone/x	plugin marketplace add
+deny	nested-claude	main	Bash	project	claude update	update
+deny	nested-claude	main	Bash	project	/usr/local/bin/claude -p hi	absolute path
+deny	nested-claude	main	Bash	project	env claude -p x	env wrapper
+deny	nested-claude	main	Bash	project	nohup claude -p x &	nohup, background
+deny	nested-claude|script-scan	main	Bash	project	bash -c 'claude -p x'	inside bash -c
+deny	nested-claude	main	Bash	project	echo $(claude -p x)	inside $( )
+deny	nested-claude	main	Bash	project	cd {FEAT} && claude --bg --name 12 --permission-mode bypassPermissions "/team:ship 12 background-writer" && claude -p x	allowed form chained with a denied one
+deny	nested-claude	general-purpose	Bash	project	claude -p "x"	from a subagent
+#
+# --- prod-action ---
+deny	prod-action	main	Bash	project	team-deploy production	team-deploy production
+deny	prod-action	main	Bash	project	team-deploy production --apply	with --apply
+deny	prod-action	main	Bash	project	team-deploy production --sha 0123abc --apply	with --sha
+deny	prod-action	main	Bash	project	{PLUGIN}/bin/team-deploy production --apply	plugin bin path
+deny	prod-action	main	Bash	plain	cd {PROJ} && team-deploy production	after cd
+deny	prod-action	main	Bash	project	env team-deploy production	env wrapper
+deny	prod-action	main	Bash	project	team-flag production new-ui on	team-flag production
+deny	prod-action	main	Bash	project	ops/flag production new-ui on	ops/flag production
+deny	prod-action	main	Bash	project	./ops/flag production new-ui off	./ops/flag production
+deny	prod-action	main	Bash	plain	{PROJ}/ops/flag production x on	absolute ops/flag
+deny	prod-action|script-scan	main	Bash	project	bash ops/flag production x on	bash ops/flag
+deny	prod-action|gh-write	main	Bash	project	gh workflow run rollback.yml	rollback workflow via gh
+deny	prod-action|gh-write	main	Bash	project	gh workflow run rollback	rollback workflow by name
+deny	prod-action|gh-write	main	Bash	project	team-gh workflow run rollback.yml -f env=production	rollback workflow via team-gh
+allow	prod-action	main	Bash	project	team-deploy staging --apply	staging deploy
+allow	prod-action	main	Bash	project	team-deploy --help	help
+allow	prod-action	main	Bash	project	team-flag staging new-ui on	staging flag
+allow	prod-action	main	Bash	project	ops/flag staging x on	staging ops/flag (missing file is allowed)
+allow	prod-action	main	Bash	project	gh workflow view rollback.yml	read the rollback workflow
+allow	prod-action	main	Bash	project	echo "team-deploy production"	text only

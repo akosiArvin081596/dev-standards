@@ -1,0 +1,162 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# curl-github-write, ssh-dest, ssh-form, credential-read
+# Fake config: VPS_ALIAS=vps-test VPS_IP=192.0.2.10 VPS_HOSTNAME=srv-test.example.net DOMAIN=example.test
+#              VPS_FORBIDDEN_ALIASES=vps-test-root; GitHub SSH aliases github.com, github.com-work.
+#
+# --- curl / wget to GitHub ---
+allow	curl-github-write	main	Bash	project	curl https://api.github.com/repos/o/r	GET
+allow	curl-github-write	main	Bash	project	curl -s -H "Accept: application/vnd.github+json" https://api.github.com/repos/o/r/pulls	GET with header
+allow	curl-github-write	main	Bash	project	curl -I https://github.com	HEAD
+allow	curl-github-write	main	Bash	project	curl -X GET https://api.github.com/user	explicit -X GET
+allow	curl-github-write	main	Bash	project	curl -fsSL https://objects.githubusercontent.com/x -o /tmp/x	download from githubusercontent
+allow	curl-github-write	main	Bash	project	wget https://raw.githubusercontent.com/o/r/main/README.md	wget GET
+allow	curl-github-write	main	Bash	project	wget -qO- https://github.com/o/r/releases	wget GET to stdout
+allow	curl-github-write	main	Bash	project	curl -X POST https://example.com/hook	POST to a non-GitHub host
+allow	curl-github-write	main	Bash	project	curl -d x=1 https://example.test/api	data to a non-GitHub host
+allow	curl-github-write	main	Bash	project	curl http://localhost:3000/health	localhost
+allow	curl-github-write	main	Bash	project	curl -X POST http://localhost:3000/api	POST to localhost from main
+allow	curl-github-write	main	Bash	project	curl https://app.example.test/health	HTTPS GET to the app domain is fine
+deny	curl-github-write	main	Bash	project	curl -X POST https://api.github.com/repos/o/r/issues	-X POST
+deny	curl-github-write	main	Bash	project	curl --request PATCH https://api.github.com/repos/o/r	--request PATCH
+deny	curl-github-write	main	Bash	project	curl -XDELETE https://api.github.com/repos/o/r/git/refs/tags/v1	-XDELETE glued
+deny	curl-github-write	main	Bash	project	curl -d '{"title":"x"}' https://api.github.com/repos/o/r/issues	-d
+deny	curl-github-write	main	Bash	project	curl --data-binary @b.json https://api.github.com/repos/o/r/issues	--data-binary
+deny	curl-github-write	main	Bash	project	curl --data-raw x https://api.github.com/x	--data-raw
+deny	curl-github-write	main	Bash	project	curl --data-urlencode a=b https://api.github.com/x	--data-urlencode
+deny	curl-github-write	main	Bash	project	curl --json '{"a":1}' https://api.github.com/repos/o/r/issues	--json
+deny	curl-github-write	main	Bash	project	curl -F file=@a.zip https://uploads.github.com/repos/o/r/releases/1/assets	-F form upload
+deny	curl-github-write	main	Bash	project	curl --form f=@x https://uploads.github.com/x	--form
+deny	curl-github-write	main	Bash	project	curl -T a.zip https://uploads.github.com/x	-T upload
+deny	curl-github-write	main	Bash	project	curl --upload-file a.zip https://uploads.github.com/x	--upload-file
+deny	curl-github-write	main	Bash	project	curl --post301 https://api.github.com/x	--post* option
+deny	curl-github-write	main	Bash	project	curl -K /tmp/cfg https://api.github.com/x	-K config file
+deny	curl-github-write	main	Bash	project	curl --config /tmp/cfg https://api.github.com/x	--config
+deny	curl-github-write	main	Bash	project	curl -X POST https://gist.github.com/x	*.github.com
+deny	curl-github-write	main	Bash	project	curl -X POST https://raw.githubusercontent.com/x	*.githubusercontent.com
+deny	curl-github-write	main	Bash	project	curl -X POST https://github.com/login/oauth/access_token	github.com itself
+deny	curl-github-write	main	Bash	project	curl -X POST https://API.GITHUB.COM/repos/o/r/issues	host names are case-insensitive
+deny	curl-github-write	main	Bash	project	curl -sS -XPOST -H 'Content-Type: application/json' https://api.github.com/repos/o/r/dispatches -d '{}'	typical dispatch call
+deny	curl-github-write	main	Bash	project	curl -H "Authorization: Bearer s3cr3tAbc123" -X POST https://api.github.com/repos/o/r/issues	Bearer token; log must redact
+deny	curl-github-write	main	Bash	project	curl -X POST "$URL"	non-literal URL with POST
+deny	curl-github-write	main	Bash	project	curl -d @b.json "${API}/repos/o/r/issues"	non-literal URL with data
+deny	curl-github-write	main	Bash	project	wget --method=POST https://api.github.com/x	wget --method
+deny	curl-github-write	main	Bash	project	wget --post-data='a=b' https://api.github.com/x	wget --post-data
+deny	curl-github-write	main	Bash	project	wget --post-file=b.json https://api.github.com/x	wget --post-file
+deny	curl-github-write	main	Bash	project	wget --method=PATCH --body-data='x' https://api.github.com/x	wget --body-data
+deny	curl-github-write	main	Bash	project	wget --body-file=b.json --method=PUT https://api.github.com/x	wget --body-file
+#
+# --- ssh family: allowed ---
+allow	ssh-dest	main	Bash	project	ssh vps-test uptime	the plain VPS alias form
+allow	ssh-dest	main	Bash	project	ssh vps-test	interactive VPS alias
+allow	ssh-form	main	Bash	project	ssh -T vps-test 'df -h'	-T with remote command
+allow	ssh-form	main	Bash	project	ssh -o BatchMode=yes vps-test uptime	-o BatchMode
+allow	ssh-form	main	Bash	project	ssh -o ConnectTimeout=5 -o ServerAliveInterval=10 vps-test true	two allowlisted -o keys
+allow	ssh-form	main	Bash	project	ssh -o ServerAliveCountMax=3 vps-test true	-o ServerAliveCountMax
+allow	ssh-form	main	Bash	project	ssh -q -o LogLevel=ERROR vps-test uptime	-q and -o LogLevel
+allow	ssh-form	main	Bash	project	ssh -o RequestTTY=no vps-test uptime	-o RequestTTY
+allow	ssh-form	main	Bash	project	ssh -v vps-test uptime	-v
+allow	ssh-form	main	Bash	project	ssh -T git@github.com	GitHub auth check
+allow	ssh-form	main	Bash	project	ssh -T git@github.com-work	GitHub SSH alias from accounts.conf
+allow	ssh-dest	main	Bash	project	ssh git@github.com	without -T
+allow	ssh-form	main	Bash	project	rsync -a a b	local rsync
+allow	ssh-form	main	Bash	project	rsync -av --delete build/ dist/	local rsync with --delete
+allow	ssh-form	main	Bash	project	rsync -a ./a/ /tmp/b/	local rsync to an absolute path
+allow	ssh-dest	main	Bash	project	dig app.example.test	DNS lookup
+allow	ssh-dest	main	Bash	project	host srv-test.example.net	DNS lookup of the VPS hostname
+allow	ssh-dest	main	Bash	project	nslookup 192.0.2.10	reverse lookup
+allow	ssh-form	main	Bash	project	ssh -T git@github.com	missing config: GitHub is still allowed	TEAM_CONFIG_DIR={CFG_EMPTY}
+#
+# --- ssh-dest ---
+deny	ssh-dest	main	Bash	project	ssh 192.0.2.10	VPS by IP
+deny	ssh-dest|ssh-form	main	Bash	project	ssh -p 22 192.0.2.10	VPS by IP with -p
+deny	ssh-dest|ssh-form	main	Bash	project	ssh root@192.0.2.10	user@IP
+deny	ssh-dest|ssh-form	main	Bash	project	ssh deploy@192.0.2.10 uptime	user@IP with command
+deny	ssh-dest	main	Bash	project	ssh srv-test.example.net	VPS_HOSTNAME
+deny	ssh-dest	main	Bash	project	ssh app.example.test	subdomain of DOMAIN
+deny	ssh-dest	main	Bash	project	ssh example.test	DOMAIN itself
+deny	ssh-dest	main	Bash	project	ssh vps-test-root	forbidden alias
+deny	ssh-dest	main	Bash	project	ssh unknown-host	host not on the allowlist
+deny	ssh-dest	main	Bash	project	ssh vps-test2	near-miss alias
+deny	ssh-dest	main	Bash	project	ssh ssh://vps-test	ssh:// form
+deny	ssh-dest	main	Bash	project	ssh ssh://192.0.2.10:22	ssh:// with IP and port
+deny	ssh-dest	main	Bash	project	ssh git@evil.example	git@ a non-GitHub host
+deny	ssh-dest	main	Bash	project	ssh -T git@gitlab.com	git@ another forge
+deny	ssh-dest	main	Bash	project	ssh git@github.com.evil.example	look-alike GitHub host
+deny	ssh-dest|ssh-form	main	Bash	project	ssh vps-test uptime	missing config: VPS alias denied	TEAM_CONFIG_DIR={CFG_EMPTY}
+deny	ssh-dest|ssh-form	main	Bash	project	ssh -T git@github.com-work	missing config: account alias denied	TEAM_CONFIG_DIR={CFG_EMPTY}
+deny	ssh-dest	main	Bash	project	ssh 192.0.2.10	missing config: IP denied	TEAM_CONFIG_DIR={CFG_EMPTY}
+#
+# --- ssh-form ---
+deny	ssh-form	main	Bash	project	ssh -F /tmp/cfg vps-test	-F
+deny	ssh-form	main	Bash	project	ssh -F /dev/null git@github.com	-F with GitHub
+deny	ssh-form	main	Bash	project	ssh -J jump vps-test	-J
+deny	ssh-form	main	Bash	project	ssh -W host:22 vps-test	-W
+deny	ssh-form|ssh-dest	main	Bash	project	ssh -o ProxyCommand="nc 192.0.2.10 22" vps-test	-o ProxyCommand
+deny	ssh-form	main	Bash	project	ssh -o ProxyJump=x vps-test	-o ProxyJump
+deny	ssh-form|ssh-dest	main	Bash	project	ssh -o HostName=192.0.2.10 vps-test	-o HostName
+deny	ssh-form	main	Bash	project	ssh -oHostName=other vps-test	-oHostName glued
+deny	ssh-form	main	Bash	project	ssh -o "ProxyCommand nc x 22" vps-test	-o key and value separated by a space
+deny	ssh-form	main	Bash	project	ssh -o LocalCommand=x -o PermitLocalCommand=yes vps-test	-o LocalCommand
+deny	ssh-form	main	Bash	project	ssh -o User=root vps-test	-o User
+deny	ssh-form	main	Bash	project	ssh -o Include=/tmp/x vps-test	-o Include
+deny	ssh-form	main	Bash	project	ssh -T git@github.com -o ProxyCommand=x	GitHub with ProxyCommand
+deny	ssh-form	main	Bash	project	ssh -l root vps-test	-l
+deny	ssh-form	main	Bash	project	ssh root@vps-test	user@alias
+deny	ssh-form	main	Bash	project	ssh deploy@vps-test uptime	other user@alias
+deny	ssh-form	main	Bash	project	ssh -A vps-test	agent forwarding is not in the allowed form
+deny	ssh-form	main	Bash	project	ssh -L 8080:localhost:80 vps-test	-L port forward
+deny	ssh-form	main	Bash	project	ssh -R 9000:localhost:22 vps-test	-R reverse forward
+deny	ssh-form	main	Bash	project	ssh -D 1080 vps-test	-D SOCKS
+deny	ssh-form	main	Bash	project	ssh -p 2222 vps-test	-p
+deny	ssh-form|credential-read	main	Bash	project	ssh -i ~/.ssh/id_ed25519 vps-test	-i private key
+deny	ssh-form	main	Bash	project	scp a.txt vps-test:/tmp/	scp upload
+deny	ssh-form	main	Bash	project	scp vps-test:/etc/hosts .	scp download
+deny	ssh-form	main	Bash	project	sftp vps-test	sftp
+deny	ssh-form	main	Bash	project	sshfs vps-test:/ /tmp/m	sshfs
+deny	ssh-form	main	Bash	project	autossh -M 0 vps-test	autossh
+deny	ssh-form	main	Bash	project	mosh vps-test	mosh
+deny	ssh-form	main	Bash	project	rsync -e ssh a vps-test:/tmp/	rsync -e ssh
+deny	ssh-form	main	Bash	project	rsync -a a vps-test:b	rsync host:path
+deny	ssh-form	main	Bash	project	rsync -av --rsh=ssh a b	rsync --rsh
+deny	ssh-form|ssh-dest	main	Bash	project	rsync -a src/ host:/dst/	rsync to an unknown host
+deny	ssh-form|ssh-dest	main	Bash	project	rsync -a vps-test:/var/log/ ./logs/	rsync pull from the VPS
+#
+# --- credential-read ---
+deny	credential-read	main	Bash	project	git credential fill	git credential fill
+deny	credential-read	main	Bash	project	printf 'host=github.com\nprotocol=https\n' | git credential fill	piped into credential fill
+deny	credential-read	main	Bash	project	git credential approve	git credential approve
+deny	credential-read	main	Bash	project	git credential-osxkeychain get	git credential-osxkeychain
+deny	credential-read	main	Bash	project	git credential-cache exit	git credential-cache
+deny	credential-read	main	Bash	project	security find-generic-password -s hostinger-api-key -w	keychain generic password
+deny	credential-read	main	Bash	project	security find-internet-password -s github.com	keychain internet password
+deny	credential-read	main	Bash	project	security dump-keychain	dump-keychain
+deny	credential-read	main	Bash	project	security export -k login.keychain -o /tmp/x	keychain export
+deny	credential-read	main	Bash	project	/usr/bin/security find-generic-password -s x -w	security by absolute path
+deny	credential-read	main	Bash	project	cat ~/.ssh/id_ed25519	private key via ~
+deny	credential-read	main	Bash	project	cat {HOME}/.ssh/id_ed25519	private key via absolute HOME
+deny	credential-read	main	Bash	project	cat $HOME/.ssh/id_rsa	private key via $HOME
+deny	credential-read	main	Bash	project	cat ~/.ssh/../.ssh/id_ed25519	private key via ..
+deny	credential-read	main	Bash	project	cp ~/.ssh/id_ed25519 /tmp/k	copy private key
+deny	credential-read	main	Bash	project	base64 < ~/.ssh/id_ed25519	private key as redirection source
+deny	credential-read	main	Bash	project	ssh-keygen -y -f ~/.ssh/id_ed25519	derive from private key
+deny	credential-read	main	Bash	project	cat .env.production	production env file
+deny	credential-read	main	Bash	plain	cat {PROJ}/.env.production	production env file, absolute path
+deny	credential-read	main	Bash	project	grep APP_KEY .env.production	grep a production env file
+deny	credential-read	main	Bash	project	source .env.production	source a production env file
+deny	credential-read	main	Bash	project	cat .env.production.local	.env.production*
+deny	credential-read	main	Bash	project	cat config/app.production.env	*.production.env
+deny	credential-read	main	Bash	project	cat production.env	production.env
+deny	credential-read	main	Bash	project	cat .env.prod	.env.prod
+deny	credential-read	main	Bash	project	cp .env.production .env	copy a production env file
+deny	credential-read	main	Bash	project	cat ~/.config/gh/hosts.yml	gh hosts.yml
+deny	credential-read	main	Bash	project	grep oauth_token {HOME}/.config/gh/hosts.yml	gh hosts.yml absolute
+allow	credential-read	main	Bash	project	cat ~/.ssh/id_ed25519.pub	public key
+allow	credential-read	main	Bash	project	cat ~/.ssh/config	ssh config
+allow	credential-read	main	Bash	project	cat ~/.ssh/known_hosts	known_hosts
+allow	credential-read	main	Bash	project	ssh-keygen -lf ~/.ssh/id_ed25519.pub	fingerprint of a public key
+allow	ssh-form	main	Bash	project	ssh-keygen -t ed25519 -f /tmp/newkey -N ''	ssh-keygen is not an ssh-family command
+allow	ssh-form	main	Bash	project	ssh-keygen -F github.com	ssh-keygen -F looks up known_hosts
+allow	credential-read	main	Bash	project	cat .env	ordinary env file
+allow	credential-read	main	Bash	project	cat .env.example	example env file
+allow	credential-read	main	Bash	project	cat .env.staging	staging env file
+allow	credential-read	main	Bash	project	security list-keychains	not a credential read
