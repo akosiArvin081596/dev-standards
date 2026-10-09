@@ -67,7 +67,9 @@ Read `.team/new-project.conf`. Check that `origin` is `GITHUB_REPO`.
    `PROJECT_NAME GITHUB_ACCOUNT GITHUB_SSH_HOST GITHUB_REPO VISIBILITY DB_ENGINE WEB_MODE HEALTH_PATH(/health) MIGRATE_CMD SEED_CMD MIGRATIONS_GLOB HIGH_RISK_GLOBS PROJECT_TIMEZONE LOW_TRAFFIC_HOUR ENV_FILE(.env) ARTIFACT_DIR(.team/artifact) SHARED_PATHS STATIC_ROOT`, plus `LOCAL_DB_IMAGE LOCAL_DB_PORT` for mysql and mariadb.
    - The globs match the stack's real layout.
    - `HIGH_RISK_GLOBS` covers auth, payments and permissions code.
-3. **Sync.** Run `team-sync --init`: it deletes the template-only CI and writes `.claude/team-standards.lock`. Commit with `chore: configure project`. Never skip git hooks.
+3. **Sync.** Run `team-sync --init`: it deletes the template-only CI and writes `.claude/team-standards.lock`.
+   - Check that `git status --porcelain` lists only `ops/project.conf`, `.claude/team-standards.lock`, the deleted `.github/workflows/template-ci.yml`, and files `team-sync` reports it wrote.
+   - Then run `git add -A` (it stages the deletion too) and `git commit -m 'chore: configure project'`. Never skip git hooks.
 4. **Settings.**
    1. Show the plan: `team-bootstrap-repo <owner>/<name> --profile project`.
    2. Yes moment: `team-bootstrap-repo <owner>/<name> --profile project --apply`.

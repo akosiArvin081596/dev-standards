@@ -18,7 +18,7 @@ Work only in this issue's worktree, on a branch named `feat/<n>-<slug>` (any `<t
 ## 2. Before screenshot (if the feature is user-visible)
 1. Run `team-app up`. Read `APP_URL` from the env file.
 2. Run `mkdir -p .team/evidence/issue-<n>`.
-3. With Playwright MCP, open the page the feature changes and call `browser_take_screenshot` with `filename: ".team/evidence/issue-<n>/before-1.png"`.
+3. With Playwright MCP, open the page the feature changes and call `browser_take_screenshot` with `filename: ".team/evidence/issue-<n>/before-1.png"`. Check the path the tool prints: if the file landed anywhere other than `.team/evidence/issue-<n>/`, move it there.
 
 ## 3. Create the flag
 1. **Name:** `issue_<n>_<slug>`: lowercase, `[a-z0-9_]`, the slug taken from the title and kept short (for example `issue_42_csv_export`). Use the same name everywhere.
@@ -29,6 +29,7 @@ Work only in this issue's worktree, on a branch named `feat/<n>-<slug>` (any `<t
    - It's **on** in staging's seed (staging seeds every flag on) and in the local seed data.
    - Use an additive migration or seed, never a destructive one.
 4. **Read it through the project's flag reader.** With the flag off, the app behaves exactly as before.
+5. **Switching it on staging later** (rarely needed, since staging seeds every flag on): the main session runs `team-flag staging <name> on|off`. That's a VPS yes moment, so a background writer stops and reports instead. Never use `ops/flag`, and never switch production.
 
 ## 4. Build it
 - **Keep changes small and in scope.** Follow the project's patterns and the path-scoped rules for the files you touch.
@@ -41,7 +42,7 @@ Work only in this issue's worktree, on a branch named `feat/<n>-<slug>` (any `<t
 - For each main path in the acceptance criteria, add tests with the flag **on** (the new behaviour) and **off** (the old behaviour unchanged).
 - UI flows get a Playwright e2e test. Unit tests run with `TZ=UTC`.
 - Never weaken an existing test. If an old assertion is wrong, correct it and explain why in the report.
-- Run the targeted tests, then `make lint test`.
+- Run the targeted tests, then `make lint` and `make test` as separate commands. A target with `Error 3` plus "not configured: fill in for your stack" wasn't run: say so.
 - Commit with Conventional Commits, for example `feat(<scope>): <what users can now do>`.
 
 ## Hand back

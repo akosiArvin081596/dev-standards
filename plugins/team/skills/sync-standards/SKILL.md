@@ -25,7 +25,7 @@ Run in the project's main checkout (MAIN), which must be clean (`git status --po
    - in `.github/workflows/*.yml`, only the `uses: …@<ref>` pin lines (check with `git diff -U0 .github/workflows`)
 
    Anything else changed: stop. Show the owner the unexpected paths and ask. Never edit project-owned files in this skill, and never hand-edit workflow or fence files; only `team-sync` writes them.
-4. **Commit:** `git add <the paths above>`, then `git commit -m 'chore: sync dev-standards to <tag>'`. Never skip git hooks.
+4. **Commit.** Once `git status --porcelain` lists only the paths above (step 3), run `git add -A` (it also stages files `team-sync` deleted), then `git commit -m 'chore: sync dev-standards to <tag>'`. Never skip git hooks.
 5. **Push:** `git push -u origin HEAD`.
 6. **Open the PR.** Write `.team/report.md` as the standard report:
    - status `waiting for your yes`
@@ -37,7 +37,7 @@ Run in the project's main checkout (MAIN), which must be clean (`git status --po
    Then run `team-gh pr create --base main --title 'chore: sync dev-standards to <tag>' --body-file .team/report.md`.
 
 ## 3. Finish the PR (it's guarded)
-1. **Reviews.** Wait until the check run `guarded-paths` has completed for the head (`team-gh pr view <pr> --json headRefOid,labels,statusCheckRollup`, every ~30 s). Then run `team:team-reviewer`, `team:team-security` and `team:team-qa` as foreground subagents in one message, each with the PR number as its whole prompt.
+1. **Reviews.** Wait until the check run `gates / guarded-paths` has completed for the head (`team-gh pr view <pr> --json headRefOid,labels,statusCheckRollup`, every ~30 s). Then run `team:team-reviewer`, `team:team-security` and `team:team-qa` as foreground subagents in one message, each with the PR number as its whole prompt.
 2. **Findings.** For a real problem in the release, don't patch managed files here: report it for dev-standards and leave the PR open.
 3. **The owner's yes:**
    - Show team-security's plain-language summary (workflow pin changes keep `ai-security` pending until the owner approves). Then AskUserQuestion: "Approve guarded PR #<pr>?" ("Yes, add owner-approved" / "I'll add it myself" / "No, leave it waiting").

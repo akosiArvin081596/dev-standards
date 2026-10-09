@@ -65,6 +65,6 @@ Build this on `chore/initial-stack` in the new clone, for the stack in `.team/ne
 - **Budget:** `wc -l CLAUDE.md .claude/rules/*/*.md`. At most 250 lines load every session (`CLAUDE.md` plus rule files without `paths:`).
 
 ## Verify, then commit
-1. Run `make setup lint test build migrate seed anonymize-check audit`, then `team-app up`, then `make e2e`, then `team-app down`. Each must exit 0.
-2. Commit in small Conventional Commits (for example `feat: walking skeleton`, `test: smoke and midnight e2e tests`, `docs: commands and architecture`). Never skip git hooks.
+1. Run each target as its own command: `make setup`, `make lint`, `make test`, `make build`, `make migrate`, `make seed`, `make anonymize-check`, `make audit`, then `team-app up`, `make e2e`, `team-app down`. Each must exit 0. Output with `Error 3` plus "not configured: fill in for your stack" means a target is still unfilled: fill it in.
+2. Check that `git status --porcelain` shows only skeleton files (no `.env`, no `.team/`), then commit with `git add -A` in small Conventional Commits (for example `feat: walking skeleton`, `test: smoke and midnight e2e tests`, `docs: commands and architecture`). Never skip git hooks.
 3. Don't push or open the PR here: `/team:ship` does both.

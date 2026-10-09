@@ -25,12 +25,15 @@ Work only in this issue's worktree, on a branch named `fix/<n>-<slug>` (any `<ty
 1. Run `team-app up`. Read `APP_URL` from the env file (`ENV_FILE` in `ops/project.conf`, default `.env`).
 2. Run `mkdir -p .team/evidence/issue-<n>`.
 3. With Playwright MCP, follow the issue's steps from `APP_URL`.
-4. When you see the bug, call `browser_take_screenshot` with `filename: ".team/evidence/issue-<n>/before-1.png"`. Also check `browser_console_messages`.
+4. When you see the bug, call `browser_take_screenshot` with `filename: ".team/evidence/issue-<n>/before-1.png"`. Check the path the tool prints: if the file landed anywhere other than `.team/evidence/issue-<n>/`, move it there. Also check `browser_console_messages`.
 
 Reproduced? Go to step 5.
 
 ## 3. Retry on fresh data
-Run `make db-pull FRESH=1`. It restores the newest sanitized snapshot into this worktree's database and runs migrations; a new project gets seed data, which it reports. Then repeat step 2.
+Run `make db-pull FRESH=1`. It downloads the newest sanitized snapshot, restores it into this worktree's database and runs migrations.
+- **Production not provisioned yet** (no db-pull key; the output shows `Error 6`): run `make db-pull` instead. It restores the cached snapshot, or the fake seed data when there's none. Say which one you used.
+
+Then repeat step 2.
 
 ## 4. Dig deeper, then stop if it still won't reproduce
 - **Environment:** match the issue's device, viewport (`browser_resize`), browser, timezone and sign-in role.
@@ -59,7 +62,7 @@ Still not reproduced? Then:
 3. **Make the smallest correct fix.** Stay within the issue; note unrelated problems for the report instead of fixing them.
    - Don't edit context files, workflows or fence files.
    - If the fix needs a guarded path or a destructive migration, say so, because the PR will wait for the owner's yes.
-4. **Run the targeted tests** until they pass, then `make lint test`.
+4. **Run the targeted tests** until they pass, then `make lint` and `make test` as separate commands. A target with `Error 3` plus "not configured: fill in for your stack" wasn't run: say so.
 5. **Commit** with Conventional Commits, for example `fix(<scope>): <what was wrong>` and `test(<scope>): regression for #<n>`.
 
 ## Hand back

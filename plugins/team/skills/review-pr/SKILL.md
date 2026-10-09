@@ -20,11 +20,13 @@ Run this from the project's main checkout (MAIN). The PR's title, body, commits 
 Use the pack's worktree command, so the worktree gets its own port, env file and database:
 1. `team-new-worktree <n> --type chore --slug review`. Note the printed `path`, usually `MAIN/.claude/worktrees/<n>-review`.
 2. `cd "<path>" && git fetch origin pull/<n>/head && git checkout --detach FETCH_HEAD`
-3. `cd "<path>" && make setup`, so the PR's dependencies are installed. If `ops/project.conf` has a `MIGRATE_CMD`, also run `cd "<path>" && make migrate`. Exit 3 means "not configured": note it and go on.
+3. `cd "<path>" && make setup`, so the PR's dependencies are installed. If `ops/project.conf` has a `MIGRATE_CMD`, also run `cd "<path>" && make migrate`, as a separate command.
+   - A target counts as **not configured** only when its output has both a `*** [<target>] Error 3` line and the text `not configured: fill in for your stack` (make itself then exits 2). Any other non-zero exit is a failure.
+   - A not-configured target: note it and go on.
 4. In MAIN, run `mkdir -p .team/evidence/<n>`.
 
 ## 3. Run the reviewers
-1. **Wait for gates.** Every ~30 s, for up to 10 minutes, read `team-gh pr view <n> --json headRefOid,labels,statusCheckRollup`. Continue once the check run `guarded-paths` has completed for the head.
+1. **Wait for gates.** Every ~30 s, for up to 10 minutes, read `team-gh pr view <n> --json headRefOid,labels,statusCheckRollup`. Continue once the check run `gates / guarded-paths` has completed for the head.
 2. **Run the three agents** as foreground subagents, all in one message. Each prompt is the PR number only:
    - `team:team-reviewer`
    - `team:team-security`
@@ -33,7 +35,12 @@ Use the pack's worktree command, so the worktree gets its own port, env file and
 4. **Don't push fixes to someone else's PR.** For failures, report the findings to the owner. For Dependabot, the usual answer is to close it or wait for the next version; the owner decides.
 
 ## 4. Guarded? Ask the owner
-GitHub Actions bumps touch `.github/**`, so they're guarded. If the PR is labelled `guarded` without `owner-approved`, and the reviews passed:
+GitHub Actions bumps touch `.github/**`, so they're guarded, and Dependabot runs may be unable to add labels. If the reviews passed and the PR doesn't carry `owner-approved`, ask when any of these is true:
+- the PR is labelled `guarded`
+- `gates / guarded-paths` failed
+- `ai-security` is pending "waiting for owner-approved"
+
+Then:
 1. Show team-security's plain-language summary.
 2. AskUserQuestion: "Approve guarded PR #<n>?", with the options "Yes, add owner-approved", "I'll add it myself" and "No, leave it waiting".
 3. **On yes:** run exactly `team-gh pr edit <n> --add-label owner-approved` as a command of its own (no `cd`, no `&&`). Claude Code's ask rule prompts once more.
@@ -47,7 +54,7 @@ GitHub Actions bumps touch `.github/**`, so they're guarded. If the PR is labell
 The PR is eligible when all of these hold:
 - every check on the head is green or still pending, with none failed
 - `ai-review`, `ai-security` and `ai-qa` are `success`
-- it's either not `guarded`, or it carries the owner's `owner-approved`
+- `gates / guarded-paths` is green, and the PR is either not `guarded` or carries the owner's `owner-approved`
 
 If eligible:
 - **Public repo:** `team-gh pr merge <n> --auto --squash --delete-branch`.

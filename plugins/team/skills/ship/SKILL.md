@@ -33,18 +33,19 @@ Arguments: `$ARGUMENTS`
   - continue only if this work is for that issue, or the owner confirms in the conversation that this change fixes `main`. A background writer can't confirm: status `blocked`.
   - if you continue, remember to add `fixes-main` in step 3
   - otherwise refuse with "main is red (#m): fix it first with /team:start-issue m"
-- **Uncommitted changes.** Commit them with a Conventional Commit message (`git add <paths>`, then `git commit -m '<type>(<scope>): <summary>'`), or ask the owner.
+- **Uncommitted changes.** Check that `git status --porcelain` lists only files this work changed. Then run `git add -A` and `git commit -m '<type>(<scope>): <summary>'`. If the list shows anything else, ask the owner.
 
 ## Step 2: verify locally
 1. `git fetch origin`, then `git merge origin/main`. Resolve any conflicts in a merge commit.
-2. `make lint test`.
-   - Exit 3 means "not configured": say it wasn't run, and never count it as a pass.
+2. Run `make lint`, then `make test`, as separate commands, so an unconfigured target doesn't hide the other one.
+   - A target counts as **not configured** only when its output has both a `*** [<target>] Error 3` line and the text `not configured: fill in for your stack` (make itself then exits 2). Any other non-zero exit is a failure.
+   - Say a not-configured target wasn't run, and never count it as a pass.
    - A failure this change caused: fix it and rerun. A failure from outside this change: status `blocked`.
    - Commit fixes the same way. If a git hook fails, fix the cause.
 3. **After screenshots.** Skip this if nothing user-visible changed, and say so.
    - Run `team-app up`. Read `APP_URL` from the env file (`ENV_FILE` in `ops/project.conf`, default `.env`). If this checkout has no env file, skip screenshots and say "no runnable app in this checkout".
    - The evidence key is `issue-<n>`, or the branch name with `/` replaced by `-` when there's no issue. Run `mkdir -p .team/evidence/<key>`.
-   - With Playwright MCP, open each page the change touches and call `browser_take_screenshot` with `filename: ".team/evidence/<key>/after-<k>.png"`.
+   - With Playwright MCP, open each page the change touches and call `browser_take_screenshot` with `filename: ".team/evidence/<key>/after-<k>.png"`. Check the path the tool prints: if the file landed anywhere other than `.team/evidence/<key>/`, move it there.
 
 ## Step 3: push and open the PR
 1. **Push.** The first push is `git push -u origin HEAD`; later pushes are `git push`.
@@ -69,11 +70,11 @@ Arguments: `$ARGUMENTS`
    - No customer data, secrets or server details. Times name the timezone.
 4. **Open or update the PR.** With no PR yet: `team-gh pr create --base main --title '<title>' --body-file .team/report.md`. Otherwise: `team-gh pr edit <pr> --body-file .team/report.md`.
 5. **Read it back.** `team-gh pr view --json number,url,headRefOid,labels` gives `<pr>` and the link.
-6. **Move the evidence.** Run `mkdir -p .team/evidence/<pr>`, move every file from `.team/evidence/<key>/` into it, and remove the empty folder. Put `<pr>` and the link into `.team/report.md`, then run `team-gh pr edit <pr> --body-file .team/report.md`.
+6. **Move the evidence** by renaming the folder: `mv .team/evidence/<key> .team/evidence/<pr>`. If `.team/evidence/<pr>` already exists, run `mv .team/evidence/<key>/*.png .team/evidence/<pr>/` and then `rmdir .team/evidence/<key>`. Never move a bare `/*`. Put `<pr>` and the link into `.team/report.md`, then run `team-gh pr edit <pr> --body-file .team/report.md`.
 7. **Fixing red main?** Run `team-gh pr edit <pr> --add-label fixes-main`.
 
 ## Step 4: reviews
-1. **Wait for gates.** Every ~30 s, for up to 10 minutes, read `team-gh pr view <pr> --json headRefOid,labels,statusCheckRollup`. Continue once the check run `guarded-paths` has completed for the current head; it sets `guarded` and `high-risk`.
+1. **Wait for gates.** Every ~30 s, for up to 10 minutes, read `team-gh pr view <pr> --json headRefOid,labels,statusCheckRollup`. Continue once the check run `gates / guarded-paths` has completed for the current head; it sets `guarded` and `high-risk`.
 2. **Run the reviewers.** Launch these as foreground subagents, all in one message. Each prompt is the PR number and nothing else:
    - `subagent_type: team:team-reviewer`
    - `subagent_type: team:team-security`
@@ -83,7 +84,7 @@ Arguments: `$ARGUMENTS`
 3. **Read the results:** their replies, plus `ai-review`, `ai-security` and `ai-qa` on the head (`team-gh pr view <pr> --json headRefOid,statusCheckRollup`).
 
 ## Step 5: address findings (at most 2 rounds)
-- **A correct, in-scope blocking finding:** fix it, add or adjust tests (never weaken them), commit, run `make lint test`, then `git push`.
+- **A correct, in-scope blocking finding:** fix it, add or adjust tests (never weaken them), commit, run `make lint` and `make test` separately, then `git push`.
   - A push creates a new head. Old statuses stop counting, and gates removes `owner-approved`.
   - Then repeat step 4: wait for gates and rerun all three agents.
 - **A finding you think is wrong:** don't change code to satisfy it. Put it under "Questions for you".
@@ -94,7 +95,7 @@ Arguments: `$ARGUMENTS`
 - **After 2 rounds with failures left:** status `blocked`, list the findings, and stop. Don't enable auto-merge.
 
 ## Step 6: guarded PRs wait for the owner's yes
-Applies when the PR is labelled `guarded` and doesn't carry `owner-approved`.
+Applies when the PR doesn't carry `owner-approved` and is labelled `guarded`, or `gates / guarded-paths` failed, or `ai-security` is pending "waiting for owner-approved".
 
 **Background writer:** stop here. Set status `waiting for your yes`, and put team-security's plain-language summary under "Guarded / risks". Update the PR body, print the report, and don't enable auto-merge.
 

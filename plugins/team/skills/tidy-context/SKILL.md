@@ -59,7 +59,7 @@ Merge duplicates, and drop lessons already covered. Then route each one, citing 
    EOF
    ```
 2. **Branch:** `git switch -c docs/<issue>-tidy-context --no-track origin/main`. Apply the edits from steps 2–3, and write `last_run_utc=<now>` to `docs/decisions/.last-tidy`.
-3. **Commit:** `git add <paths>`, then `git commit -m 'docs: tidy context files'`. If a hook fails, fix the cause; never skip git hooks.
+3. **Commit.** Check that `git status --porcelain` lists only the context files, decision records and `docs/decisions/.last-tidy` you changed. Then run `git add -A` and `git commit -m 'docs: tidy context files'`. If a hook fails, fix the cause; never skip git hooks.
 4. **Push and open the PR:** `git push -u origin HEAD`. Write `.team/report.md` as the standard report:
    - status `waiting for your yes`
    - a table: lesson → destination, with the source PR
@@ -71,7 +71,7 @@ Merge duplicates, and drop lessons already covered. Then route each one, citing 
    Then run `team-gh pr create --base main --title 'docs: tidy context files' --body-file .team/report.md`.
 
 ## 5. Finish the PR (it's guarded)
-1. **Reviews.** Wait until the check run `guarded-paths` has completed for the head (`team-gh pr view <pr> --json headRefOid,labels,statusCheckRollup`, every ~30 s). Then run `team:team-reviewer`, `team:team-security` and `team:team-qa` as foreground subagents in one message, each with the PR number as its whole prompt.
+1. **Reviews.** Wait until the check run `gates / guarded-paths` has completed for the head (`team-gh pr view <pr> --json headRefOid,labels,statusCheckRollup`, every ~30 s). Then run `team:team-reviewer`, `team:team-security` and `team:team-qa` as foreground subagents in one message, each with the PR number as its whole prompt.
 2. **Findings.** Fix correct findings, commit, `git push`, and rerun all three. At most 2 rounds.
 3. **The owner's yes:**
    - Show team-security's plain-language summary, then AskUserQuestion: "Approve guarded PR #<pr>?" ("Yes, add owner-approved" / "I'll add it myself" / "No, leave it waiting").

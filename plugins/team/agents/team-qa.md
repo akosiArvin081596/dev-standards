@@ -26,7 +26,7 @@ Read GitHub with `team-gh` (reads pass through; `gh <same args>` also works on a
    - If it won't start, read the end of `P/.team/app.log` (local fake data only). Then post `failure` "app does not start", with the reason in your reply.
 4. **Evidence folder.** Screenshots go to `.team/evidence/<n>/`, relative to the session's project root. In a worktree, that path is a symlink into the main checkout.
    - The calling skill creates the folder. Confirm it exists with `ls -d .team/evidence/<n>`.
-   - Pass `filename: ".team/evidence/<n>/after-qa-<k>.png"` to `browser_take_screenshot`.
+   - Pass `filename: ".team/evidence/<n>/after-qa-<k>.png"` to `browser_take_screenshot`. Check the path it prints; if the file landed outside `.team/evidence/<n>/`, report the real path (you can't move files).
    - If the folder is missing or the tool refuses the path, take the screenshot without `filename` (it lands in `.team/evidence/` with a timestamped name), and report the path it printed.
 5. **Check each acceptance criterion** in the browser, starting at `APP_URL`:
    - Act with `browser_navigate`, `browser_click`, `browser_type` and similar tools. Judge with `browser_snapshot` (the accessibility tree), plus console errors (`browser_console_messages`).
@@ -34,7 +34,7 @@ Read GitHub with `team-gh` (reads pass through; `gh <same args>` also works on a
    - Also check: no console errors on the pages you visited, a narrow mobile viewport (`browser_resize` to 390×844) for UI changes, and that times shown name or match the project timezone.
    - Before-screenshots come from the writer (`before-*` files in the same folder). List them. If there are none, say "no before screenshot".
    - Feature flags: note each flag's state as seen locally. Don't change data to toggle flags; the PR's tests cover on and off.
-6. **Nothing user-visible changed** (for example backend-only, a dependency bump, or config)? Run the smoke test instead: `cd "P" && make e2e`. Report "smoke test only", with the pass and fail counts. Exit code 3 means "not configured": report it as `failure` "smoke test not configured".
+6. **Nothing user-visible changed** (for example backend-only, a dependency bump, or config)? Run the smoke test instead: `cd "P" && make e2e`. Report "smoke test only", with the pass and fail counts. If the output has both a `*** [e2e] Error 3` line and "not configured: fill in for your stack" (make exits 2), report `failure` "smoke test not configured". Any other non-zero exit is a failed smoke test.
 7. **Clean up.** If you started the app in step 3, run `cd "P" && team-app down`. Close the browser (`browser_close`).
 8. **Status.** Re-check `team-gh pr view <n> --json headRefOid`, then post on SHA either way: `team-post-check <SHA> ai-qa <success|failure> "<summary, at most 140 characters>"`.
    - Use `failure` if any criterion failed, the app didn't start, or the smoke test failed.

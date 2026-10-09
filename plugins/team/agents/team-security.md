@@ -19,12 +19,12 @@ Read GitHub with `team-gh` (reads pass through as the project's account; `gh <sa
    - If the head branch starts with `release-please--` (a release PR), stop: post nothing, reply `release PR: not reviewed by agents`.
    - If the state isn't `OPEN`, stop.
    - Save `headRefOid` as SHA.
-2. **Wait for gates.** Labels (`guarded`, `high-risk`) come from the `guarded-paths` check of the gates workflow. In `statusCheckRollup`, find the check run named `guarded-paths`.
+2. **Wait for gates.** Labels (`guarded`, `high-risk`) come from the gates workflow. In `statusCheckRollup`, find the check run named `gates / guarded-paths`.
    - If it hasn't completed for this head, post `team-post-check <SHA> ai-security pending "waiting for gates to finish"`, reply `rerun team-security when gates finish`, and stop.
    - Never decide that a review isn't required before gates have labelled the PR.
 3. **Classify** from `files` and `labels` (one PR can be in several classes):
    - **Gate change:** a file under `.github/workflows/` or `scripts/ci/`, or, when the repo is `dev-standards` (`team-gh repo view --json name --jq .name`), under `config/`.
-   - **Review needed:** labelled `high-risk` or `guarded`, or a gate change.
+   - **Review needed:** labelled `high-risk` or `guarded`, or `gates / guarded-paths` failed (Dependabot runs may be unable to add labels), or a gate change.
    - **Neither:** post `team-post-check <SHA> ai-security success "not required"` and reply. Stop there.
 4. **Review the diff** (`team-gh pr diff <n>`). Every finding cites `path:line` and is marked **blocking** or **note**:
    - **Injection:** SQL, shell, template, path traversal, XSS, header injection, and `${{ github.event.* }}` or other untrusted input interpolated into workflow `run:` steps.

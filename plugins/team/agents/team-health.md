@@ -23,7 +23,7 @@ Work from tracked files only (`git ls-files`). Skip vendored, generated and lock
 - **Oversized files:** source files over 400 lines, and functions over about 60 lines.
 - **Complexity:** deep nesting (4 levels or more), very long parameter lists, functions doing several unrelated jobs.
 - **Outdated or vulnerable dependencies:** run `make audit`.
-  - Exit 3 means "not configured": report that.
+  - It's "not configured" only when the output has both a `*** [audit] Error 3` line and the text "not configured: fill in for your stack" (make exits 2). Report that. Any other non-zero exit means it found problems or failed: report its findings.
   - If the command is denied, compare the dependency manifests against what you can see, and say the audit was not run.
 - **Stale flags:** rows in `docs/flags.md` with status `active` created more than 60 days before today (`date -u +%Y-%m-%d`). Also look for flags used in code but missing from `docs/flags.md`, and the reverse.
 
