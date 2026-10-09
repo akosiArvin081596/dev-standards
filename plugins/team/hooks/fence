@@ -1,0 +1,4241 @@
+#!/bin/bash
+# fence: PreToolUse hook, layer 3 of the team fences (docs/rules.md section 13).
+#   allow  -> exit 0, no output
+#   deny   -> JSON decision on stdout, exit 0
+#   error  -> "[fence:<id>] reason" on stderr, exit 2 (internal-error, malformed-input, timeout)
+# bash 3.2 + BSD tools, one jq call, no network. It never fails open: every unexpected exit
+# becomes an error-deny through the EXIT trap, and a watchdog turns a slow decision into one.
+# Rule semantics: hooks/README.md. Rule ids: docs/rules.md section 13.
+LC_ALL=C
+export LC_ALL
+set -u
+set -f
+# Reasons go to fd 3 (the real stderr). bash's own notices (e.g. "Killed: 9" when the watchdog
+# kills a child) go nowhere, so the first stderr line is always the fence's.
+exec 3>&2 2>/dev/null
+
+FENCE_DONE=0
+FENCE_CHILD=0
+FENCE_CHILD_PID=''
+FENCE_AGENT=main
+FENCE_TEXT=-
+FENCE_WD=8
+FENCE_WDPID=
+
+# ============================================================ outcome, log, traps, watchdog
+
+fence_redact() {
+  # redact secrets in $1 into REPLY (one sed call, only on the deny path); at most 300 chars
+  # only the start of the text is logged; cut first (substitution is slow on long text)
+  local t=${1:0:2000}
+  t=${t//$'\n'/ }
+  t=${t//$'\t'/ }
+  t=${t//$'\r'/ }
+  t=${t//$'\001'/\$}
+  REPLY=$(printf '%s\n' "$t" | sed -E \
+    -e 's/(gh[opusr]_)[A-Za-z0-9_]+/\1[REDACTED]/g' \
+    -e 's/github_pat_[A-Za-z0-9_]+/github_pat_[REDACTED]/g' \
+    -e 's/([Bb][Ee][Aa][Rr][Ee][Rr])[ :]+[^ "'"'"']+/\1 [REDACTED]/g' \
+    -e 's/([Aa]uthorization:[ ]*[A-Za-z]+[ ]+)[^ "'"'"']+/\1[REDACTED]/g' \
+    -e 's/([A-Za-z0-9_]*([Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Kk][Ee][Yy])[A-Za-z0-9_]*=)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^ ;&|]*)/\1[REDACTED]/g' \
+    2>/dev/null) || REPLY='[redaction failed]'
+  REPLY=${REPLY:0:300}
+}
+
+fence_log() {
+  # one line per deny / error-deny: <UTC ISO-8601> TAB <rule-id> TAB <agent|main> TAB <text>
+  local dir ts
+  dir=${TEAM_CONFIG_DIR:-${HOME:-/nonexistent}/.config/team}
+  [ -d "$dir" ] || return 0
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || ts=
+  [ -n "$ts" ] || ts=unknown
+  fence_redact "$FENCE_TEXT"
+  printf '%s\t%s\t%s\t%s\n' "$ts" "$1" "$FENCE_AGENT" "$REPLY" >>"$dir/fence.log" 2>/dev/null
+  return 0
+}
+
+fence_stop_watchdog() {
+  # stop the watchdog and wait for it, so its sleep is gone before the hook exits
+  if [ -n "$FENCE_WDPID" ] && [ "$FENCE_CHILD" = 0 ]; then
+    kill -TERM "$FENCE_WDPID" 2>/dev/null
+    wait "$FENCE_WDPID" 2>/dev/null
+  fi
+  FENCE_WDPID=''
+  return 0
+}
+
+fence_error() {
+  # fence_error <rule-id> <reason>: error-deny, exit 2
+  FENCE_DONE=1
+  trap '' ALRM
+  fence_stop_watchdog
+  printf '[fence:%s] %s\n' "$1" "$2" >&3
+  fence_log "$1"
+  exit 2
+}
+
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+fence_on_exit() {
+  local st=$?
+  if [ "$FENCE_DONE" != 1 ]; then
+    FENCE_DONE=1
+    trap '' ALRM
+    fence_stop_watchdog
+    printf '[fence:internal-error] the fence hook failed (status %s), so the call is blocked. Retry; if it keeps failing, tell the owner.\n' "$st" >&3
+    fence_log internal-error
+    exit 2
+  fi
+}
+
+# shellcheck disable=SC2329 # invoked by the ALRM trap
+fence_on_alarm() {
+  # the watchdog fired: it kills the decision process (even inside a long builtin); wait
+  # for that and for the watchdog itself, then fail closed
+  trap '' ALRM
+  [ -n "$FENCE_CHILD_PID" ] && wait "$FENCE_CHILD_PID" 2>/dev/null
+  [ -n "$FENCE_WDPID" ] && wait "$FENCE_WDPID" 2>/dev/null
+  FENCE_WDPID=''
+  fence_error timeout "the fence hook ran out of time (${FENCE_WD}s), so the call is blocked. Retry with a simpler command."
+}
+
+trap fence_on_exit EXIT
+trap fence_on_alarm ALRM
+
+case ${TEAM_FENCE_WATCHDOG:-} in
+  [1-8]) FENCE_WD=$TEAM_FENCE_WATCHDOG ;;
+esac
+
+deny() {
+  # deny <rule-id> <reason>. Inside a scanned script or make recipe the id becomes script-scan.
+  local id=$1 reason=$2 msg
+  if [ -n "$F_SCAN_CTX" ] && [ "$id" != script-scan ]; then
+    reason="$F_SCAN_CTX would run something the fence blocks ($id: $reason) Run the steps you need directly so each can be checked."
+    id=script-scan
+  fi
+  FENCE_DONE=1
+  trap '' ALRM
+  fence_stop_watchdog
+  msg="[fence:$id] ${reason:0:1500}"
+  msg=${msg//\\/\\\\}
+  msg=${msg//\"/\\\"}
+  msg=${msg//$'\n'/ }
+  msg=${msg//$'\t'/ }
+  msg=${msg//$'\r'/ }
+  msg=${msg//$'\001'/\$}
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$msg"
+  fence_log "$id"
+  exit 0
+}
+
+allow() {
+  fence_stop_watchdog
+  FENCE_DONE=1
+  trap '' ALRM
+  exit 0
+}
+
+fence_start_watchdog() {
+  # A subshell sleeps FENCE_WD seconds, then signals the hook (ALRM) and kills every other
+  # process under the hook (a hung git/jq or the test delay). Stopped early, it kills its sleep.
+  (
+    trap 'kill -TERM $! 2>/dev/null; exit 0' TERM
+    sleep "$FENCE_WD" &
+    wait $!
+    trap '' TERM
+    sleep 30 &
+    marker=$!
+    tree=$(ps -A -o pid= -o ppid= 2>/dev/null)
+    kill -KILL "$marker" 2>/dev/null
+    wait "$marker" 2>/dev/null
+    kill -ALRM "$$" 2>/dev/null
+    self=
+    while read -r p pp; do
+      [ "$p" = "$marker" ] && self=$pp
+    done <<WDEOF
+$tree
+WDEOF
+    list=" $$ "
+    changed=1
+    while [ "$changed" = 1 ]; do
+      changed=0
+      while read -r p pp; do
+        [ -n "$p" ] || continue
+        [ "$p" = "$self" ] && continue
+        [ "$p" = "$marker" ] && continue
+        case $list in *" $p "*) continue ;; esac
+        case $list in *" $pp "*) list="$list$p " && changed=1 ;; esac
+      done <<WDEOF
+$tree
+WDEOF
+    done
+    for p in $list; do
+      [ "$p" = "$$" ] && continue
+      kill -KILL "$p" 2>/dev/null
+    done
+    exit 0
+  ) </dev/null >/dev/null 2>&1 3>&- &
+  FENCE_WDPID=$!
+}
+
+# ============================================================ messages (say what to do instead)
+
+M_PUSH_MAIN="pushing to main is not allowed. Push your feature branch (git push -u origin HEAD from the worktree branch) and open a PR with team-gh pr create."
+M_PUSH_UNKNOWN="the fence can't tell where this push goes (the branch or refspec isn't literal, or the repo can't be read). Write it plainly from the worktree, e.g. git push -u origin HEAD."
+M_RELEASE_BRANCH="release-please branches belong to the release workflow; don't push to them."
+M_FORCE="force-pushing is not allowed. Add a new commit instead, or ask the owner."
+M_PUSH_TAGS="pushing or deleting tags (or pushing all refs) is not allowed; tags come from release-please. Push only your branch: git push -u origin HEAD."
+M_TAG="creating, moving or deleting tags is not allowed; tags come from release-please. Listing tags (git tag -l) is fine."
+M_RELEASE="creating, editing or deleting releases is not allowed; release-please makes releases. Viewing them (gh release view/list) is fine."
+M_SKIP_HOOKS="skipping git hooks (--no-verify, commit -n) is not allowed. Fix what the hook reports and commit again."
+M_HOOKS_PATH="changing core.hooksPath is not allowed; only team-hooks sets it."
+M_GIT_CONFIG="changing git config or remotes is not allowed here (allowed -c keys: user.name user.email color.* advice.* init.defaultBranch core.quotePath core.autocrlf push.default push.autoSetupRemote pull.rebase commit.gpgSign log.* format.* diff.renames). Ask the owner."
+M_MERGE_ADMIN="merging with --admin is not allowed. Use team-gh pr merge <n> --auto --squash and let the required checks decide."
+M_MERGE_NO_AUTO="merges go through auto-merge only: team-gh pr merge <n> --auto --squash [--delete-branch]."
+M_OWNER="only the owner adds owner-approved: from the main session, exactly 'team-gh pr edit <n> --add-label owner-approved', which asks the owner. The protected labels (owner-approved, guarded, high-risk, tests-changed) are never removed. Ask the owner."
+M_GH_WRITE="raw gh is for reads only. Use team-gh for the allowed writes: pr create, pr edit (title/body/base, allowed labels), pr comment, pr review --comment, pr merge --auto --squash, issue create/comment, issue edit --add-label <allowed>."
+M_GH_API="gh api writes are not allowed. Use the matching team-gh subcommand; reads need no -X/-f/-F (or use -X GET)."
+M_GH_CRED="printing or changing gh credentials or gh config is not allowed; team-gh picks the right account itself."
+M_CURL="only GET/HEAD requests go to GitHub with curl or wget, with a literal URL and no config file. Use team-gh for writes."
+M_CRED="reading credentials (private SSH keys, the keychain, git/gh credential stores, production env files) is not allowed. Ask the owner."
+M_WORKFLOW="workflow files (.github/workflows) are changed only by team-sync from dev-standards; don't edit them here."
+M_FENCE="this path is a fence file (Claude settings, .claude/agents, .claude/hooks, .mcp.json, .git/config, .git/hooks, ~/.claude, the pack's config) and can't be written from here. Plain reads are fine. Ask the owner."
+M_PROD="production deploys, rollbacks and production flags are run by the owner in a terminal. Print the command for the owner instead."
+M_CLAUDE="nested Claude Code is allowed only as: [cd <dir> &&] claude --bg [--name <n>] [--permission-mode <BACKGROUND_PERMISSION_MODE>] \"<prompt>\", or claude agents --json [--all], claude logs|stop|rm <id>, claude --version, claude plugin list|validate."
+M_SSH_DEST="ssh-family connections go only to the VPS alias or GitHub (ssh -T git@github.com): not by IP, hostname or domain, not to a forbidden alias or any other host. Use 'ssh <vps alias> ...' (the owner approves it)."
+M_SSH_FORM="only the plain form is allowed: ssh [-T] [-v] [-q] [-o BatchMode|ConnectTimeout|ServerAliveInterval|ServerAliveCountMax|LogLevel|RequestTTY=...] <vps alias> [command], or ssh -T git@github.com. No scp/sftp/sshfs/autossh/mosh/remote rsync, no -F/-J/-W/-l/user@ or other options, no edits to SSH client files."
+M_DISGUISED="write the command plainly: no eval, no pipes into a shell or interpreter, no command names built from variables/quotes/escapes, no decoding, no command runners around git/gh/ssh/curl/wget, and no GIT_*/PATH/LD_PRELOAD/DYLD_* overrides."
+M_GITDISG="git options that run other programs (--exec-path=, --upload-pack, --receive-pack, --exec) are not allowed. Write the command plainly."
+M_AGENT_TOOL="review agents are read-only: they can't edit files or start agents. Report findings instead."
+M_POST_CHECK="ai-* statuses are posted only by the matching review agent through team-post-check (team-reviewer -> ai-review, team-security -> ai-security, team-qa -> ai-qa)."
+M_RC="shell startup files change what every later command runs, so they can't be written from here. Ask the owner."
+
+# ============================================================ small helpers
+
+f_lc() {
+  # lowercase (ASCII) $1 into REPLY
+  local s=$1
+  case $s in *[A-Z]*) ;; *) REPLY=$s; return 0 ;; esac
+  if [ "${#s}" -gt 4096 ]; then
+    # ${s//X/x} is slow on long text; tr is linear
+    REPLY=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+    return 0
+  fi
+  s=${s//A/a}; s=${s//B/b}; s=${s//C/c}; s=${s//D/d}; s=${s//E/e}; s=${s//F/f}; s=${s//G/g}
+  s=${s//H/h}; s=${s//I/i}; s=${s//J/j}; s=${s//K/k}; s=${s//L/l}; s=${s//M/m}; s=${s//N/n}
+  s=${s//O/o}; s=${s//P/p}; s=${s//Q/q}; s=${s//R/r}; s=${s//S/s}; s=${s//T/t}; s=${s//U/u}
+  s=${s//V/v}; s=${s//W/w}; s=${s//X/x}; s=${s//Y/y}; s=${s//Z/z}
+  REPLY=$s
+}
+
+f_abbrev() {
+  # f_abbrev <word> <full long option> <min length>: the word (without =value) abbreviates it
+  local w=${1%%=*}
+  [ "${#w}" -ge "$3" ] || return 1
+  case $2 in "$w"*) return 0 ;; esac
+  return 1
+}
+
+f_is_digits() { case $1 in '' | *[!0-9]*) return 1 ;; esac; return 0; }
+
+f_norm() {
+  # normalise a path into REPLY: no '.', '..' or empty components (\001 = unknown component)
+  local p=$1 lead='' part n
+  local -a parts ncomp
+  case $p in /*) lead=/ ;; esac
+  local IFS=/
+  # shellcheck disable=SC2206 # split on / on purpose; globbing is off (set -f)
+  parts=($p)
+  IFS=$' \t\n'
+  ncomp=()
+  for part in ${parts[@]+"${parts[@]}"}; do
+    case $part in
+      '' | .) ;;
+      ..)
+        n=${#ncomp[@]}
+        if [ "$n" -gt 0 ] && [ "${ncomp[n - 1]}" != $'\001' ]; then
+          unset "ncomp[$((n - 1))]"
+          ncomp=(${ncomp[@]+"${ncomp[@]}"})
+        fi
+        ;;
+      *) ncomp+=("$part") ;;
+    esac
+  done
+  IFS=/
+  REPLY="$lead${ncomp[*]+${ncomp[*]}}"
+  IFS=$' \t\n'
+  [ -n "$REPLY" ] || REPLY=/
+}
+
+f_resolve() {
+  # f_resolve <path word> [base dir]: absolute normalised path into REPLY;
+  # with an unknown base the path starts with a \001 component
+  local p=$1 base=${2-$VCWD}
+  case $p in
+    /* | $'\001'*) ;;
+    *) if [ -n "$base" ]; then p=$base/$p; else p=$'\001'/$p; fi ;;
+  esac
+  f_norm "$p"
+}
+
+# ============================================================ config (parsed, never sourced)
+
+CFG_LOADED=0
+CFG_OK=0
+CFG_VPS_ALIAS=
+CFG_VPS_IP=
+CFG_VPS_HOSTNAME=
+CFG_DOMAIN=
+CFG_FORBIDDEN=
+CFG_BG_MODE=
+CFG_GH_ALIASES=
+f_load_config() {
+  [ "$CFG_LOADED" = 1 ] && return 0
+  CFG_LOADED=1
+  local f line k v kind alias rest
+  f=$F_CFGDIR/defaults.conf
+  if [ -f "$f" ] && [ -r "$f" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}
+      case $line in '#'* | '') continue ;; *=*) ;; *) continue ;; esac
+      k=${line%%=*}
+      v=${line#*=}
+      case $v in \"*\") v=${v#\"}; v=${v%\"} ;; esac
+      case $k in
+        VPS_ALIAS) CFG_VPS_ALIAS=$v ;;
+        VPS_IP) CFG_VPS_IP=$v ;;
+        VPS_HOSTNAME) CFG_VPS_HOSTNAME=$v ;;
+        DOMAIN) CFG_DOMAIN=$v ;;
+        VPS_FORBIDDEN_ALIASES) CFG_FORBIDDEN=$v ;;
+        BACKGROUND_PERMISSION_MODE) CFG_BG_MODE=$v ;;
+      esac
+    done <"$f"
+    [ -n "$CFG_VPS_ALIAS" ] && CFG_OK=1
+  fi
+  f=$F_CFGDIR/accounts.conf
+  if [ -f "$f" ] && [ -r "$f" ]; then
+    while IFS='|' read -r kind _ alias rest || [ -n "$kind" ]; do
+      case $kind in account | agent) ;; *) continue ;; esac
+      [ -n "$alias" ] || continue
+      f_lc "$alias"
+      CFG_GH_ALIASES="$CFG_GH_ALIASES $REPLY"
+    done <"$f"
+  fi
+  f_lc "$CFG_VPS_ALIAS"; CFG_VPS_ALIAS=$REPLY
+  f_lc "$CFG_VPS_IP"; CFG_VPS_IP=$REPLY
+  f_lc "$CFG_VPS_HOSTNAME"; CFG_VPS_HOSTNAME=$REPLY
+  f_lc "$CFG_DOMAIN"; CFG_DOMAIN=$REPLY
+  f_lc "$CFG_FORBIDDEN"; CFG_FORBIDDEN=$REPLY
+  return 0
+}
+
+# ============================================================ agents (the one place for the map)
+
+AG_KIND=
+AG_CTX=
+F_IS_REVIEW=0
+f_review_agent() {
+  # review agents get Bash allowlists and no Write/Edit/Agent; AG_CTX is their ai-* status.
+  # team-post-check matches the exact (namespaced) agent_type only.
+  AG_KIND='' AG_CTX=''
+  case $T_AGENT in
+    team:team-reviewer) AG_KIND=reviewer AG_CTX=ai-review ;;
+    team:team-security) AG_KIND=security AG_CTX=ai-security ;;
+    team:team-qa) AG_KIND=qa AG_CTX=ai-qa ;;
+    team:team-health) AG_KIND=health ;;
+    team-reviewer) AG_KIND=reviewer ;;
+    team-security) AG_KIND=security ;;
+    team-qa) AG_KIND=qa ;;
+    team-health) AG_KIND=health ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# ============================================================ path classification
+
+F_STD_CACHE=" "
+f_is_standards_root() {
+  # f_is_standards_root <dir>: a git checkout whose origin URL path ends /dev-standards(.git)
+  local d=$1 url
+  case $F_STD_CACHE in *" +$d "*) return 0 ;; *" -$d "*) return 1 ;; esac
+  if [ -e "$d/.git" ]; then
+    url=$(git -C "$d" config --get remote.origin.url 2>/dev/null) || url=
+    url=${url%/}
+    case $url in
+      */dev-standards | */dev-standards.git)
+        F_STD_CACHE="$F_STD_CACHE+$d "
+        return 0
+        ;;
+    esac
+  fi
+  F_STD_CACHE="$F_STD_CACHE-$d "
+  return 1
+}
+
+f_std_exempt() {
+  # f_std_exempt <abs path> <kind>: inside the standards repo, managed/** and tests/** copies
+  # are ordinary files, and so are its workflows
+  local p=$1 kind=$2 pre='' comp
+  local -a parts
+  local IFS=/
+  # shellcheck disable=SC2206
+  parts=($p)
+  IFS=$' \t\n'
+  for comp in ${parts[@]+"${parts[@]}"}; do
+    [ -n "$comp" ] || continue
+    f_lc "$comp"
+    case $REPLY in
+      managed | tests)
+        [ -n "$pre" ] && f_is_standards_root "$pre" && return 0
+        ;;
+      .github)
+        [ "$kind" = workflow ] && [ -n "$pre" ] && f_is_standards_root "$pre" && return 0
+        ;;
+    esac
+    pre=$pre/$comp
+  done
+  return 1
+}
+
+f_kind_literal() {
+  # f_kind_literal <abs normalised path> -> FK: fence|workflow|cred|sshcfg|gitcfg|curlcfg|shellrc|''
+  local p=$1 lp b
+  FK=
+  f_lc "$p"
+  lp=$REPLY
+  case $lp in
+    "$F_LHOME"/.claude | "$F_LHOME"/.claude/* | "$F_LHOME"/.claude.json) FK=fence ;;
+    "$F_LCFG" | "$F_LCFG"/*) FK=fence ;;
+    */.claude/settings*.json | */.claude/agents | */.claude/agents/* | */.claude/hooks | */.claude/hooks/* | */.mcp.json | */.claude) FK=fence ;;
+    */.git | */.git/config | */.git/config.* | */.git/*/config | */.git/*/config.worktree | */.git/hooks | */.git/hooks/* | */.git/*/hooks | */.git/*/hooks/*) FK=fence ;;
+    */.github/workflows | */.github/workflows/* | */.github) FK=workflow ;;
+    */.ssh/config) FK=sshcfg ;;
+    */.ssh/known_hosts | */.ssh/known_hosts.old | */.ssh/*.pub) ;;
+    */.ssh | */.ssh/*) FK=cred ;;
+    */.config/gh | */.config/gh/*) FK=cred ;;
+    */.git-credentials | */.netrc | */.config/git/credentials | */library/keychains | */library/keychains/*) FK=cred ;;
+    */.gitconfig | */.config/git/config) FK=gitcfg ;;
+    */.curlrc | */.wgetrc | */.config/curlrc) FK=curlcfg ;;
+    "$F_LHOME"/.zshenv | "$F_LHOME"/.zshrc | "$F_LHOME"/.zprofile | "$F_LHOME"/.zlogin | "$F_LHOME"/.bashrc | "$F_LHOME"/.bash_profile | "$F_LHOME"/.bash_login | "$F_LHOME"/.profile) FK=shellrc ;;
+  esac
+  if [ -z "$FK" ]; then
+    b=${lp##*/}
+    case $b in
+      .env.production* | *.production.env | production.env | .env.prod) FK=cred ;;
+    esac
+  fi
+  case $FK in
+    fence | workflow)
+      case $lp in
+        */managed/* | */tests/* | */.github/* | */.github) f_std_exempt "$p" "$FK" && FK= ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
+F_EXEMPLARS=".claude .git .claude/settings.json .claude/settings.local.json .claude/agents .claude/agents/a.md .claude/hooks .claude/hooks/h .mcp.json .git/config .git/hooks .git/hooks/pre-push .github .github/workflows .github/workflows/ci.yml .env.production .env.production.local .env.prod production.env app.production.env .ssh/id_rsa .ssh/id_ed25519 .ssh/config"
+
+f_gm() {
+  # component-wise glob match: f_gm <pattern> <candidate> (both without a leading /).
+  # '**' or a component that is only \001 matches any number of components. A literal glob
+  # matches a dot-component only when it starts with '.' (or F_DOTOK=1); \001 matches anything.
+  local p=$1 c=$2 ph ch pat
+  while :; do
+    if [ -z "$p" ]; then
+      [ -z "$c" ]
+      return
+    fi
+    if [ "${p#*/}" = "$p" ]; then ph=$p p=; else ph=${p%%/*} p=${p#*/}; fi
+    if [ "$ph" = '**' ] || [ "$ph" = $'\001' ]; then
+      while :; do
+        f_gm "$p" "$c" && return 0
+        [ -n "$c" ] || return 1
+        if [ "${c#*/}" = "$c" ]; then c=; else c=${c#*/}; fi
+      done
+    fi
+    [ -n "$c" ] || return 1
+    if [ "${c#*/}" = "$c" ]; then ch=$c c=; else ch=${c%%/*} c=${c#*/}; fi
+    case $ph in
+      *$'\001'* | .*) ;;
+      *) case $ch in .*) [ "$F_DOTOK" = 1 ] || return 1 ;; esac ;;
+    esac
+    pat=${ph//$'\001'/*}
+    # shellcheck disable=SC2053 # a pattern match on purpose
+    [[ $ch == $pat ]] || return 1
+  done
+}
+
+f_kind_glob() {
+  # f_kind_glob <abs normalised pattern> -> FKS: the kinds of exemplar paths it could match
+  local lpat pre rest comp base='' s cand
+  FKS=
+  f_lc "$1"
+  lpat=$REPLY
+  while :; do
+    case $lpat in
+      *'{'*'}'*)
+        pre=${lpat%%'{'*}
+        rest=${lpat#*'{'}
+        rest=${rest#*'}'}
+        lpat="$pre*$rest"
+        ;;
+      *) break ;;
+    esac
+  done
+  # an expression with no literal part at all can't be judged
+  case ${lpat//[\/$'\001'*]/} in '') return 0 ;; esac
+  rest=${lpat#/}
+  while [ -n "$rest" ]; do
+    if [ "${rest#*/}" = "$rest" ]; then break; fi
+    comp=${rest%%/*}
+    case $comp in *[*?[]* | *$'\001'*) break ;; esac
+    base=$base/$comp
+    rest=${rest#*/}
+  done
+  # candidate fence paths below the literal prefix and below its ancestors (the prefix may
+  # already hold part of a fence path, e.g. .claude/settings*.json)
+  local -a bases
+  local anc=$base up=0
+  bases=("$base" "$base/x" "$base/x/y")
+  while [ "$up" -lt 3 ] && [ -n "$anc" ]; do
+    anc=${anc%/*}
+    bases+=("$anc")
+    up=$((up + 1))
+  done
+  for cand in $F_EXEMPLARS; do
+    for s in "${bases[@]}"; do
+      s=$s/$cand
+      if f_gm "${lpat#/}" "${s#/}"; then
+        f_kind_literal "$s"
+        [ -n "$FK" ] && FKS="$FKS $FK"
+      fi
+    done
+  done
+  for cand in "$F_LHOME/.claude" "$F_LHOME/.claude/settings.json" "$F_LHOME/.claude/x" "$F_LHOME/.claude.json" "$F_LCFG/defaults.conf" "$F_LHOME/.ssh/id_rsa" "$F_LHOME/.ssh/id_ed25519" "$F_LHOME/.config/gh/hosts.yml" "$F_LHOME/.netrc" "$F_LHOME/.git-credentials" "$F_LHOME/.gitconfig" "$F_LHOME/.zshrc" "$F_LHOME/.zshenv" "$F_LHOME/.bashrc"; do
+    if f_gm "${lpat#/}" "${cand#/}"; then
+      f_kind_literal "$cand"
+      [ -n "$FK" ] && FKS="$FKS $FK"
+    fi
+  done
+  return 0
+}
+
+f_hot() {
+  # cheap filter: could word $1 (flags $2) name a protected path?
+  case $2 in *g* | *D* | *v*) return 0 ;; esac
+  [ "$F_HOTCWD" = 1 ] && return 0
+  shopt -s nocasematch
+  case $1 in
+    *.claude* | *.mcp.json* | *.git* | *.ssh* | *.env* | *production* | *.config* | *hosts.yml* | *credentials* | *.netrc* | *.curlrc* | *.wgetrc* | *.zsh* | *.bash* | *.profile* | *keychains* | "$F_HOME" | "$F_HOME"/)
+      shopt -u nocasematch
+      return 0
+      ;;
+  esac
+  shopt -u nocasematch
+  return 1
+}
+
+f_set_hotcwd() {
+  F_HOTCWD=0
+  shopt -s nocasematch
+  case $VCWD in
+    '' | *.claude* | *.git* | *.ssh* | *.config* | *keychains* | *library*) F_HOTCWD=1 ;;
+    "$F_HOME") F_HOTCWD=1 ;;
+  esac
+  shopt -u nocasematch
+}
+
+f_path_kinds() {
+  # f_path_kinds <word value> <word flags> -> PK: space-separated kinds the word may name
+  local v=$1 fl=$2
+  PK=''
+  case $v in '' | - | /dev/null | /dev/stdin | /dev/stdout | /dev/stderr) return 0 ;; esac
+  # longer than PATH_MAX: not a path the system can open
+  [ "${#v}" -gt 4096 ] && return 0
+  f_resolve "$v"
+  case $fl in
+    *g* | *D*)
+      F_DOTOK=0
+      case $fl in *D*) F_DOTOK=1 ;; esac
+      f_kind_glob "$REPLY"
+      PK=$FKS
+      return 0
+      ;;
+  esac
+  case $REPLY in
+    *$'\001'*)
+      F_DOTOK=1
+      f_kind_glob "$REPLY"
+      PK=$FKS
+      return 0
+      ;;
+  esac
+  f_kind_literal "$REPLY"
+  PK=$FK
+}
+
+f_has_kind() { case " $PK " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# ============================================================ shared state
+
+T_TOOL='' T_HASCMD=0 T_CMD='' T_FILE='' T_NB='' T_PATH='' T_CWD='' T_AGENT='' T_AGENTID='' T_NUL=0
+VCWD=
+V_GITDIR=
+V_WORKTREE=
+F_HOTCWD=0
+F_SCAN_CTX=
+F_SCAN_LABEL=
+F_SCAN_DEPTH=0
+F_DEPTH=0
+F_DOTOK=0
+G_MENTION=0
+G_DISG=
+G_WORDS=
+G_SENS_EXPORT=0
+P_S=''
+P_R=''
+PREV_CAT=
+F_HOME=${HOME:-}
+F_LHOME=
+F_CFGDIR=${TEAM_CONFIG_DIR:-${HOME:-/nonexistent}/.config/team}
+F_LCFG=
+F_PLUGIN_BIN=
+REPLY=
+FK=
+FKS=
+PK=
+GSUB=
+GSUB_I=0
+GC_BAD=
+GR_UNKNOWN=0
+GR_BASE=
+GHG=
+GHS=
+GHG_I=0
+GHS_I=0
+LBL_ADD=
+LBL_RM=
+LBL_DYN=0
+SSHC=
+CURL_LOCAL_GET=0
+F_CANON_OWNER=0
+G_DECODE=0
+F_LAST_SRC=bad
+PREV_CAT_BODY=''
+declare -a GC_DIRS GC_KEYS GR
+GC_DIRS=() GC_KEYS=() GR=()
+
+
+# a sensitive tool named as a word; quotes and backslashes may sit between its letters
+# (g"i"t). One regex call: bash's ${var//...} is quadratic on long text, the regex is not.
+# shellcheck disable=SC2016 # a literal regex
+F_RE_MENTION='(^|[^A-Za-z0-9_-])(g[\"'"'"'\\]*i[\"'"'"'\\]*t|g[\"'"'"'\\]*h|t[\"'"'"'\\]*e[\"'"'"'\\]*a[\"'"'"'\\]*m[\"'"'"'\\]*-[\"'"'"'\\]*g[\"'"'"'\\]*h|s[\"'"'"'\\]*s[\"'"'"'\\]*h|s[\"'"'"'\\]*c[\"'"'"'\\]*p|s[\"'"'"'\\]*f[\"'"'"'\\]*t[\"'"'"'\\]*p|r[\"'"'"'\\]*s[\"'"'"'\\]*y[\"'"'"'\\]*n[\"'"'"'\\]*c|c[\"'"'"'\\]*u[\"'"'"'\\]*r[\"'"'"'\\]*l|w[\"'"'"'\\]*g[\"'"'"'\\]*e[\"'"'"'\\]*t|c[\"'"'"'\\]*l[\"'"'"'\\]*a[\"'"'"'\\]*u[\"'"'"'\\]*d[\"'"'"'\\]*e)([^A-Za-z0-9_-]|$)'
+
+f_mentions() {
+  # does text $1 mention a sensitive tool as a word (raw, or with quotes/backslashes removed)?
+  local r=1
+  shopt -s nocasematch
+  [[ $1 =~ $F_RE_MENTION ]] && r=0
+  shopt -u nocasematch
+  return $r
+}
+
+f_disg() {
+  # a disguise structure is used: deny now if the text mentions a sensitive tool, else remember
+  # it until the decoded words are known (f_disg_final)
+  if [ "$G_MENTION" = 1 ]; then
+    deny disguised "$1 $M_DISGUISED"
+  fi
+  [ -n "$G_DISG" ] || G_DISG=$1
+  return 0
+}
+
+f_disg_final() {
+  if [ -n "$G_DISG" ] && f_mentions "$G_WORDS"; then
+    deny disguised "$G_DISG $M_DISGUISED"
+  fi
+  return 0
+}
+
+# ============================================================ tokenizer / parser
+# Works on the global cursor P_S. Words go to CW (values) and CF (flags):
+#   q quoted  b backslash  d $'..'  v unknown expansion (\001 in the value)  u unquoted expansion
+#   k known variable ($HOME...)  g glob/brace  D zsh dot-glob qualifier  p process substitution
+#   e leading '=' (zsh)  t leading ~
+# Redirection targets go to CRO/CRF (output) and CRI/CRIF (input); here-doc bodies to CHD.
+
+F_SPECIAL=$' \t\n;&|()<>\'"\\$`'
+
+F_WIN_LO=2048
+F_WIN_HI=16384
+F_WIN_STEP=8192
+f_fill() {
+  # keep the parse window P_S between 2 KB and 16 KB; the rest of the text waits in P_R.
+  # (every ${P_S:...} costs time in proportion to P_S, so long texts are parsed in windows)
+  if [ -n "$P_R" ] && [ "${#P_S}" -lt "$F_WIN_LO" ]; then
+    P_S=$P_S${P_R:0:$F_WIN_STEP}
+    P_R=${P_R:$F_WIN_STEP}
+  elif [ "${#P_S}" -gt "$F_WIN_HI" ]; then
+    P_R=${P_S:$F_WIN_STEP}$P_R
+    P_S=${P_S:0:$F_WIN_STEP}
+  fi
+  return 0
+}
+
+f_merge() {
+  # a construct that must see ahead (a quote, a comment, a here-doc) gets the whole text
+  P_S=$P_S$P_R
+  P_R=''
+}
+
+f_known_var() {
+  # the value of a variable the fence can know, into REPLY; 1 if unknown
+  case $1 in
+    HOME) [ -n "$F_HOME" ] && { REPLY=$F_HOME; return 0; } ;;
+    TEAM_CONFIG_DIR) [ -n "${TEAM_CONFIG_DIR:-}" ] && { REPLY=$TEAM_CONFIG_DIR; return 0; } ;;
+    PWD) [ -n "$VCWD" ] && { REPLY=$VCWD; return 0; } ;;
+  esac
+  return 1
+}
+
+f_take_braced() {
+  # P_S starts just after '${': consume to the matching '}', raw body into REPLY
+  local depth=1 out='' c r q
+  while f_fill; [ -n "$P_S" ]; do
+    c=${P_S:0:1}
+    case $c in
+      '}')
+        depth=$((depth - 1))
+        P_S=${P_S:1}
+        [ "$depth" = 0 ] && { REPLY=$out; return 0; }
+        out=$out$c
+        ;;
+      '{')
+        case $out in *'$') depth=$((depth + 1)) ;; esac
+        out=$out$c
+        P_S=${P_S:1}
+        ;;
+      \\)
+        out=$out${P_S:0:2}
+        P_S=${P_S:2}
+        ;;
+      "'")
+        case ${P_S:1} in *"'"*) ;; *) f_merge ;; esac
+        r=${P_S:1}
+        case $r in
+          *"'"*) q=${r%%\'*}; out="$out'$q'"; P_S=${r:${#q}+1} ;;
+          *) out=$out$P_S; P_S='' ;;
+        esac
+        ;;
+      *)
+        out=$out$c
+        P_S=${P_S:1}
+        ;;
+    esac
+  done
+  REPLY=$out
+}
+
+f_expand_simple() {
+  # best-effort expansion of a parameter default: ~, $HOME, ${HOME}, $TEAM_CONFIG_DIR; others \001
+  local s=$1 out='' name chunk
+  # shellcheck disable=SC2088 # a literal ~ pattern on purpose
+  case $s in '~' | '~/'*) out=$F_HOME; s=${s#\~} ;; esac
+  while [ -n "$s" ]; do
+    case $s in
+      \$\{*)
+        s=${s#??}
+        name=${s%%\}*}
+        s=${s#*\}}
+        if f_known_var "$name"; then out=$out$REPLY; else out=$out$'\001'; fi
+        ;;
+      \$[A-Za-z_]*)
+        s=${s#?}
+        name=${s%%[!A-Za-z0-9_]*}
+        s=${s:${#name}}
+        if f_known_var "$name"; then out=$out$REPLY; else out=$out$'\001'; fi
+        ;;
+      \$*)
+        out=$out$'\001'
+        s=${s#?}
+        ;;
+      [\"\']*) s=${s#?} ;;
+      *)
+        chunk=${s%%[\$\"\']*}
+        out=$out$chunk
+        s=${s:${#chunk}}
+        ;;
+    esac
+  done
+  REPLY=$out
+}
+
+f_expand_param() {
+  # ${...} body $1: append its value (known) or \001 to W; analyse substitutions inside
+  local body=$1 name op def
+  name=${body%%[!A-Za-z0-9_]*}
+  op=${body:${#name}}
+  if [ -n "$name" ]; then
+    case $op in
+      '')
+        if f_known_var "$name"; then W=$W$REPLY; WF="${WF}k"; else W=$W$'\001'; WF="${WF}v"; fi
+        return 0
+        ;;
+      :-* | -* | :=* | =*)
+        def=${op#:}
+        def=${def#?}
+        f_scan_expansions "$def"
+        if f_known_var "$name"; then
+          W=$W$REPLY
+          WF="${WF}k"
+          return 0
+        fi
+        f_expand_simple "$def"
+        W=$W$REPLY
+        case $REPLY in *$'\001'*) WF="${WF}v" ;; *) WF="${WF}k" ;; esac
+        return 0
+        ;;
+    esac
+  fi
+  f_scan_expansions "$body"
+  W=$W$'\001'
+  WF="${WF}v"
+}
+
+f_scan_expansions() {
+  # analyse every $(...), `...` and ${...} inside text $1 (here-doc bodies, parameter
+  # defaults); the text itself is data
+  # shellcheck disable=SC2016 # literal $( ${ patterns on purpose
+  case $1 in *'$('* | *'`'* | *'${'*) ;; *) return 0 ;; esac
+  local saved=$P_S saved_r=$P_R W='' WF=''
+  P_S=$1
+  P_R=''
+  while f_fill; [ -n "$P_S" ]; do
+    # shellcheck disable=SC2016 # literal $( ${ patterns on purpose
+    case $P_S in
+      \\*) P_S=${P_S:2} ;;
+      '$('*) P_S=${P_S:2}; f_cmdsubst 0 ;;
+      '${'*) P_S=${P_S:2}; f_take_braced; f_expand_param "$REPLY" ;;
+      '`'*) P_S=${P_S:1}; f_backtick ;;
+      *)
+        local chunk=${P_S%%[\\\$\`]*}
+        [ -n "$chunk" ] || chunk=${P_S:0:1}
+        P_S=${P_S:${#chunk}}
+        ;;
+    esac
+  done
+  P_S=$saved
+  P_R=$saved_r
+}
+
+f_cmdsubst() {
+  # P_S is just after '$(' (or '<(' / '>('): parse to the matching ')' in its own cwd scope
+  local save_cwd=$VCWD save_gd=$V_GITDIR save_wt=$V_WORKTREE
+  F_DEPTH=$((F_DEPTH + 1))
+  [ "$F_DEPTH" -gt 24 ] && deny disguised "the command is nested too deeply. $M_DISGUISED"
+  f_parse_seq ')' "${1:-0}"
+  F_DEPTH=$((F_DEPTH - 1))
+  VCWD=$save_cwd V_GITDIR=$save_gd V_WORKTREE=$save_wt
+}
+
+f_backtick() {
+  # P_S is just after an opening backtick: take the text up to the closing one and parse it
+  local out='' c chunk
+  while f_fill; [ -n "$P_S" ]; do
+    c=${P_S:0:1}
+    case $c in
+      '`') P_S=${P_S:1}; break ;;
+      \\)
+        case ${P_S:1:1} in
+          '`' | \\ | \$) out=$out${P_S:1:1} ;;
+          *) out=$out${P_S:0:2} ;;
+        esac
+        P_S=${P_S:2}
+        ;;
+      *)
+        chunk=${P_S%%[\`\\]*}
+        out=$out$chunk
+        P_S=${P_S:${#chunk}}
+        ;;
+    esac
+  done
+  f_parse_text "$out" 0
+}
+
+f_parse_text() {
+  # f_parse_text <text> <pipe-in>: analyse a separate text (backticks, -c strings, eval)
+  local saved=$P_S saved_r=$P_R save_cwd=$VCWD save_gd=$V_GITDIR save_wt=$V_WORKTREE
+  F_DEPTH=$((F_DEPTH + 1))
+  [ "$F_DEPTH" -gt 24 ] && deny disguised "the command is nested too deeply. $M_DISGUISED"
+  P_S=$1
+  P_R=''
+  f_parse_seq '' "${2:-0}"
+  P_S=$saved
+  P_R=$saved_r
+  F_DEPTH=$((F_DEPTH - 1))
+  VCWD=$save_cwd V_GITDIR=$save_gd V_WORKTREE=$save_wt
+}
+
+f_dollar() {
+  # P_S starts with '$' (outside single quotes); $1 = 1 inside double quotes
+  local inq=$1 name
+  # shellcheck disable=SC2016 # literal $( ${ patterns on purpose
+  case $P_S in
+    '$('*)
+      P_S=${P_S:2}
+      f_cmdsubst 0
+      W=$W$'\001'
+      WF="${WF}v"
+      [ "$inq" = 1 ] || WF="${WF}u"
+      ;;
+    '${'*)
+      P_S=${P_S:2}
+      f_take_braced
+      f_expand_param "$REPLY"
+      case $W in *$'\001'*) [ "$inq" = 1 ] || WF="${WF}u" ;; esac
+      ;;
+    "\$'"*)
+      if [ "$inq" = 1 ]; then
+        W=$W\$
+        P_S=${P_S:1}
+        return 0
+      fi
+      P_S=${P_S:2}
+      f_ansi_c
+      ;;
+    '$"'*)
+      if [ "$inq" = 1 ]; then
+        W=$W\$
+        P_S=${P_S:1}
+        return 0
+      fi
+      P_S=${P_S:1}
+      ;;
+    \$[A-Za-z_]*)
+      P_S=${P_S:1}
+      name=${P_S%%[!A-Za-z0-9_]*}
+      P_S=${P_S:${#name}}
+      if f_known_var "$name"; then
+        W=$W$REPLY
+        WF="${WF}k"
+      else
+        W=$W$'\001'
+        WF="${WF}v"
+        [ "$inq" = 1 ] || WF="${WF}u"
+      fi
+      ;;
+    \$[0-9@*#?\$!-]*)
+      P_S=${P_S:2}
+      W=$W$'\001'
+      WF="${WF}v"
+      [ "$inq" = 1 ] || WF="${WF}u"
+      ;;
+    *)
+      W=$W\$
+      P_S=${P_S:1}
+      ;;
+  esac
+  return 0
+}
+
+f_ansi_c() {
+  # P_S is just after $' : decode best-effort; escapes that can't be decoded make the word dynamic
+  local out='' c raw='' chunk
+  while f_fill; [ -n "$P_S" ]; do
+    c=${P_S:0:1}
+    case $c in
+      "'") P_S=${P_S:1}; break ;;
+      \\)
+        raw=$raw${P_S:0:2}
+        case ${P_S:1:1} in
+          u | U | c | [0-7]) WF="${WF}v" ;;
+        esac
+        P_S=${P_S:2}
+        ;;
+      *)
+        chunk=${P_S%%[\'\\]*}
+        raw=$raw$chunk
+        P_S=${P_S:${#chunk}}
+        ;;
+    esac
+  done
+  raw=${raw//\\\'/\'}
+  printf -v out '%b' "$raw" 2>/dev/null || out=$raw
+  out=${out//$'\001'/}
+  W=$W$out
+  WF="${WF}d"
+}
+
+f_dquote() {
+  # P_S is just after an opening double quote
+  local c chunk
+  while f_fill; [ -n "$P_S" ]; do
+    c=${P_S:0:1}
+    case $c in
+      '"') P_S=${P_S:1}; return 0 ;;
+      \\)
+        case ${P_S:1:1} in
+          \$ | '`' | '"' | \\) W=$W${P_S:1:1}; WF="${WF}b" ;;
+          $'\n') ;;
+          *) W=$W${P_S:0:2} ;;
+        esac
+        P_S=${P_S:2}
+        ;;
+      \$) f_dollar 1 ;;
+      '`')
+        P_S=${P_S:1}
+        f_backtick
+        W=$W$'\001'
+        WF="${WF}v"
+        ;;
+      *)
+        chunk=${P_S%%[\"\\\$\`]*}
+        W=$W$chunk
+        P_S=${P_S:${#chunk}}
+        ;;
+    esac
+  done
+}
+
+f_heredoc() {
+  # the delimiter word just ended (value $1, flags $2, strip tabs $3): cut the body out of P_S
+  # (it starts after the next newline) into CHD; unquoted bodies still run $(...) and `...`
+  local delim=$1 fl=$2 strip=$3 pre post x body='' rest line tl
+  f_merge
+  case $P_S in
+    *$'\n'*) pre=${P_S%%$'\n'*}; post=${P_S:${#pre}+1} ;;
+    *) return 0 ;;
+  esac
+  if [ "$strip" = 1 ]; then
+    rest=
+    local found=0
+    while IFS= read -r line; do
+      if [ "$found" = 1 ]; then
+        rest=$rest$line$'\n'
+        continue
+      fi
+      tl=$line
+      while [ "${tl#$'\t'}" != "$tl" ]; do tl=${tl#$'\t'}; done
+      if [ "$tl" = "$delim" ]; then found=1; continue; fi
+      body=$body$tl$'\n'
+    done <<HDEOF
+$post
+HDEOF
+    rest=${rest%$'\n'}
+  else
+    x=$'\n'$post$'\n'
+    case $x in
+      *$'\n'"$delim"$'\n'*)
+        body=${x%%$'\n'"$delim"$'\n'*}
+        rest=${x:${#body}+${#delim}+2}
+        rest=${rest%$'\n'}
+        body=${body#$'\n'}
+        ;;
+      *)
+        body=$post
+        rest=
+        ;;
+    esac
+  fi
+  P_S=$pre$'\n'$rest
+  CHD=$CHD$body
+  case $fl in
+    *q* | *b* | *d*) ;;
+    *) f_scan_expansions "$body" ;;
+  esac
+}
+
+f_word_end() {
+  # finish the current word: a redirection target, a here-doc delimiter or a command word
+  [ "$WIN" = 1 ] || return 0
+  WIN=0
+  case $REDIR in
+    '') CW+=("$W"); CF+=("$WF") ;;
+    out) CRO+=("$W"); CRF+=("$WF") ;;
+    in) CRI+=("$W"); CRIF+=("$WF") ;;
+    dup) case $W in *[!0-9-]*) CRO+=("$W"); CRF+=("$WF") ;; esac ;;
+    hstr) CHD=$CHD$W$'\n'; CRI+=("$W"); CRIF+=("${WF}h") ;;
+    hdoc) f_heredoc "$W" "$WF" 0 ;;
+    hdoc-) f_heredoc "$W" "$WF" 1 ;;
+  esac
+  # decoded words ($'...') can hide a tool name from the raw and unquoted text
+  case $WF in *d*) G_WORDS="$G_WORDS $W" ;; esac
+  REDIR=
+  W=
+  WF=
+}
+
+f_end_cmd() {
+  # end of a simple command: analyse it, then reset for the next one
+  local op=$1
+  F_LAST_SRC=bad
+  f_word_end
+  if [ "$CASE_PAT" = 1 ]; then
+    CW=() CF=() CRO=() CRF=() CRI=() CRIF=() CHD=
+    return 0
+  fi
+  if [ "${#CW[@]}" -gt 0 ] || [ "${#CRO[@]}" -gt 0 ] || [ "${#CRI[@]}" -gt 0 ]; then
+    f_simple "$op"
+  fi
+  CW=() CF=() CRO=() CRF=() CRI=() CRIF=() CHD=''
+  case $op in
+    '|' | '|&')
+      # can the code flowing down this pipeline be seen? (echo/printf literals, cat of files)
+      if [ "$C_PIPEIN" = 1 ]; then
+        if [ "$C_PIPESRC" != ok ] || [ "$F_LAST_SRC" != ok ]; then C_PIPESRC=bad; fi
+      else
+        C_PIPESRC=$F_LAST_SRC
+      fi
+      C_PIPEIN=1
+      ;;
+    *)
+      C_PIPEIN=0
+      C_PIPESRC=ok
+      ;;
+  esac
+}
+
+f_parse_seq() {
+  # f_parse_seq <terminator> <pipe-in>: consume P_S up to the terminator (')' or the end)
+  local term=$1
+  local -a CW CF CRO CRF CRI CRIF CWDSTACK
+  local CHD='' W='' WF='' WIN=0 REDIR='' C_PIPEIN=${2:-0} c chunk after n st pin CASE_N=0 CASE_PAT=0
+  local C_PIPESRC=ok
+  [ "$C_PIPEIN" = 1 ] && C_PIPESRC=bad
+  CW=() CF=() CRO=() CRF=() CRI=() CRIF=() CWDSTACK=()
+  while :; do
+    f_fill
+    if [ -z "$P_S" ]; then
+      f_end_cmd EOF
+      return 0
+    fi
+    c=${P_S:0:1}
+    case $c in
+      ' ' | $'\t' | $'\r')
+        f_word_end
+        P_S=${P_S:1}
+        ;;
+      $'\n')
+        f_word_end
+        P_S=${P_S:1}
+        f_end_cmd ';'
+        ;;
+      ';')
+        f_word_end
+        case $P_S in
+          ';;&'*) P_S=${P_S:3}; f_end_cmd ';'; [ "$CASE_N" -gt 0 ] && CASE_PAT=1 ;;
+          ';;'* | ';&'*) P_S=${P_S:2}; f_end_cmd ';'; [ "$CASE_N" -gt 0 ] && CASE_PAT=1 ;;
+          *) P_S=${P_S:1}; f_end_cmd ';' ;;
+        esac
+        ;;
+      '&')
+        case $P_S in
+          '&&'*) f_word_end; P_S=${P_S:2}; f_end_cmd '&&' ;;
+          '&>>'*) f_word_end; P_S=${P_S:3}; REDIR=out ;;
+          '&>'*) f_word_end; P_S=${P_S:2}; REDIR=out ;;
+          *) f_word_end; P_S=${P_S:1}; f_end_cmd '&' ;;
+        esac
+        ;;
+      '|')
+        f_word_end
+        if [ "$CASE_PAT" = 1 ]; then
+          P_S=${P_S:1}
+          continue
+        fi
+        case $P_S in
+          '||'*) P_S=${P_S:2}; f_end_cmd '||' ;;
+          '|&'*) P_S=${P_S:2}; f_end_cmd '|&' ;;
+          *) P_S=${P_S:1}; f_end_cmd '|' ;;
+        esac
+        ;;
+      '(')
+        if [ "$WIN" = 1 ]; then
+          case $W in
+            *=)
+              # array assignment: its words may hold substitutions
+              P_S=${P_S:1}
+              f_cmdsubst 0
+              W=$W$'\001'
+              WF="${WF}v"
+              continue
+              ;;
+            *[*?+@!]* | *']')
+              # extglob or zsh glob qualifier
+              chunk=${P_S%%')'*}
+              P_S=${P_S:${#chunk}}
+              P_S=${P_S:1}
+              W=$W$chunk')'
+              WF="${WF}g"
+              case $chunk in '('*D*) WF="${WF}D" ;; esac
+              continue
+              ;;
+          esac
+          f_word_end
+        fi
+        after=${P_S:1}
+        after=${after#"${after%%[! $'\t']*}"}
+        if [ "${#CW[@]}" -ge 1 ] && [ "${after:0:1}" = ')' ]; then
+          # name () function definition: drop the name; the body is analysed as commands
+          P_S=${after:1}
+          CW=() CF=()
+          continue
+        fi
+        if [ "$CASE_PAT" = 1 ]; then
+          P_S=${P_S:1}
+          continue
+        fi
+        f_end_cmd ';'
+        P_S=${P_S:1}
+        CWDSTACK+=("$VCWD|$V_GITDIR|$V_WORKTREE")
+        ;;
+      ')')
+        if [ "$CASE_PAT" = 1 ]; then
+          f_word_end
+          P_S=${P_S:1}
+          CW=() CF=() CRO=() CRF=() CRI=() CRIF=() CHD=
+          CASE_PAT=0
+          continue
+        fi
+        f_end_cmd ')'
+        P_S=${P_S:1}
+        n=${#CWDSTACK[@]}
+        if [ "$n" -gt 0 ]; then
+          st=${CWDSTACK[n - 1]}
+          unset "CWDSTACK[$((n - 1))]"
+          CWDSTACK=(${CWDSTACK[@]+"${CWDSTACK[@]}"})
+          VCWD=${st%%|*}
+          st=${st#*|}
+          V_GITDIR=${st%%|*}
+          V_WORKTREE=${st#*|}
+        elif [ "$term" = ')' ]; then
+          return 0
+        fi
+        ;;
+      '<' | '>')
+        if [ "$WIN" = 1 ] && [ -z "$WF" ] && f_is_digits "$W"; then
+          W='' WIN=0
+        else
+          f_word_end
+        fi
+        case $P_S in
+          '<('* | '>('*)
+            if [ -z "$REDIR" ]; then
+              pin=0
+              [ "$c" = '>' ] && pin=1
+              P_S=${P_S:2}
+              f_cmdsubst "$pin"
+              W=$'\001'
+              WF=vp
+              WIN=1
+              continue
+            fi
+            ;;
+        esac
+        case $P_S in
+          '<<<'*) P_S=${P_S:3}; REDIR=hstr ;;
+          '<<-'*) P_S=${P_S:3}; REDIR=hdoc- ;;
+          '<<'*) P_S=${P_S:2}; REDIR=hdoc ;;
+          '<>'*) P_S=${P_S:2}; REDIR=out ;;
+          '<&'*) P_S=${P_S:2}; REDIR=dup ;;
+          '<'*) P_S=${P_S:1}; REDIR=in ;;
+          '>>'* | '>|'*) P_S=${P_S:2}; REDIR=out ;;
+          '>&'*) P_S=${P_S:2}; REDIR=dup ;;
+          *) P_S=${P_S:1}; REDIR=out ;;
+        esac
+        ;;
+      '#')
+        if [ "$WIN" = 0 ]; then
+          case $P_S in *$'\n'*) ;; *) f_merge ;; esac
+          case $P_S in
+            *$'\n'*) chunk=${P_S%%$'\n'*}; P_S=${P_S:${#chunk}} ;;
+            *) P_S='' ;;
+          esac
+        else
+          W=$W#
+          P_S=${P_S:1}
+        fi
+        ;;
+      "'")
+        WIN=1
+        WF="${WF}q"
+        case ${P_S:1} in *"'"*) ;; *) f_merge ;; esac
+        chunk=${P_S:1}
+        case $chunk in
+          *"'"*) after=${chunk%%\'*}; W=$W$after; P_S=${chunk:${#after}+1} ;;
+          *) W=$W$chunk; P_S='' ;;
+        esac
+        ;;
+      '"')
+        WIN=1
+        WF="${WF}q"
+        P_S=${P_S:1}
+        f_dquote
+        ;;
+      \\)
+        WIN=1
+        if [ "${P_S:1:1}" = $'\n' ]; then
+          P_S=${P_S:2}
+        else
+          WF="${WF}b"
+          W=$W${P_S:1:1}
+          P_S=${P_S:2}
+        fi
+        ;;
+      \$)
+        WIN=1
+        f_dollar 0
+        ;;
+      '`')
+        WIN=1
+        P_S=${P_S:1}
+        f_backtick
+        W=$W$'\001'
+        WF="${WF}vu"
+        ;;
+      *)
+        chunk=${P_S%%["$F_SPECIAL"]*}
+        P_S=${P_S:${#chunk}}
+        if [ "$WIN" = 0 ]; then
+          # shellcheck disable=SC2088 # a literal ~ pattern on purpose
+          case $chunk in
+            '~' | '~/'*) chunk=$F_HOME${chunk#\~}; WF="${WF}t" ;;
+            '~'*) chunk=$'\001'; WF="${WF}v" ;;
+            =?*) WF="${WF}e" ;;
+          esac
+        fi
+        case $chunk in *[*?]* | *'['*']'*) WF="${WF}g" ;; esac
+        case $chunk in *'{'*,*'}'* | *'{'*..*'}'*) WF="${WF}g" ;; esac
+        case $chunk in *$'\001'*) WF="${WF}v" ;; esac
+        W=$W$chunk
+        WIN=1
+        # 'case WORD in': the following words are patterns up to ')'
+        if [ "$W" = in ] && [ -z "$WF" ] && [ "${#CW[@]}" = 2 ] && [ "${CW[0]}" = case ]; then
+          case ${P_S:0:1} in
+            ' ' | $'\t' | $'\n' | ';' | '')
+              W='' WIN=0 WF=''
+              CW=() CF=()
+              CASE_N=$((CASE_N + 1))
+              CASE_PAT=1
+              ;;
+          esac
+        elif [ "$W" = 'esac' ] && [ -z "$WF" ] && [ "$CASE_N" -gt 0 ] && [ "${#CW[@]}" = 0 ]; then
+          case ${P_S:0:1} in
+            ' ' | $'\t' | $'\n' | ';' | ')' | '&' | '|' | '')
+              W='' WIN=0 WF=''
+              CASE_N=$((CASE_N - 1))
+              CASE_PAT=0
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+}
+
+# ============================================================ simple command analysis
+
+f_word_is_dynamic() { case $1 in *v* | *d*) return 0 ;; esac; return 1; }
+f_word_built() { case $1 in *q* | *b* | *d* | *v* | *e* | *g* | *k* | *D*) return 0 ;; esac; return 1; }
+
+F_SENS_ENV_RE='^(GIT_SSH|GIT_SSH_COMMAND|GIT_CONFIG[A-Z0-9_]*|GIT_EXEC_PATH|GIT_ASKPASS|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PAGER|GIT_PROXY_COMMAND|GIT_EXTERNAL_DIFF|LD_PRELOAD|DYLD_[A-Z0-9_]*|PATH|SSH_ASKPASS|BASH_ENV|ENV|ZDOTDIR)$'
+
+f_is_sensitive_name() {
+  case $1 in
+    git | gh | team-gh | ssh | scp | sftp | rsync | sshfs | autossh | mosh | curl | wget | claude | ssh-copy-id) return 0 ;;
+  esac
+  return 1
+}
+
+f_is_shell() { case $1 in bash | sh | zsh | dash | ksh | mksh | fish | csh | tcsh) return 0 ;; esac; return 1; }
+f_is_interp() {
+  case $1 in
+    python | python[0-9]* | pypy* | node | nodejs | perl | perl5* | ruby | php | php[0-9]* | bun | deno | awk | gawk | nawk | mawk | lua | rscript | tclsh | expect) return 0 ;;
+  esac
+  return 1
+}
+
+f_simple() {
+  # analyse the simple command in CW/CF (+ CRO/CRI/CHD); $1 = the operator that ended it
+  local op=$1
+  local -a a af
+  a=(${CW[@]+"${CW[@]}"})
+  af=(${CF[@]+"${CF[@]}"})
+  local n=${#a[@]} i=0 w fl nm base lname dyn=0 assigns='' had_wrapper=0 pathinv=0 sens_env=0 vn vv j
+
+  # reserved words
+  while [ "$i" -lt "$n" ]; do
+    [ -z "${af[i]}" ] || break
+    case ${a[i]} in
+      if | then | else | elif | fi | do | done | while | until | '!' | '{' | '}' | 'esac') i=$((i + 1)) ;;
+      time) i=$((i + 1)); [ "${a[i]-}" = -p ] && i=$((i + 1)) ;;
+      function) i=$((i + 2)) ;;
+      for | select | case | '[[' | '((' | in) i=$n ;;
+      *) break ;;
+    esac
+  done
+
+  # leading assignments (or a standalone assignment)
+  while [ "$i" -lt "$n" ]; do
+    w=${a[i]}
+    case $w in [A-Za-z_]*=*) ;; *) break ;; esac
+    vn=${w%%=*}
+    vn=${vn%+}
+    vn=${vn%%\[*}
+    case $vn in *[!A-Za-z0-9_]*) break ;; esac
+    assigns="$assigns $vn"
+    if [[ $vn =~ $F_SENS_ENV_RE ]]; then sens_env=1; fi
+    case $vn in
+      GIT_DIR | GIT_WORK_TREE)
+        vv=${w#*=}
+        f_resolve "$vv"
+        if [ "$vn" = GIT_DIR ]; then V_GITDIR=$REPLY; else V_WORKTREE=$REPLY; fi
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  if [ "$i" -ge "$n" ]; then
+    # standalone assignments last for the rest of the command line
+    if [ "$sens_env" = 1 ]; then
+      [ "$G_MENTION" = 1 ] && deny disguised "$M_DISGUISED"
+      G_SENS_EXPORT=1
+    fi
+    f_redirections ""
+    return 0
+  fi
+
+  # wrappers
+  while [ "$i" -lt "$n" ]; do
+    w=${a[i]}
+    fl=${af[i]}
+    f_word_built "$fl" && break
+    case ${w##*/} in
+      env)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          w=${a[i]}
+          case $w in
+            -S | --split-string | -S?* | --split-string=*)
+              local ss rest_words=
+              if [ "$w" = -S ] || [ "$w" = --split-string ]; then ss=${a[i + 1]-}; i=$((i + 2)); else ss=${w#-S}; ss=${ss#--split-string=}; i=$((i + 1)); fi
+              j=$i
+              while [ "$j" -lt "$n" ]; do rest_words="$rest_words ${a[j]}"; j=$((j + 1)); done
+              f_parse_text "$ss$rest_words" "$C_PIPEIN"
+              f_redirections ""
+              return 0
+              ;;
+            -u | -P | -L | -U | -C | --unset | --chdir) i=$((i + 2)) ;;
+            -*) i=$((i + 1)) ;;
+            [A-Za-z_]*=*)
+              vn=${w%%=*}
+              if [[ $vn =~ $F_SENS_ENV_RE ]]; then sens_env=1; fi
+              assigns="$assigns $vn"
+              i=$((i + 1))
+              ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      command)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -p) i=$((i + 1)) ;;
+            -v | -V | -pv | -pV)
+              f_redirections ""
+              return 0
+              ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      builtin | nohup | noglob | nocorrect | coproc | -) had_wrapper=1; i=$((i + 1)) ;;
+      exec)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -a) i=$((i + 2)) ;;
+            -c | -l | -cl | -lc) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      nice)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -n) i=$((i + 2)) ;;
+            -[0-9]* | -n?* | --adjustment=*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      time)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in -p | -l | -h | -a) i=$((i + 1)) ;; -o) i=$((i + 2)) ;; *) break ;; esac
+        done
+        ;;
+      timeout | gtimeout)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -s | -k | --signal | --kill-after) i=$((i + 2)) ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        i=$((i + 1))
+        ;;
+      stdbuf)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -i | -o | -e) i=$((i + 2)) ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      caffeinate)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -t | -w) i=$((i + 2)) ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      sudo | doas)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -u | -g | -h | -p | -C | -T | -D | -r | -t | -U | --user | --group | --host | --prompt | --chdir) i=$((i + 2)) ;;
+            -e | --edit) i=$((i + 1)); break ;;
+            -*) i=$((i + 1)) ;;
+            [A-Za-z_]*=*)
+              vn=${a[i]%%=*}
+              if [[ $vn =~ $F_SENS_ENV_RE ]]; then sens_env=1; fi
+              assigns="$assigns $vn"
+              i=$((i + 1))
+              ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      arch)
+        had_wrapper=1
+        i=$((i + 1))
+        while [ "$i" -lt "$n" ]; do
+          case ${a[i]} in
+            -arch | -e | -d) i=$((i + 2)) ;;
+            -*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$n" ]; then
+    f_redirections ""
+    return 0
+  fi
+
+  # the command name
+  nm=${a[i]}
+  fl=${af[i]}
+  base=${nm##*/}
+  f_lc "$base"
+  lname=$REPLY
+  case $nm in */*) pathinv=1 ;; esac
+  case $fl in *v* | *d*) dyn=1 ;; esac
+  case $fl in *e*) lname=${lname#=} ;; esac
+
+  # a command name built from globs, quotes, escapes, $'..', variables or zsh '=cmd'
+  case $fl in
+    *g* | *D*) deny disguised "the command name is a glob pattern. $M_DISGUISED" ;;
+  esac
+  if f_word_built "$fl"; then
+    [ "$dyn" = 1 ] && f_decode_feed
+    case $fl in
+      *q* | *b* | *d* | *v* | *e*) f_disg "the command name is built from quotes, escapes or variables." ;;
+      *) f_is_sensitive_name "$lname" && f_disg "the command name is built from a variable." ;;
+    esac
+    if [ "$dyn" = 1 ]; then
+      case ${a[i + 1]-} in
+        push | commit | tag | config | remote | release | pr | issue | api | auth | merge | update-ref | credential* | rebase | reset | workflow | secret | variable | ruleset | repo)
+          deny disguised "a dynamic command name runs '${a[i + 1]}'. $M_DISGUISED"
+          ;;
+      esac
+    fi
+  fi
+
+  # sensitive environment overrides on a sensitive command (prefix, env, sudo or exported)
+  if f_is_sensitive_name "$lname"; then
+    if [ "$sens_env" = 1 ] || [ "$G_SENS_EXPORT" = 1 ]; then
+      deny disguised "$M_DISGUISED"
+    fi
+  fi
+
+  local review=0
+  [ "$F_IS_REVIEW" = 1 ] && [ -z "$F_SCAN_CTX" ] && review=1
+
+  # owner-approved and team-post-check come before the review-agent allowlist
+  case $lname in
+    team-post-check) f_post_check "$i" ;;
+    gh | team-gh) [ "$dyn" = 0 ] && f_gh_owner "$i" "$lname" ;;
+  esac
+  [ "$review" = 1 ] && f_agent_bash "$i"
+
+  if [ "$dyn" = 0 ]; then
+    case $lname in
+      git) f_git "$i" ;;
+      gh | team-gh) f_gh "$i" "$lname" ;;
+      curl | wget) f_curl "$i" "$lname" ;;
+      ssh | scp | sftp | rsync | sshfs | autossh | mosh | ssh-copy-id) f_ssh "$i" "$lname" ;;
+      claude) f_claude "$i" "$had_wrapper" "$assigns" ;;
+      security) f_security "$i" ;;
+      team-deploy | team-flag) f_prod "$i" ;;
+      flag) case $nm in ops/flag | */ops/flag) f_prod "$i" ;; esac ;;
+      eval) f_eval "$i" ;;
+      source | .) f_source "$i" ;;
+      base64 | openssl | xxd | uudecode | gunzip | zcat | gzcat | gzip | bunzip2 | bzcat | bzip2 | unxz | xzcat | xz) f_decode "$i" "$lname" ;;
+      tr | rev | base32 | basenc | recode | iconv) G_DECODE=1 ;;
+      xargs | parallel | watch | script | su | osascript | find | flock | npx | bunx | pnpx | chronic | unbuffer | setsid | ionice | taskset | chroot | sandbox-exec | entr) f_runner "$i" "$lname" ;;
+      make | gmake) f_make "$i" ;;
+      cd | pushd) f_cd "$i" "$op" ;;
+      popd) VCWD= ;;
+      export | declare | typeset | local | readonly) f_export "$i" ;;
+    esac
+    if f_is_shell "$lname"; then
+      f_shell "$i" "$lname"
+    elif f_is_interp "$lname"; then
+      f_interp "$i" "$lname"
+    fi
+  fi
+
+  # generic path rules for every command: arguments and redirections
+  f_set_hotcwd
+  f_args_paths "$i" "$lname"
+  f_redirections "$lname"
+
+  # a path-invoked file is scanned before it runs (except the plugin's own bin/)
+  if [ "$pathinv" = 1 ] && [ "$dyn" = 0 ]; then
+    f_scan_file "$nm" exec
+  fi
+
+  # what this command feeds into a pipe: visible code (echo/printf literals, cat of files
+  # or of a here-doc) or not; cat's files are scanned by the shell that reads the pipe
+  PREV_CAT=''
+  PREV_CAT_BODY=''
+  case $lname in
+    echo | printf)
+      F_LAST_SRC=ok
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${af[j]} in *v* | *d* | *u*) F_LAST_SRC=bad ;; esac
+        case ${a[j]} in
+          *\\[xuU0-7]*)
+            # escapes decode text: treat them like a decoder
+            G_DECODE=1
+            F_LAST_SRC=bad
+            ;;
+          *%[!s%-]*)
+            # printf conversions (%b %c %d ...) decode text too
+            if [ "$lname" = printf ]; then G_DECODE=1; F_LAST_SRC=bad; fi
+            ;;
+        esac
+        j=$((j + 1))
+      done
+      ;;
+    cat)
+      F_LAST_SRC=ok
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${af[j]} in *v* | *d* | *p* | *g*) F_LAST_SRC=bad ;; esac
+        case ${a[j]} in
+          -) F_LAST_SRC=bad ;;
+          -*) ;;
+          *) PREV_CAT="$PREV_CAT${a[j]}"$'\n' ;;
+        esac
+        j=$((j + 1))
+      done
+      [ "${#CRI[@]}" -gt 0 ] && [ -z "$CHD" ] && F_LAST_SRC=bad
+      PREV_CAT_BODY=$CHD
+      ;;
+  esac
+  return 0
+}
+
+# ------------------------------------------------------------ generic path rules
+
+F_PLAIN_READERS=" cat head tail less more wc ls grep egrep fgrep rg diff cmp file stat shasum md5 jq test [ [[ realpath dirname basename "
+F_META_ONLY=" ls stat test [ [[ realpath dirname basename file "
+
+f_is_plain_read() {
+  # f_is_plain_read <name index> <lname>: a plain read (fence files may be named)
+  local i=$1 ln=$2 j w quiet=0
+  case $F_PLAIN_READERS in
+    *" $ln "*)
+      if [ "$ln" = rg ]; then
+        j=$((i + 1))
+        while [ "$j" -lt "$n" ]; do
+          case ${a[j]} in --pre | --pre=*) return 1 ;; esac
+          j=$((j + 1))
+        done
+      fi
+      return 0
+      ;;
+  esac
+  case $ln in
+    find)
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -exec | -execdir | -ok | -okdir | -delete | -fprint | -fprint0 | -fprintf | -fls) return 1 ;; esac
+        j=$((j + 1))
+      done
+      return 0
+      ;;
+    sed)
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        j=$((j + 1))
+        case $w in
+          -i* | -I* | --in-place*) return 1 ;;
+          -n | --quiet | --silent) quiet=1 ;;
+          --*) ;;
+          -[a-zA-Z]*)
+            case $w in *i* | *I*) return 1 ;; esac
+            case $w in *n*) quiet=1 ;; esac
+            ;;
+        esac
+      done
+      [ "$quiet" = 1 ]
+      return
+      ;;
+    git)
+      f_git_sub "$i"
+      case $GSUB in
+        diff | show | log | status | ls-files | check-ignore | cat-file | blame)
+          j=$((GSUB_I + 1))
+          while [ "$j" -lt "$n" ]; do
+            case ${a[j]} in --output | --output=*) return 1 ;; esac
+            j=$((j + 1))
+          done
+          return 0
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+  return 1
+}
+
+f_args_paths() {
+  # credential paths: any command except metadata-only ones (ls, stat, test...).
+  # fence / workflow / other protected paths: any command that is not a plain read.
+  local i=$1 ln=$2 j w fl cands plain=-1 meta=0 skipnext=0 k
+  # these only print or set shell state; their words are never file operands
+  case $ln in echo | printf | true | false | : | team-post-check | claude | cd | pushd | popd | export | declare | typeset | local | readonly | unset) return 0 ;; esac
+  case $F_META_ONLY in *" $ln "*) meta=1 ;; esac
+  if [ "$ln" = find ] && f_is_plain_read "$i" find; then meta=1; fi
+  j=$((i + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    fl=${af[j]}
+    j=$((j + 1))
+    if [ "$skipnext" = 1 ]; then
+      skipnext=0
+      continue
+    fi
+    # message text is never a path
+    case $ln in
+      git)
+        case $w in -m | --message) skipnext=1; continue ;; --message=* | -m?*) continue ;; esac
+        ;;
+      gh | team-gh)
+        case $w in
+          -t | --title | -b | --body | --notes | --subject | -q | --jq | --template) skipnext=1; continue ;;
+          --title=* | --body=* | --notes=* | --subject=* | --jq=* | --template=*) continue ;;
+        esac
+        ;;
+    esac
+    cands=$w
+    case $w in
+      --*=*) cands=${w#*=} ;;
+      -[A-Za-z]?*) cands=${w#-?} ;;
+      -*) continue ;;
+      [A-Za-z0-9_]*=*) cands=${w#*=} ;;
+    esac
+    for k in 1 2; do
+      if [ "$k" = 2 ]; then
+        [ "$cands" != "$w" ] || break
+        case $w in -*) break ;; esac
+        cands=$w
+      fi
+      case $cands in '' | -) continue ;; esac
+      f_hot "$cands" "$fl" || continue
+      f_path_kinds "$cands" "$fl"
+      [ -n "$PK" ] || continue
+      if f_has_kind cred && [ "$meta" = 0 ]; then
+        deny credential-read "$M_CRED"
+      fi
+      if [ "$plain" = -1 ]; then
+        if f_is_plain_read "$i" "$ln"; then plain=1; else plain=0; fi
+      fi
+      if [ "$plain" = 0 ]; then
+        f_has_kind fence && deny fence-file "$M_FENCE"
+        f_has_kind workflow && deny workflow-edit "$M_WORKFLOW"
+        f_has_kind sshcfg && deny ssh-form "$M_SSH_FORM"
+        f_has_kind gitcfg && deny git-config "$M_GIT_CONFIG"
+        f_has_kind curlcfg && deny curl-github-write "$M_CURL"
+        f_has_kind shellrc && deny disguised "$M_RC"
+      fi
+    done
+  done
+  # a sed script that names a fence path writes it (w/W commands)
+  if [ "$ln" = sed ]; then
+    j=$((i + 1))
+    while [ "$j" -lt "$n" ]; do
+      case ${a[j]} in *[wW]' '*.claude* | *[wW]' '*.mcp.json* | *[wW]' '*.git/*) deny fence-file "$M_FENCE" ;; esac
+      j=$((j + 1))
+    done
+  fi
+  return 0
+}
+
+f_redirections() {
+  # output redirections into protected paths; input redirections from credentials
+  local k=0 t tf
+  while [ "$k" -lt "${#CRO[@]}" ]; do
+    t=${CRO[k]}
+    tf=${CRF[k]}
+    k=$((k + 1))
+    case $t in /dev/null | /dev/stdout | /dev/stderr | /dev/fd/* | /dev/tty | '') continue ;; esac
+    if [ "$F_IS_REVIEW" = 1 ] && [ -z "$F_SCAN_CTX" ]; then
+      deny agent-bash "${T_AGENT#team:} is a read-only review agent and can't write files (redirect only to /dev/null). Report findings instead."
+    fi
+    f_path_kinds "$t" "$tf"
+    [ -n "$PK" ] || continue
+    f_has_kind fence && deny fence-file "$M_FENCE"
+    f_has_kind workflow && deny workflow-edit "$M_WORKFLOW"
+    f_has_kind cred && deny credential-read "$M_CRED"
+    f_has_kind sshcfg && deny ssh-form "$M_SSH_FORM"
+    f_has_kind gitcfg && deny git-config "$M_GIT_CONFIG"
+    f_has_kind curlcfg && deny curl-github-write "$M_CURL"
+    f_has_kind shellrc && deny disguised "$M_RC"
+  done
+  k=0
+  while [ "$k" -lt "${#CRI[@]}" ]; do
+    t=${CRI[k]}
+    tf=${CRIF[k]}
+    k=$((k + 1))
+    case $tf in *h* | *p*) continue ;; esac
+    f_path_kinds "$t" "$tf"
+    f_has_kind cred && deny credential-read "$M_CRED"
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ cd / export
+
+f_cd() {
+  local i=$1 op=$2 j=$(($1 + 1)) d
+  while [ "$j" -lt "$n" ]; do
+    case ${a[j]} in -P | -L | -e | -@ | --) j=$((j + 1)) ;; *) break ;; esac
+  done
+  # cd in a pipeline or in the background doesn't change the shell's directory
+  if [ "$C_PIPEIN" = 1 ] || [ "$op" = '|' ] || [ "$op" = '|&' ] || [ "$op" = '&' ]; then
+    return 0
+  fi
+  if [ "$j" -ge "$n" ]; then
+    VCWD=$F_HOME
+    return 0
+  fi
+  d=${a[j]}
+  case $d in - | *$'\001'*) VCWD=; return 0 ;; esac
+  case ${af[j]} in *g*) VCWD=; return 0 ;; esac
+  if [ -z "$VCWD" ]; then
+    case $d in /*) ;; *) return 0 ;; esac
+  fi
+  f_resolve "$d"
+  VCWD=$REPLY
+  return 0
+}
+
+f_export() {
+  local j=$(($1 + 1)) w vn
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      -*) continue ;;
+      [A-Za-z_]*=*)
+        vn=${w%%=*}
+        if [[ $vn =~ $F_SENS_ENV_RE ]]; then
+          [ "$G_MENTION" = 1 ] && deny disguised "$M_DISGUISED"
+          G_SENS_EXPORT=1
+        fi
+        case $vn in
+          GIT_DIR) f_resolve "${w#*=}"; V_GITDIR=$REPLY ;;
+          GIT_WORK_TREE) f_resolve "${w#*=}"; V_WORKTREE=$REPLY ;;
+        esac
+        ;;
+    esac
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ git
+
+f_git_sub() {
+  # the git subcommand after the global options: GSUB, GSUB_I; GC_DIRS, GC_KEYS, GC_BAD
+  local j=$(($1 + 1)) w
+  GSUB='' GSUB_I=$n GC_BAD=''
+  GC_DIRS=() GC_KEYS=()
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    case $w in
+      -C) GC_DIRS+=("${a[j + 1]-}"); j=$((j + 2)) ;;
+      -C?*) GC_DIRS+=("${w#-C}"); j=$((j + 1)) ;;
+      -c) GC_KEYS+=("${a[j + 1]-}"); j=$((j + 2)) ;;
+      -c?*) GC_KEYS+=("${w#-c}"); j=$((j + 1)) ;;
+      --config-env) GC_KEYS+=("${a[j + 1]-}"); j=$((j + 2)) ;;
+      --config-env=*) GC_KEYS+=("${w#--config-env=}"); j=$((j + 1)) ;;
+      --git-dir) GC_DIRS+=("--git-dir=${a[j + 1]-}"); j=$((j + 2)) ;;
+      --git-dir=*) GC_DIRS+=("$w"); j=$((j + 1)) ;;
+      --work-tree) GC_DIRS+=("--work-tree=${a[j + 1]-}"); j=$((j + 2)) ;;
+      --work-tree=*) GC_DIRS+=("$w"); j=$((j + 1)) ;;
+      --namespace | --super-prefix | --list-cmds) j=$((j + 2)) ;;
+      --exec-path=*) GC_BAD='exec'; j=$((j + 1)) ;;
+      -*) j=$((j + 1)) ;;
+      *) GSUB=$w; GSUB_I=$j; return 0 ;;
+    esac
+  done
+  return 0
+}
+
+f_git_repo_args() {
+  # GR = git options selecting the repo the command acts on, GR_BASE its -C dir;
+  # GR_UNKNOWN=1 when the fence can't know it
+  local d k=0 base=$VCWD v
+  GR=() GR_UNKNOWN=0
+  [ -n "$base" ] || GR_UNKNOWN=1
+  while [ "$k" -lt "${#GC_DIRS[@]}" ]; do
+    d=${GC_DIRS[k]}
+    k=$((k + 1))
+    case $d in *$'\001'* | '') GR_UNKNOWN=1; continue ;; esac
+    case $d in
+      --git-dir=* | --work-tree=*)
+        v=${d#*=}
+        case $v in /*) ;; *) [ -n "$base" ] && d=${d%%=*}=$base/$v ;; esac
+        GR+=("$d")
+        ;;
+      /*) base=$d; GR_UNKNOWN=0 ;;
+      *) [ -n "$base" ] && base=$base/$d ;;
+    esac
+  done
+  if [ -n "$V_GITDIR" ]; then
+    case $V_GITDIR in *$'\001'*) GR_UNKNOWN=1 ;; *) GR+=("--git-dir=$V_GITDIR") ;; esac
+  fi
+  if [ -n "$V_WORKTREE" ]; then
+    case $V_WORKTREE in *$'\001'*) GR_UNKNOWN=1 ;; *) GR+=("--work-tree=$V_WORKTREE") ;; esac
+  fi
+  [ -n "$base" ] || base=/
+  GR_BASE=$base
+}
+
+f_git_branch() {
+  # the current branch of the repo the command acts on -> REPLY ('' = detached / none);
+  # returns 1 when unknown
+  f_git_repo_args
+  [ "$GR_UNKNOWN" = 1 ] && return 1
+  [ -d "$GR_BASE" ] || return 1
+  REPLY=$(git -C "$GR_BASE" ${GR[@]+"${GR[@]}"} symbolic-ref --short -q HEAD 2>/dev/null) || REPLY=
+  return 0
+}
+
+f_git_is_tag() {
+  # is $1 a local tag in the repo the command acts on? (an unknown repo counts as yes)
+  f_git_repo_args
+  [ "$GR_UNKNOWN" = 1 ] && return 0
+  [ -d "$GR_BASE" ] || return 0
+  git -C "$GR_BASE" ${GR[@]+"${GR[@]}"} show-ref --verify --quiet "refs/tags/$1" 2>/dev/null
+}
+
+F_GITC_ALLOW=" user.name user.email init.defaultbranch core.quotepath core.autocrlf push.default push.autosetupremote pull.rebase commit.gpgsign diff.renames "
+
+f_git_keys() {
+  # -c / --config-env keys: core.hooksPath, keys outside the allowlist, risky push.default
+  local k=0 kv key val
+  while [ "$k" -lt "${#GC_KEYS[@]}" ]; do
+    kv=${GC_KEYS[k]}
+    k=$((k + 1))
+    key=${kv%%=*}
+    val=
+    case $kv in *=*) val=${kv#*=} ;; esac
+    f_lc "$key"
+    key=$REPLY
+    case $key in
+      *hookspath*) deny hooks-path "$M_HOOKS_PATH" ;;
+      *$'\001'*) deny git-config "$M_GIT_CONFIG" ;;
+    esac
+    case $F_GITC_ALLOW in
+      *" $key "*) ;;
+      *)
+        case $key in
+          color.* | advice.* | log.* | format.*) ;;
+          *) deny git-config "$M_GIT_CONFIG" ;;
+        esac
+        ;;
+    esac
+    if [ "$key" = push.default ] && [ "$1" = push ]; then
+      f_lc "$val"
+      case $REPLY in simple | current | nothing | '') ;; *) deny push-main "push.default=$val can push other branches, main included. $M_PUSH_MAIN" ;; esac
+    fi
+  done
+  return 0
+}
+
+f_git() {
+  local i=$1 j w sub skipm=0
+  f_git_sub "$i"
+  sub=$GSUB
+  [ "$GC_BAD" = 'exec' ] && deny disguised "$M_GITDISG"
+  # a subcommand built from a variable can't be judged
+  if [ "$GSUB_I" -lt "$n" ]; then
+    case ${af[GSUB_I]} in *v* | *d*) deny disguised "the git subcommand is built from a variable. $M_DISGUISED" ;; esac
+  fi
+  f_git_keys "$sub"
+  # --no-verify anywhere (any unique abbreviation); options that run programs
+  j=$((GSUB_I + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    if [ "$skipm" = 1 ]; then
+      skipm=0
+      continue
+    fi
+    case $sub in
+      commit | tag | merge | notes | stash)
+        case $w in -m | --message | -F | --file) skipm=1; continue ;; esac
+        ;;
+    esac
+    case $w in
+      --no-v*) f_abbrev "$w" --no-verify 6 && deny skip-hooks "$M_SKIP_HOOKS" ;;
+      --upload-pack | --upload-pack=* | --receive-pack | --receive-pack=* | --exec | --exec=*) deny disguised "$M_GITDISG" ;;
+    esac
+  done
+  case $sub in
+    push | send-pack | http-push) f_git_push ;;
+    commit) f_git_commit ;;
+    config) f_git_config ;;
+    remote) f_git_remote ;;
+    tag) f_git_tag ;;
+    update-ref) f_git_update_ref ;;
+    credential | credential-*) deny credential-read "$M_CRED" ;;
+    submodule) f_git_submodule ;;
+    rebase) f_git_rebase ;;
+    bisect) [ "${a[GSUB_I + 1]-}" = run ] && f_subcommand_words $((GSUB_I + 2)) ;;
+    difftool | mergetool)
+      j=$((GSUB_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          -x | --extcmd) f_parse_text "${a[j + 1]-}" 0; j=$((j + 2)) ;;
+          --extcmd=*) f_parse_text "${a[j]#*=}" 0; j=$((j + 1)) ;;
+          *) j=$((j + 1)) ;;
+        esac
+      done
+      ;;
+    filter-branch)
+      j=$((GSUB_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in --*-filter) f_parse_text "${a[j + 1]-}" 0; j=$((j + 2)) ;; *) j=$((j + 1)) ;; esac
+      done
+      ;;
+  esac
+  return 0
+}
+
+f_subcommand_words() {
+  # analyse the words a[$1..] as their own simple command
+  local k=$1 save_pipe=$C_PIPEIN
+  local -a CW CF CRO CRF CRI CRIF
+  local CHD=
+  CW=() CF=() CRO=() CRF=() CRI=() CRIF=()
+  while [ "$k" -lt "$n" ]; do
+    CW+=("${a[k]}")
+    CF+=("${af[k]}")
+    k=$((k + 1))
+  done
+  [ "${#CW[@]}" -gt 0 ] || return 0
+  f_simple ';'
+  C_PIPEIN=$save_pipe
+  return 0
+}
+
+f_git_push() {
+  local j=$((GSUB_I + 1)) w fl wl remote_set=0 force=0 tags=0 dyn=0 dashdash=0 bare=0
+  local k=0 r src dst plus ldst
+  local -a refs
+  refs=()
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    fl=${af[j]}
+    j=$((j + 1))
+    if [ "$dashdash" = 0 ]; then
+      case $w in
+        --) dashdash=1; continue ;;
+        --repo) remote_set=1; j=$((j + 1)); continue ;;
+        --repo=*) remote_set=1; continue ;;
+        -o | --push-option) j=$((j + 1)); continue ;;
+        --push-option=* | -o?*) continue ;;
+        --no-force* | --no-verify | --no-thin | --no-signed | --no-atomic | --no-recurse-submodules | --no-follow-tags) continue ;;
+        --*)
+          wl=${w%%=*}
+          if f_abbrev "$wl" --force 4 || f_abbrev "$wl" --force-with-lease 8 || f_abbrev "$wl" --force-if-includes 8; then force=1; continue; fi
+          case $wl in --force*) force=1; continue ;; esac
+          if f_abbrev "$wl" --tags 5 || f_abbrev "$wl" --follow-tags 5 || f_abbrev "$wl" --mirror 4 || f_abbrev "$wl" --all 4 || f_abbrev "$wl" --branches 4 || f_abbrev "$wl" --delete 4 || f_abbrev "$wl" --prune 4; then
+            tags=1
+          fi
+          continue
+          ;;
+        -?*)
+          case $fl in *v* | *d*) dyn=1; continue ;; esac
+          case ${w#-} in *f*) force=1 ;; esac
+          case ${w#-} in *d*) tags=1 ;; esac
+          continue
+          ;;
+      esac
+    fi
+    case $fl in *u*) dyn=1 ;; esac
+    if [ "$remote_set" = 0 ]; then
+      remote_set=1
+      continue
+    fi
+    refs+=("$w")
+  done
+  [ "$dyn" = 1 ] && deny push-main "$M_PUSH_UNKNOWN"
+  [ "${#refs[@]}" = 0 ] && bare=1
+  while [ "$k" -lt "${#refs[@]}" ]; do
+    r=${refs[k]}
+    k=$((k + 1))
+    case $r in *$'\001'*) deny push-main "$M_PUSH_UNKNOWN" ;; esac
+    plus=0
+    case $r in +*) plus=1; r=${r#+} ;; esac
+    case $r in
+      *:*) src=${r%%:*}; dst=${r#*:} ;;
+      *) src=$r; dst= ;;
+    esac
+    if [ -z "$dst" ]; then
+      case $src in
+        HEAD | @) bare=1 ;;
+        refs/heads/*) dst=${src#refs/heads/} ;;
+        *) dst=$src ;;
+      esac
+    fi
+    f_lc "$dst"
+    ldst=$REPLY
+    case $ldst in
+      refs/tags/* | tags/*) tags=1 ;;
+      *)
+        ldst=${ldst#refs/heads/}
+        ldst=${ldst#heads/}
+        case $ldst in
+          main | *'*'*) deny push-main "$M_PUSH_MAIN" ;;
+          release-please--*) deny push-release-branch "$M_RELEASE_BRANCH" ;;
+        esac
+        ;;
+    esac
+    [ "$plus" = 1 ] && force=1
+    case $src in refs/tags/* | '') tags=1 ;; esac
+    if [ "$tags" = 0 ] && [ -n "$src" ]; then
+      case $src in
+        HEAD | @ | HEAD[~^]* | @[~^]* | refs/heads/* | refs/remotes/* | *'*'*) ;;
+        *)
+          case $dst in
+            refs/*) ;;
+            *) f_git_is_tag "$src" && tags=1 ;;
+          esac
+          ;;
+      esac
+    fi
+  done
+  if [ "$bare" = 1 ]; then
+    if f_git_branch; then
+      f_lc "$REPLY"
+      [ "$REPLY" = main ] && deny push-main "$M_PUSH_MAIN"
+      case $REPLY in release-please--*) deny push-release-branch "$M_RELEASE_BRANCH" ;; esac
+    else
+      deny push-main "$M_PUSH_UNKNOWN"
+    fi
+  fi
+  [ "$force" = 1 ] && deny force-push "$M_FORCE"
+  [ "$tags" = 1 ] && deny push-tags "$M_PUSH_TAGS"
+  return 0
+}
+
+f_git_commit() {
+  local j=$((GSUB_I + 1)) w g c
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      --) break ;;
+      -m | -F | -c | -C | -t | --message | --file | --reuse-message | --reedit-message | --template | --author | --date | --fixup | --squash | --trailer | --cleanup | --pathspec-from-file) j=$((j + 1)) ;;
+      --*) ;;
+      -?*)
+        case ${af[j - 1]} in *u*) deny skip-hooks "$M_SKIP_HOOKS" ;; esac
+        g=${w#-}
+        while [ -n "$g" ]; do
+          c=${g:0:1}
+          g=${g:1}
+          case $c in
+            n) deny skip-hooks "$M_SKIP_HOOKS" ;;
+            m | F | c | C | t)
+              [ -z "$g" ] && j=$((j + 1))
+              break
+              ;;
+            u | S) break ;;
+          esac
+        done
+        ;;
+      *) case ${af[j - 1]} in *u*) deny skip-hooks "$M_SKIP_HOOKS" ;; esac ;;
+    esac
+  done
+  return 0
+}
+
+f_git_config() {
+  # deny any write; reads: --get*, --list/-l, get/list, a single key
+  local j=$((GSUB_I + 1)) w pos read=0 write=0 key sub=
+  local -a posv
+  posv=()
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      --get | --get-all | --get-regexp | --get-urlmatch | --get-color | --get-colorbool | -l | --list) read=1 ;;
+      --show-origin | --show-scope | --name-only | --null | -z | --includes | --no-includes | --bool | --int | --bool-or-int | --path | --expiry-date | --fixed-value) ;;
+      --global | --system | --local | --worktree) ;;
+      -f | --file | --blob | --type | --default | --comment) j=$((j + 1)) ;;
+      --file=* | --blob=* | --type=* | --default=* | --comment=*) ;;
+      -*) write=1 ;;
+      *)
+        case ${af[j - 1]} in *u*) write=1 ;; esac
+        posv+=("$w")
+        ;;
+    esac
+  done
+  pos=${#posv[@]}
+  if [ "$pos" -gt 0 ]; then
+    case ${posv[0]} in
+      get | list) [ "$write" = 0 ] && read=1 ;;
+      set | unset | edit | rename-section | remove-section) sub=${posv[0]}; write=1 ;;
+    esac
+  fi
+  if [ -n "$sub" ]; then key=${posv[1]-}; else key=${posv[0]-}; fi
+  if [ -z "$sub" ] && [ "$read" = 0 ] && [ "$pos" -ge 2 ]; then write=1; fi
+  if [ "$write" = 1 ]; then
+    f_lc "$key"
+    case $REPLY in *hookspath* | *$'\001'*) deny hooks-path "$M_HOOKS_PATH" ;; esac
+    deny git-config "$M_GIT_CONFIG"
+  fi
+  return 0
+}
+
+f_git_remote() {
+  local j=$((GSUB_I + 1)) w
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      -v | --verbose) ;;
+      add | set-url | rename | remove | rm | set-head | set-branches) deny git-config "$M_GIT_CONFIG" ;;
+      *)
+        case ${af[j - 1]} in *v* | *d*) deny git-config "$M_GIT_CONFIG" ;; esac
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+f_git_tag() {
+  local j=$((GSUB_I + 1)) w listmode=0 pos=0 write=0
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      -l | --list | -v | --verify | --contains | --no-contains | --points-at | --merged | --no-merged | -n | -n[0-9]* | --sort=* | --format=* | --column* | --no-column | --color* | --no-color | -i | --ignore-case | --omit-empty) listmode=1 ;;
+      --sort | --format) listmode=1; j=$((j + 1)) ;;
+      -u | --local-user | -m | --message | -F | --file | --cleanup | --trailer) write=1; j=$((j + 1)) ;;
+      --*) write=1 ;;
+      -?*)
+        case ${w#-} in *[!lvn0-9i]*) write=1 ;; *) listmode=1 ;; esac
+        ;;
+      *)
+        pos=$((pos + 1))
+        case ${af[j - 1]} in *u*) write=1 ;; esac
+        ;;
+    esac
+  done
+  [ "$write" = 1 ] && deny tag-write "$M_TAG"
+  [ "$pos" -gt 0 ] && [ "$listmode" = 0 ] && deny tag-write "$M_TAG"
+  return 0
+}
+
+f_git_update_ref() {
+  local j=$((GSUB_I + 1)) w
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      --stdin) deny tag-write "update-ref --stdin can't be checked. $M_TAG" ;;
+      refs/tags/* | tags/*) deny tag-write "$M_TAG" ;;
+      *$'\001'*) deny tag-write "the ref isn't literal. $M_TAG" ;;
+    esac
+  done
+  return 0
+}
+
+f_git_submodule() {
+  local j=$((GSUB_I + 1)) s='' k
+  while [ "$j" -lt "$n" ]; do
+    if [ "${a[j]}" = foreach ]; then
+      j=$((j + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in --recursive | -q | --quiet) j=$((j + 1)) ;; *) break ;; esac
+      done
+      k=$j
+      while [ "$k" -lt "$n" ]; do s="$s ${a[k]}"; k=$((k + 1)); done
+      f_parse_text "$s" 0
+      return 0
+    fi
+    j=$((j + 1))
+  done
+  return 0
+}
+
+f_git_rebase() {
+  local j=$((GSUB_I + 1)) w
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      -x | --exec) f_parse_text "${a[j]-}" 0; j=$((j + 1)) ;;
+      --exec=*) f_parse_text "${w#--exec=}" 0 ;;
+      -x?*) f_parse_text "${w#-x}" 0 ;;
+    esac
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ gh / team-gh
+
+F_ALLOWED_LABELS=" needs-info fixes-main bug feature client-request health "
+F_PROTECTED_LABELS=" owner-approved guarded high-risk tests-changed "
+
+f_gh_positionals() {
+  # GHG group, GHS subcommand (and their indexes) after the name at index $1
+  local j=$(($1 + 1)) w
+  GHG='' GHS='' GHG_I=$n GHS_I=$n
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    case $w in
+      -R | --repo | --hostname) j=$((j + 2)); continue ;;
+      -*) j=$((j + 1)); continue ;;
+    esac
+    if [ -z "$GHG" ]; then
+      GHG=$w
+      GHG_I=$j
+    else
+      GHS=$w
+      GHS_I=$j
+      return 0
+    fi
+    j=$((j + 1))
+  done
+  return 0
+}
+
+f_gh_is_read() {
+  # the read-only gh commands (gh, team-gh and the review agents); uses I0 = name index
+  local j
+  case "$GHG $GHS" in
+    'pr view' | 'pr list' | 'pr diff' | 'pr checks' | 'pr status' | 'pr checkout') return 0 ;;
+    'issue view' | 'issue list' | 'issue status') return 0 ;;
+    'repo view' | 'repo list' | 'repo clone') return 0 ;;
+    'run view' | 'run list' | 'run watch' | 'run download') return 0 ;;
+    'workflow view' | 'workflow list') return 0 ;;
+    'release view' | 'release list' | 'release download') return 0 ;;
+    'label list') return 0 ;;
+    'search '*) return 0 ;;
+    'status '*) return 0 ;;
+    'ruleset list' | 'ruleset view' | 'ruleset check') return 0 ;;
+    'secret list') return 0 ;;
+    'variable list' | 'variable get') return 0 ;;
+    'cache list') return 0 ;;
+    'gist view' | 'gist list') return 0 ;;
+    'co '*) return 0 ;;
+    'version '* | 'help '*) return 0 ;;
+    'browse '*)
+      j=$((I0 + 1))
+      while [ "$j" -lt "$n" ]; do
+        [ "${a[j]}" = --no-browser ] && return 0
+        j=$((j + 1))
+      done
+      return 1
+      ;;
+    'auth status')
+      j=$((I0 + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -t | --show-token | --show-t* | -[a-zA-Z]*t*) return 1 ;; esac
+        j=$((j + 1))
+      done
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+f_gh_api_write() {
+  # 0 if this gh api call writes (uses I0)
+  local j=$((I0 + 1)) w method='' fields=0 g c
+  shopt -s nocasematch
+  while [ "$j" -lt "$n" ]; do
+    case ${a[j]} in
+      *mutation*)
+        shopt -u nocasematch
+        return 0
+        ;;
+    esac
+    j=$((j + 1))
+  done
+  shopt -u nocasematch
+  j=$((I0 + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      -X | --method) method=${a[j]-}; j=$((j + 1)) ;;
+      --method=*) method=${w#*=} ;;
+      -f | -F | --field | --raw-field | --input) fields=1; j=$((j + 1)) ;;
+      --field=* | --raw-field=* | --input=*) fields=1 ;;
+      -H | --header | -q | --jq | -t | --template | -p | --preview | --hostname | --cache) j=$((j + 1)) ;;
+      --*) ;;
+      -?*)
+        g=${w#-}
+        while [ -n "$g" ]; do
+          c=${g:0:1}
+          g=${g:1}
+          case $c in
+            X)
+              if [ -n "$g" ]; then method=${g#=}; else method=${a[j]-}; j=$((j + 1)); fi
+              break
+              ;;
+            f | F)
+              fields=1
+              [ -z "$g" ] && j=$((j + 1))
+              break
+              ;;
+            H | q | t | p)
+              [ -z "$g" ] && j=$((j + 1))
+              break
+              ;;
+          esac
+        done
+        ;;
+    esac
+  done
+  f_lc "$method"
+  method=$REPLY
+  case $method in *$'\001'*) return 0 ;; esac
+  if [ -n "$method" ]; then
+    case $method in get | head) ;; *) return 0 ;; esac
+  fi
+  if [ "$fields" = 1 ] && [ "$method" != get ]; then return 0; fi
+  return 1
+}
+
+f_gh_labels() {
+  # label values added (LBL_ADD) and removed (LBL_RM), comma lists; LBL_DYN=1 if not literal
+  local j=$((I0 + 1)) w v
+  LBL_ADD='' LBL_RM='' LBL_DYN=0
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      --add-label | --label | -l)
+        v=${a[j]-}
+        case ${af[j]-} in *v* | *d*) LBL_DYN=1 ;; esac
+        j=$((j + 1))
+        LBL_ADD="$LBL_ADD,$v"
+        ;;
+      --add-label=* | --label=*)
+        case ${af[j - 1]} in *v* | *d*) LBL_DYN=1 ;; esac
+        LBL_ADD="$LBL_ADD,${w#*=}"
+        ;;
+      -l?*) LBL_ADD="$LBL_ADD,${w#-l}" ;;
+      --remove-label)
+        case ${af[j]-} in *v* | *d*) LBL_DYN=1 ;; esac
+        LBL_RM="$LBL_RM,${a[j]-}"
+        j=$((j + 1))
+        ;;
+      --remove-label=*) LBL_RM="$LBL_RM,${w#*=}" ;;
+    esac
+  done
+  return 0
+}
+
+f_label_in() {
+  # f_label_in <comma list> <set>: every label in the list is in the set
+  local l
+  local IFS=,
+  # shellcheck disable=SC2086 # split on commas on purpose
+  set -- $1 "$2"
+  IFS=$' \t\n'
+  local set_=${!#}
+  while [ $# -gt 1 ]; do
+    l=$1
+    shift
+    l=${l# }
+    l=${l% }
+    [ -n "$l" ] || continue
+    f_lc "$l"
+    case $set_ in *" $REPLY "*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+f_label_has() {
+  # f_label_has <comma list> <set>: some label in the list is in the set
+  local l
+  local IFS=,
+  # shellcheck disable=SC2086
+  set -- $1 "$2"
+  IFS=$' \t\n'
+  local set_=${!#}
+  while [ $# -gt 1 ]; do
+    l=$1
+    shift
+    l=${l# }
+    l=${l% }
+    f_lc "$l"
+    case $set_ in *" $REPLY "*) return 0 ;; esac
+  done
+  return 1
+}
+
+f_gh_owner() {
+  # owner-approved: never added except the canonical form from the main session; protected
+  # labels never removed. Runs before the review-agent allowlist.
+  local I0=$1 kind=$2 canon j
+  f_gh_positionals "$I0"
+  if [ "$GHG" = api ]; then
+    if f_gh_api_write; then
+      j=$((I0 + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in *owner-approved*) deny owner-approved "$M_OWNER" ;; esac
+        j=$((j + 1))
+      done
+    fi
+    return 0
+  fi
+  f_gh_is_read && return 0
+  f_gh_labels
+  if [ "$LBL_DYN" = 1 ] || f_label_has "$LBL_RM" "$F_PROTECTED_LABELS"; then
+    deny owner-approved "$M_OWNER"
+  fi
+  if f_label_has "$LBL_ADD" " owner-approved "; then
+    canon=$T_CMD
+    canon=${canon#"${canon%%[![:space:]]*}"}
+    canon=${canon%"${canon##*[![:space:]]}"}
+    if [ "$kind" = team-gh ] && [ -z "$T_AGENTID" ] && [ -z "$F_SCAN_CTX" ] && [ "$F_DEPTH" = 0 ] \
+      && [ "$n" = 6 ] && [ "$I0" = 0 ] && [ "${a[0]}" = team-gh ] && [ -z "${af[0]}" ] \
+      && [ "${a[1]}" = pr ] && [ "${a[2]}" = edit ] && f_is_digits "${a[3]}" \
+      && [ "${a[4]}" = --add-label ] && [ "${a[5]}" = owner-approved ] \
+      && [ "$canon" = "team-gh pr edit ${a[3]} --add-label owner-approved" ]; then
+      F_CANON_OWNER=1
+      return 0
+    fi
+    deny owner-approved "$M_OWNER"
+  fi
+  return 0
+}
+
+f_gh() {
+  # f_gh <name index> <gh|team-gh>
+  local I0=$1 kind=$2 j w is_write=1 auto=0 squash=0 other=0 npos=0 adds=0 comment=0
+  if [ "$F_CANON_OWNER" = 1 ]; then
+    # the owner's canonical 'team-gh pr edit <n> --add-label owner-approved' (layer 2 asks)
+    F_CANON_OWNER=0
+    return 0
+  fi
+  f_gh_positionals "$I0"
+  if [ "$GHG_I" -lt "$n" ]; then
+    case ${af[GHG_I]} in *v* | *d*) deny disguised "the gh subcommand is built from a variable. $M_DISGUISED" ;; esac
+  fi
+  if [ "$GHS_I" -lt "$n" ]; then
+    case ${af[GHS_I]} in *v* | *d*) deny disguised "the gh subcommand is built from a variable. $M_DISGUISED" ;; esac
+  fi
+  # help and version never act
+  j=$((I0 + 1))
+  while [ "$j" -lt "$n" ]; do
+    case ${a[j]} in --help | -h | --version) return 0 ;; esac
+    j=$((j + 1))
+  done
+  [ -n "$GHG" ] || return 0
+  case $GHG in version | help) return 0 ;; esac
+
+  case $GHG in
+    release)
+      case $GHS in view | list | download) ;; *) deny release-write "$M_RELEASE" ;; esac
+      ;;
+    auth)
+      if [ "$GHS" = status ]; then
+        f_gh_is_read || deny gh-credential "$M_GH_CRED"
+      else
+        deny gh-credential "$M_GH_CRED"
+      fi
+      ;;
+    config)
+      case $GHS in get | list) ;; *) deny gh-credential "$M_GH_CRED" ;; esac
+      ;;
+    workflow)
+      if [ "$GHS" = run ]; then
+        j=$((GHS_I + 1))
+        while [ "$j" -lt "$n" ]; do
+          w=${a[j]}
+          j=$((j + 1))
+          case $w in -*) continue ;; esac
+          f_lc "$w"
+          case $REPLY in rollback* | *$'\001'*) deny prod-action "$M_PROD" ;; esac
+          break
+        done
+      fi
+      ;;
+  esac
+
+  if [ "$GHG" = api ]; then
+    f_gh_api_write && deny gh-api-write "$M_GH_API"
+    return 0
+  fi
+  f_gh_is_read && is_write=0
+
+  if [ "$GHG $GHS" = "pr merge" ]; then
+    j=$((GHS_I + 1))
+    while [ "$j" -lt "$n" ]; do
+      w=${a[j]}
+      j=$((j + 1))
+      case $w in
+        --admin) deny merge-admin "$M_MERGE_ADMIN" ;;
+        --auto) auto=1 ;;
+        --squash | -s) squash=1 ;;
+        --delete-branch | -d) ;;
+        -R | --repo) j=$((j + 1)) ;;
+        --repo=*) ;;
+        --*) other=1 ;;
+        -[a-zA-Z]*)
+          case $w in *s*) squash=1 ;; esac
+          case ${w#-} in *[!sd]*) other=1 ;; esac
+          ;;
+        *) npos=$((npos + 1)) ;;
+      esac
+    done
+    [ "$kind" = gh ] && deny gh-write "$M_GH_WRITE"
+    [ "$auto" = 0 ] && deny merge-no-auto "$M_MERGE_NO_AUTO"
+    if [ "$squash" = 0 ] || [ "$other" = 1 ] || [ "$npos" -gt 1 ]; then
+      deny gh-write "$M_MERGE_NO_AUTO"
+    fi
+    return 0
+  fi
+
+  [ "$is_write" = 0 ] && return 0
+  [ "$kind" = gh ] && deny gh-write "$M_GH_WRITE"
+
+  # team-gh: the allowed writes only
+  f_gh_labels
+  case "$GHG $GHS" in
+    'pr create' | 'pr comment' | 'issue comment') return 0 ;;
+    'issue create')
+      f_label_in "$LBL_ADD" "$F_ALLOWED_LABELS" || deny gh-write "allowed labels: needs-info fixes-main bug feature client-request health. $M_GH_WRITE"
+      return 0
+      ;;
+    'pr edit')
+      j=$((GHS_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        j=$((j + 1))
+        case $w in
+          -t | --title | -b | --body | -F | --body-file | -B | --base | --add-label | -R | --repo) j=$((j + 1)) ;;
+          --title=* | --body=* | --body-file=* | --base=* | --add-label=* | --repo=*) ;;
+          -*) deny gh-write "team-gh pr edit may change only the title, body, base and allowed labels. $M_GH_WRITE" ;;
+          *) npos=$((npos + 1)) ;;
+        esac
+      done
+      [ "$npos" -gt 1 ] && deny gh-write "$M_GH_WRITE"
+      f_label_in "$LBL_ADD" "$F_ALLOWED_LABELS" || deny gh-write "allowed labels: needs-info fixes-main bug feature client-request health. $M_GH_WRITE"
+      return 0
+      ;;
+    'pr review')
+      j=$((GHS_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          --comment | -c) comment=1 ;;
+          --approve | -a | --request-changes | -r) deny gh-write "reviews may only comment (pr review --comment). $M_GH_WRITE" ;;
+          -b | --body | -F | --body-file | -R | --repo) j=$((j + 1)) ;;
+          --*) ;;
+          -[a-zA-Z][a-zA-Z]*)
+            case ${a[j]} in *a* | *r*) deny gh-write "reviews may only comment (pr review --comment). $M_GH_WRITE" ;; esac
+            case ${a[j]} in *c*) comment=1 ;; esac
+            ;;
+        esac
+        j=$((j + 1))
+      done
+      [ "$comment" = 1 ] || deny gh-write "reviews may only comment (pr review --comment). $M_GH_WRITE"
+      return 0
+      ;;
+    'issue edit')
+      j=$((GHS_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        j=$((j + 1))
+        case $w in
+          --add-label) adds=1; j=$((j + 1)) ;;
+          --add-label=*) adds=1 ;;
+          -R | --repo) j=$((j + 1)) ;;
+          --repo=*) ;;
+          -*) deny gh-write "team-gh issue edit may only add allowed labels. $M_GH_WRITE" ;;
+          *) npos=$((npos + 1)) ;;
+        esac
+      done
+      if [ "$npos" != 1 ] || [ "$adds" = 0 ]; then deny gh-write "$M_GH_WRITE"; fi
+      f_label_in "$LBL_ADD" "$F_ALLOWED_LABELS" || deny gh-write "allowed labels: needs-info fixes-main bug feature client-request health. $M_GH_WRITE"
+      return 0
+      ;;
+  esac
+  deny gh-write "$M_GH_WRITE"
+}
+
+# ------------------------------------------------------------ curl / wget
+
+f_url_host() {
+  # the host of a URL-like word into REPLY (lowercase); '' if it isn't one
+  local u=$1
+  case $u in
+    *://*) u=${u#*://} ;;
+    -* | /* | .* | @* | *' '*) REPLY=; return 0 ;;
+    *.*) ;;
+    *) REPLY=; return 0 ;;
+  esac
+  u=${u%%[/?#]*}
+  u=${u##*@}
+  u=${u%%:*}
+  u=${u%.}
+  f_lc "$u"
+}
+
+f_is_github_host() {
+  case $1 in
+    github.com | *.github.com | *.githubusercontent.com | githubusercontent.com) return 0 ;;
+  esac
+  return 1
+}
+
+f_curl() {
+  local i=$1 tool=$2 j w g c wl method='' data=0 cfg=0 gh=0 dynurl=0 local_only=1 nurl=0 outfile=0 nonget=0
+  j=$((i + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    if [ "$tool" = curl ]; then
+      case $w in
+        -X | --request) method=${a[j]-}; j=$((j + 1)); continue ;;
+        --request=*) method=${w#*=}; continue ;;
+        -d | --data | --data-* | --json | -F | --form | --form-string | -T | --upload-file) data=1; j=$((j + 1)); continue ;;
+        --data=* | --form=* | --upload-file=* | --json=*) data=1; continue ;;
+        --post301 | --post302 | --post303) data=1; continue ;;
+        -K | --config) cfg=1; j=$((j + 1)); continue ;;
+        --config=*) cfg=1; continue ;;
+        -o | --output | --output-dir | -D | --dump-header | -c | --cookie-jar)
+          [ "${a[j]-}" = /dev/null ] || outfile=1
+          j=$((j + 1))
+          continue
+          ;;
+        -O | --remote-name | --remote-name-all) outfile=1; continue ;;
+        --url) w=${a[j]-}; j=$((j + 1)) ;;
+        --url=*) w=${w#*=} ;;
+        -H | --header | -A | --user-agent | -u | --user | -e | --referer | -b | --cookie | -w | --write-out | -m | --max-time | --connect-timeout | --retry | -x | --proxy | -E | --cert | --key | -r | --range | -C | --continue-at | -Y | -y | -z | -U | -P | -Q | --resolve | --connect-to | --cacert | --capath | --limit-rate | --max-filesize | --retry-delay | --retry-max-time | --interface | --dns-servers | --variable | --expand-url)
+          j=$((j + 1))
+          continue
+          ;;
+        --*)
+          wl=${w%%=*}
+          if f_abbrev "$wl" --request 5; then
+            if [ "$wl" != "$w" ]; then method=${w#*=}; else method=${a[j]-}; j=$((j + 1)); fi
+            continue
+          fi
+          if f_abbrev "$wl" --data 5 || f_abbrev "$wl" --upload-file 5 || f_abbrev "$wl" --form 5 || f_abbrev "$wl" --json 5; then
+            data=1
+            continue
+          fi
+          if f_abbrev "$wl" --config 5; then cfg=1; continue; fi
+          continue
+          ;;
+        -?*)
+          g=${w#-}
+          while [ -n "$g" ]; do
+            c=${g:0:1}
+            g=${g:1}
+            case $c in
+              X) if [ -n "$g" ]; then method=$g; else method=${a[j]-}; j=$((j + 1)); fi; break ;;
+              d | F | T) data=1; [ -z "$g" ] && j=$((j + 1)); break ;;
+              K) cfg=1; [ -z "$g" ] && j=$((j + 1)); break ;;
+              o | D | c)
+                if [ -z "$g" ]; then
+                  [ "${a[j]-}" = /dev/null ] || outfile=1
+                  j=$((j + 1))
+                else
+                  [ "$g" = /dev/null ] || outfile=1
+                fi
+                break
+                ;;
+              O) outfile=1 ;;
+              H | A | u | e | b | w | m | x | E | r | C | Y | y | z | U | P | Q) [ -z "$g" ] && j=$((j + 1)); break ;;
+            esac
+          done
+          continue
+          ;;
+      esac
+    else
+      case $w in
+        --method=* | --post-data=* | --post-file=* | --body-data=* | --body-file=*)
+          data=1
+          case $w in --method=*) method=${w#*=} ;; esac
+          continue
+          ;;
+        --method | --post-data | --post-file | --body-data | --body-file)
+          data=1
+          [ "$w" = --method ] && method=${a[j]-}
+          j=$((j + 1))
+          continue
+          ;;
+        -e | --execute | --config | -i | --input-file) cfg=1; j=$((j + 1)); continue ;;
+        --execute=* | --config=* | --input-file=*) cfg=1; continue ;;
+        -O | --output-document | -o | --output-file | -P | --directory-prefix | -a | --append-output) outfile=1; j=$((j + 1)); continue ;;
+        --header | -U | --user-agent | --user | --password | -T | --timeout | -t | --tries) j=$((j + 1)); continue ;;
+        -*) continue ;;
+      esac
+    fi
+    case $w in *$'\001'*) dynurl=1; local_only=0; nurl=$((nurl + 1)); continue ;; esac
+    f_url_host "$w"
+    [ -n "$REPLY" ] || continue
+    nurl=$((nurl + 1))
+    f_is_github_host "$REPLY" && gh=1
+    case $REPLY in localhost | 127.0.0.1 | '[::1]') ;; *) local_only=0 ;; esac
+  done
+  f_lc "$method"
+  method=$REPLY
+  [ "$data" = 1 ] && nonget=1
+  case $method in '' | get | head) ;; *) nonget=1 ;; esac
+  if [ "$cfg" = 1 ] && { [ "$gh" = 1 ] || [ "$dynurl" = 1 ] || [ "$nurl" = 0 ]; }; then
+    deny curl-github-write "$M_CURL"
+  fi
+  if [ "$nonget" = 1 ] && { [ "$gh" = 1 ] || [ "$dynurl" = 1 ]; }; then
+    if [ "$gh" = 1 ]; then
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in *owner-approved*) deny owner-approved "$M_OWNER" ;; esac
+        j=$((j + 1))
+      done
+    fi
+    deny curl-github-write "$M_CURL"
+  fi
+  CURL_LOCAL_GET=0
+  if [ "$local_only" = 1 ] && [ "$nurl" -gt 0 ] && [ "$nonget" = 0 ] && [ "$cfg" = 0 ] && [ "$outfile" = 0 ]; then
+    CURL_LOCAL_GET=1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ ssh family
+
+f_ssh_host_class() {
+  # f_ssh_host_class <host, lowercase> -> SSHC: vps|github|forbidden|other
+  local h=$1 x
+  SSHC=other
+  f_load_config
+  if [ "$h" = github.com ]; then SSHC=github; return 0; fi
+  for x in $CFG_GH_ALIASES; do
+    [ "$h" = "$x" ] && { SSHC=github; return 0; }
+  done
+  [ "$CFG_OK" = 1 ] || return 0
+  for x in $CFG_FORBIDDEN; do
+    [ "$h" = "$x" ] && { SSHC=forbidden; return 0; }
+  done
+  [ -n "$CFG_VPS_IP" ] && [ "$h" = "$CFG_VPS_IP" ] && { SSHC=forbidden; return 0; }
+  [ -n "$CFG_VPS_HOSTNAME" ] && [ "$h" = "$CFG_VPS_HOSTNAME" ] && { SSHC=forbidden; return 0; }
+  if [ -n "$CFG_DOMAIN" ]; then
+    case $h in "$CFG_DOMAIN" | *."$CFG_DOMAIN") SSHC=forbidden; return 0 ;; esac
+  fi
+  [ "$h" = "$CFG_VPS_ALIAS" ] && SSHC=vps
+  return 0
+}
+
+f_ssh_opt() {
+  # -o keys on the allowlist only
+  local k=${1%%=*}
+  k=${k%% *}
+  f_lc "$k"
+  case $REPLY in
+    batchmode | connecttimeout | serveraliveinterval | serveralivecountmax | loglevel | requesttty) return 0 ;;
+  esac
+  return 1
+}
+
+f_ssh() {
+  local i=$1 tool=$2 j w g c hh pre host user='' badopt=0 dest='' rcmd=0 remote=0
+  case $tool in
+    scp | sftp | sshfs | autossh | mosh | ssh-copy-id)
+      # always denied; naming the VPS by IP/hostname/domain or a forbidden alias is ssh-dest
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        j=$((j + 1))
+        case $w in -*) continue ;; esac
+        hh=$w
+        case $hh in *://*) hh=${hh#*://} ;; esac
+        hh=${hh%%[:/]*}
+        hh=${hh##*@}
+        f_lc "$hh"
+        f_ssh_host_class "$REPLY"
+        [ "$SSHC" = forbidden ] && deny ssh-dest "$M_SSH_DEST"
+      done
+      deny ssh-form "$M_SSH_FORM"
+      ;;
+    rsync)
+      j=$((i + 1))
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        j=$((j + 1))
+        case $w in
+          -e | --rsh) remote=1; j=$((j + 1)); continue ;;
+          --rsh=* | -e?* | --rsync-path | --rsync-path=*) remote=1; continue ;;
+          -*) continue ;;
+          rsync://* | *::*) remote=1 ;;
+          *:*)
+            pre=${w%%:*}
+            case $pre in
+              */* | '') ;;
+              *)
+                remote=1
+                f_lc "${pre##*@}"
+                f_ssh_host_class "$REPLY"
+                [ "$SSHC" = forbidden ] && deny ssh-dest "$M_SSH_DEST"
+                ;;
+            esac
+            ;;
+        esac
+      done
+      [ "$remote" = 1 ] && deny ssh-form "$M_SSH_FORM"
+      return 0
+      ;;
+  esac
+  # ssh: options may come before and after the destination (OpenSSH re-parses them);
+  # the first non-option word after the destination starts the remote command
+  j=$((i + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      --)
+        if [ -z "$dest" ]; then
+          dest=${a[j]-}
+          j=$((j + 1))
+        fi
+        [ "$j" -lt "$n" ] && rcmd=1
+        break
+        ;;
+      -o)
+        f_ssh_opt "${a[j]-}" || badopt=1
+        j=$((j + 1))
+        ;;
+      -o?*) f_ssh_opt "${w#-o}" || badopt=1 ;;
+      -G | -V) return 0 ;;
+      -?*)
+        g=${w#-}
+        while [ -n "$g" ]; do
+          c=${g:0:1}
+          g=${g:1}
+          case $c in
+            T | v | q) ;;
+            G | V) return 0 ;;
+            o)
+              if [ -n "$g" ]; then
+                f_ssh_opt "$g" || badopt=1
+              else
+                f_ssh_opt "${a[j]-}" || badopt=1
+                j=$((j + 1))
+              fi
+              break
+              ;;
+            b | c | D | E | e | F | I | i | J | L | l | m | O | p | Q | R | S | W | w | B)
+              badopt=1
+              [ -z "$g" ] && j=$((j + 1))
+              break
+              ;;
+            *) badopt=1 ;;
+          esac
+        done
+        ;;
+      *)
+        if [ -z "$dest" ]; then
+          dest=$w
+        else
+          rcmd=1
+          break
+        fi
+        ;;
+    esac
+  done
+  if [ -z "$dest" ]; then
+    [ "$badopt" = 1 ] && deny ssh-form "$M_SSH_FORM"
+    return 0
+  fi
+  case $dest in *$'\001'*) deny ssh-dest "the destination isn't literal. $M_SSH_DEST" ;; esac
+  case $dest in *://*) deny ssh-dest "$M_SSH_DEST" ;; esac
+  host=$dest
+  case $host in *@*) user=${host%@*}; host=${host##*@} ;; esac
+  f_lc "$host"
+  host=$REPLY
+  f_ssh_host_class "$host"
+  case $SSHC in
+    forbidden) deny ssh-dest "$M_SSH_DEST" ;;
+    other)
+      [ "$CFG_OK" = 0 ] && deny ssh-dest "no pack config (defaults.conf with VPS_ALIAS) was found, so only ssh -T git@github.com is allowed."
+      deny ssh-dest "$M_SSH_DEST"
+      ;;
+    github)
+      if [ "$user" != git ] || [ "$rcmd" = 1 ] || [ "$badopt" = 1 ]; then
+        deny ssh-form "$M_SSH_FORM"
+      fi
+      ;;
+    vps)
+      if [ -n "$user" ] || [ "$badopt" = 1 ]; then
+        deny ssh-form "$M_SSH_FORM"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ------------------------------------------------------------ claude, security, production
+
+f_claude() {
+  local i=$1 wrapped=$2 assigns=$3 j w fl npos=0 bg=0 promptq=0 json=0 mode
+  if [ -n "$assigns" ] || [ "$wrapped" = 1 ] || [ "$C_PIPEIN" = 1 ]; then deny nested-claude "$M_CLAUDE"; fi
+  case ${a[i + 1]-} in
+    --version | -v)
+      [ "$n" = $((i + 2)) ] && return 0
+      deny nested-claude "$M_CLAUDE"
+      ;;
+    agents)
+      j=$((i + 2))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in --json) json=1 ;; --all) ;; *) deny nested-claude "$M_CLAUDE" ;; esac
+        j=$((j + 1))
+      done
+      [ "$json" = 1 ] && return 0
+      deny nested-claude "$M_CLAUDE"
+      ;;
+    logs | stop | rm)
+      [ "$n" = $((i + 3)) ] || deny nested-claude "$M_CLAUDE"
+      case ${a[i + 2]} in -* | '') deny nested-claude "$M_CLAUDE" ;; esac
+      f_word_is_dynamic "${af[i + 2]}" && deny nested-claude "$M_CLAUDE"
+      return 0
+      ;;
+    plugin)
+      case ${a[i + 2]-} in
+        list | validate)
+          j=$((i + 3))
+          while [ "$j" -lt "$n" ]; do
+            case ${a[j]} in --plugin-dir* | --settings* | --setting-sources* | --mcp-config* | --add-dir* | --plugin-url*) deny nested-claude "$M_CLAUDE" ;; esac
+            j=$((j + 1))
+          done
+          return 0
+          ;;
+      esac
+      deny nested-claude "$M_CLAUDE"
+      ;;
+  esac
+  # claude --bg [--name <n>] [--permission-mode <BACKGROUND_PERMISSION_MODE>] "<prompt>"
+  j=$((i + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    fl=${af[j]}
+    j=$((j + 1))
+    case $w in
+      --bg) bg=1 ;;
+      --name)
+        case ${a[j]-} in -* | '') deny nested-claude "$M_CLAUDE" ;; esac
+        f_word_is_dynamic "${af[j]}" && deny nested-claude "$M_CLAUDE"
+        j=$((j + 1))
+        ;;
+      --name=*) f_word_is_dynamic "$fl" && deny nested-claude "$M_CLAUDE" ;;
+      --permission-mode | --permission-mode=*)
+        if [ "$w" = --permission-mode ]; then
+          mode=${a[j]-}
+          f_word_is_dynamic "${af[j]-}" && deny nested-claude "$M_CLAUDE"
+          j=$((j + 1))
+        else
+          mode=${w#*=}
+        fi
+        f_load_config
+        if [ -z "$CFG_BG_MODE" ] || [ "$mode" != "$CFG_BG_MODE" ]; then
+          deny nested-claude "--permission-mode is allowed only as BACKGROUND_PERMISSION_MODE from defaults.conf. $M_CLAUDE"
+        fi
+        ;;
+      -*) deny nested-claude "$M_CLAUDE" ;;
+      *)
+        npos=$((npos + 1))
+        case $fl in *q*) promptq=1 ;; *) promptq=0 ;; esac
+        f_word_is_dynamic "$fl" && deny nested-claude "the prompt must be one literal quoted string. $M_CLAUDE"
+        ;;
+    esac
+  done
+  if [ "$bg" = 1 ] && [ "$npos" = 1 ] && [ "$promptq" = 1 ]; then
+    return 0
+  fi
+  deny nested-claude "$M_CLAUDE"
+}
+
+f_security() {
+  case ${a[$1 + 1]-} in
+    find-generic-password | find-internet-password | dump-keychain | export | find-key | find-certificate | export-identities) deny credential-read "$M_CRED" ;;
+  esac
+  return 0
+}
+
+f_prod() {
+  # team-deploy / team-flag / ops/flag with production (or an unknown environment)
+  local j=$(($1 + 1)) w
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in -*) continue ;; esac
+    f_lc "$w"
+    case $REPLY in production | prod | *$'\001'*) deny prod-action "$M_PROD" ;; esac
+    return 0
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ disguise structures
+
+f_eval() {
+  local j=$(($1 + 1)) s=
+  f_decode_feed
+  f_disg "eval runs text as a command."
+  while [ "$j" -lt "$n" ]; do s="$s ${a[j]}"; j=$((j + 1)); done
+  f_parse_text "$s" "$C_PIPEIN"
+}
+
+f_source() {
+  local j=$(($1 + 1)) w fl
+  while [ "$j" -lt "$n" ]; do
+    case ${a[j]} in --) j=$((j + 1)); break ;; -*) j=$((j + 1)) ;; *) break ;; esac
+  done
+  [ "$j" -lt "$n" ] || return 0
+  w=${a[j]}
+  fl=${af[j]}
+  case $fl in *p*) f_decode_feed; f_disg "source of a process substitution."; return 0 ;; esac
+  case $w in
+    /dev/stdin | /dev/fd/* | -) f_decode_feed; f_disg "source of standard input."; return 0 ;;
+    *$'\001'*) f_disg "source of a dynamic path."; return 0 ;;
+  esac
+  f_scan_file "$w" sh
+}
+
+f_decode() {
+  local j=$(($1 + 1)) tool=$2 w dec=0 isb64=0
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $tool in
+      base64) case $w in -d | -D | --decode | -[a-zA-Z]*[dD]*) dec=1 ;; esac ;;
+      openssl)
+        case $w in
+          base64 | enc) isb64=1 ;;
+          -d) dec=1 ;;
+        esac
+        ;;
+      xxd) case $w in -r | -revert | -[a-zA-Z]*r*) dec=1 ;; esac ;;
+      gzip | bzip2 | xz) case $w in -d | --decompress | --uncompress | -[a-zA-Z]*d*) dec=1 ;; esac ;;
+    esac
+  done
+  case $tool in uudecode | gunzip | zcat | gzcat | bunzip2 | bzcat | unxz | xzcat) dec=1 ;; esac
+  [ "$tool" = openssl ] && [ "$isb64" = 0 ] && dec=0
+  if [ "$dec" = 1 ]; then
+    G_DECODE=1
+    f_disg "the command decodes base64/hex."
+  fi
+  return 0
+}
+
+f_decode_feed() {
+  # ruling: a decoded payload fed to a shell, an interpreter or source is denied always
+  [ "$G_DECODE" = 1 ] && deny disguised "a decoded payload would run as code; it can't be judged. $M_DISGUISED"
+  return 0
+}
+
+f_runner() {
+  # command runners: around a sensitive command they are a disguise (xargs, find -exec, parallel,
+  # watch, script, su -c, osascript -e); otherwise the inner command is analysed normally
+  local i=$1 tool=$2 j inner=-1 s='' k nm
+  j=$((i + 1))
+  case $tool in
+    find)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -exec | -execdir | -ok | -okdir) inner=$((j + 1)); break ;; esac
+        j=$((j + 1))
+      done
+      ;;
+    xargs)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          -I | -J | -L | -n | -P | -s | -E | -d | -a | --delimiter | --max-args | --max-procs | --arg-file | --replace | --max-lines) j=$((j + 2)) ;;
+          -*) j=$((j + 1)) ;;
+          *) inner=$j; break ;;
+        esac
+      done
+      ;;
+    script)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          -c | --command) f_runner_string "${a[j + 1]-}" "$tool"; return 0 ;;
+          -F | -t | -T | -I | -O | -B | -E | -m) j=$((j + 2)) ;;
+          -*) j=$((j + 1)) ;;
+          *) [ $((j + 1)) -lt "$n" ] && inner=$((j + 1)); break ;;
+        esac
+      done
+      ;;
+    su)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -c | --command) f_runner_string "${a[j + 1]-}" "$tool"; return 0 ;; esac
+        j=$((j + 1))
+      done
+      return 0
+      ;;
+    osascript)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -e) s="$s ${a[j + 1]-}"; j=$((j + 2)) ;; *) j=$((j + 1)) ;; esac
+      done
+      [ -n "$s" ] && f_runner_string "$s" "$tool"
+      return 0
+      ;;
+    watch)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          -n | -d | --interval | -q | --chgexit) j=$((j + 2)) ;;
+          -*) j=$((j + 1)) ;;
+          *) inner=$j; break ;;
+        esac
+      done
+      if [ "$inner" -ge 0 ]; then
+        k=$inner
+        while [ "$k" -lt "$n" ]; do s="$s ${a[k]}"; k=$((k + 1)); done
+        f_runner_string "$s" "$tool"
+        return 0
+      fi
+      ;;
+    parallel)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          -j | -S | --jobs | --sshlogin) j=$((j + 2)) ;;
+          ':::'*) break ;;
+          -*) j=$((j + 1)) ;;
+          *) inner=$j; break ;;
+        esac
+      done
+      ;;
+    flock)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in
+          -c | --command) f_parse_text "${a[j + 1]-}" 0; return 0 ;;
+          -w | -E | --timeout | --conflict-exit-code) j=$((j + 2)) ;;
+          -*) j=$((j + 1)) ;;
+          *) inner=$((j + 1)); break ;;
+        esac
+      done
+      ;;
+    *)
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -*) j=$((j + 1)) ;; *) inner=$j; break ;; esac
+      done
+      ;;
+  esac
+  [ "$inner" -ge 0 ] && [ "$inner" -lt "$n" ] || return 0
+  nm=${a[inner]}
+  case $nm in *claude-code*) deny nested-claude "$M_CLAUDE" ;; esac
+  f_lc "${nm##*/}"
+  case $tool in
+    xargs | find | parallel | watch | script | su | osascript)
+      f_is_sensitive_name "$REPLY" && deny disguised "a command runner ($tool) around $REPLY. $M_DISGUISED"
+      if f_is_shell "$REPLY" || f_is_interp "$REPLY"; then
+        f_disg "a command runner ($tool) runs a shell or interpreter."
+      fi
+      ;;
+  esac
+  f_subcommand_words "$inner"
+}
+
+f_runner_string() {
+  # a command string given to a runner: around a sensitive tool it's a disguise
+  if f_mentions "$1"; then
+    deny disguised "a command runner ($2) around a sensitive command. $M_DISGUISED"
+  fi
+  f_parse_text "$1" 0
+}
+
+# ------------------------------------------------------------ shells and interpreters
+
+f_shell() {
+  # bash/sh/zsh...: a -c string is analysed; a file is scanned; a program read from stdin
+  # (here-doc, pipe, redirection, process substitution) is checked
+  local i=$1 sh=$2 j w g hasc=0 file stdin=0
+  j=$((i + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    case $w in
+      --) j=$((j + 1)); break ;;
+      -o | +o | -O | +O | --rcfile | --init-file) j=$((j + 2)) ;;
+      --*) j=$((j + 1)) ;;
+      -?* | +?*)
+        g=${w#?}
+        case $g in *c*) hasc=1 ;; esac
+        case $g in *s*) stdin=1 ;; esac
+        j=$((j + 1))
+        ;;
+      *) break ;;
+    esac
+  done
+  if [ "$hasc" = 1 ]; then
+    case ${a[j]-} in *$'\001'*) f_decode_feed ;; esac
+    f_parse_text "${a[j]-}" 0
+    return 0
+  fi
+  if [ "$stdin" = 0 ] && [ "$j" -lt "$n" ]; then
+    file=${a[j]}
+    case ${af[j]} in *p*) f_decode_feed; f_disg "a shell runs a process substitution."; return 0 ;; esac
+    case $file in
+      /dev/stdin | /dev/fd/* | -) stdin=1 ;;
+      *$'\001'*) f_disg "a shell runs a dynamic path."; return 0 ;;
+    esac
+    if [ "$stdin" = 0 ]; then
+      # ops/flag run through a shell is still ops/flag
+      case $file in ops/flag | */ops/flag) f_prod "$j" ;; esac
+      f_scan_file "$file" sh
+      return 0
+    fi
+  fi
+  f_stdin_code "$sh" shell
+}
+
+f_stdin_code() {
+  # the program text comes from stdin: here-doc/here-string, a redirected file, a pipe
+  local prog=$1 lang=$2 k=0 t tf f rest
+  if [ -n "$CHD" ]; then
+    if [ "$lang" = shell ]; then f_parse_text "$CHD" 0; else f_code_check "$CHD" "$prog" inline; fi
+  fi
+  while [ "$k" -lt "${#CRI[@]}" ]; do
+    t=${CRI[k]}
+    tf=${CRIF[k]}
+    k=$((k + 1))
+    case $tf in
+      *h*) continue ;;
+      *p*) f_decode_feed; f_disg "$prog reads its program from a process substitution."; continue ;;
+    esac
+    case $t in *$'\001'*) f_disg "$prog reads a dynamic file."; continue ;; esac
+    if [ "$lang" = shell ]; then f_scan_file "$t" sh; else f_scan_file "$t" "$prog"; fi
+  done
+  if [ "$C_PIPEIN" = 1 ]; then
+    f_decode_feed
+    f_disg "a pipe into $prog."
+    if [ "$C_PIPESRC" != ok ]; then
+      deny disguised "the code piped into $prog comes from a program, so it can't be checked. Run the commands plainly. $M_DISGUISED"
+    fi
+    if [ -n "$PREV_CAT_BODY" ]; then
+      if [ "$lang" = shell ]; then f_parse_text "$PREV_CAT_BODY" 0; else f_code_check "$PREV_CAT_BODY" "$prog" inline; fi
+    fi
+    rest=$PREV_CAT
+    while [ -n "$rest" ]; do
+      f=${rest%%$'\n'*}
+      rest=${rest#*$'\n'}
+      [ -n "$f" ] || continue
+      if [ "$lang" = shell ]; then f_scan_file "$f" sh; else f_scan_file "$f" "$prog"; fi
+    done
+  fi
+  return 0
+}
+
+f_interp() {
+  local i=$1 prog=$2 j w g tail code='' file='' havecode=0 stdin=0
+  j=$((i + 1))
+  case $prog in
+    python* | pypy*)
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        case $w in
+          -c) code=${a[j + 1]-}; havecode=1; break ;;
+          -c?*) code=${w#-c}; havecode=1; break ;;
+          -m) return 0 ;;
+          -W | -X | -Q) j=$((j + 2)) ;;
+          -) stdin=1; break ;;
+          --) j=$((j + 1)); file=${a[j]-}; break ;;
+          -*) j=$((j + 1)) ;;
+          *) file=$w; break ;;
+        esac
+      done
+      ;;
+    node | nodejs | bun | deno)
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        case $w in
+          -e | --eval | -p | --print) code=${a[j + 1]-}; havecode=1; break ;;
+          --eval=* | --print=*) code=${w#*=}; havecode=1; break ;;
+          eval)
+            if [ "$prog" = deno ]; then code=${a[j + 1]-}; havecode=1; else file=$w; fi
+            break
+            ;;
+          run | x)
+            if [ "$prog" = deno ] || [ "$prog" = bun ]; then j=$((j + 1)); continue; fi
+            file=$w
+            break
+            ;;
+          -r | --require | --import | --loader | --input-type | --env-file | -C | --conditions) j=$((j + 2)) ;;
+          -) stdin=1; break ;;
+          -*) j=$((j + 1)) ;;
+          *) file=$w; break ;;
+        esac
+      done
+      ;;
+    ruby | perl | perl5*)
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        case $w in
+          -e | -E) code="$code ${a[j + 1]-}"; havecode=1; j=$((j + 2)) ;;
+          -r | -I | -C | -M | -m | -x) j=$((j + 2)) ;;
+          --)
+            j=$((j + 1))
+            [ "$havecode" = 0 ] && file=${a[j]-}
+            break
+            ;;
+          -) stdin=1; break ;;
+          -?*)
+            g=${w#-}
+            case $g in
+              *[eE]*)
+                tail=${g#*[eE]}
+                if [ -n "$tail" ]; then
+                  code="$code $tail"
+                  j=$((j + 1))
+                else
+                  code="$code ${a[j + 1]-}"
+                  j=$((j + 2))
+                fi
+                havecode=1
+                ;;
+              *) j=$((j + 1)) ;;
+            esac
+            ;;
+          *)
+            [ "$havecode" = 0 ] && file=$w
+            break
+            ;;
+        esac
+      done
+      ;;
+    php | php[0-9]*)
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        case $w in
+          -r) code=${a[j + 1]-}; havecode=1; break ;;
+          -f) file=${a[j + 1]-}; break ;;
+          -d | -c | -z) j=$((j + 2)) ;;
+          -*) j=$((j + 1)) ;;
+          *) file=$w; break ;;
+        esac
+      done
+      ;;
+    awk | gawk | nawk | mawk)
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        case $w in
+          -f) file=${a[j + 1]-}; break ;;
+          -v | -F) j=$((j + 2)) ;;
+          -*) j=$((j + 1)) ;;
+          *) code=$w; havecode=1; break ;;
+        esac
+      done
+      if [ "$havecode" = 1 ]; then
+        if f_mentions "$code"; then
+          case $code in *'system('* | *'|'* | *getline*) deny script-scan "an awk program starts a sensitive tool. Run the command plainly instead." ;; esac
+        fi
+        f_code_check "$code" awk inline
+      fi
+      [ -n "$file" ] && f_scan_file "$file" awk
+      return 0
+      ;;
+    *)
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        case $w in
+          -e | -c) code=${a[j + 1]-}; havecode=1; break ;;
+          -*) j=$((j + 1)) ;;
+          *) file=$w; break ;;
+        esac
+      done
+      ;;
+  esac
+  if [ "$havecode" = 1 ]; then
+    case $code in *$'\001'*) f_decode_feed ;; esac
+    f_code_check "$code" "$prog" inline
+    return 0
+  fi
+  if [ -n "$file" ] && [ "$stdin" = 0 ]; then
+    case $file in
+      /dev/stdin | /dev/fd/*) stdin=1 ;;
+      *$'\001'*) f_disg "$prog runs a dynamic path."; return 0 ;;
+    esac
+    if [ "$stdin" = 0 ]; then
+      f_scan_file "$file" "$prog"
+      return 0
+    fi
+  fi
+  f_stdin_code "$prog" code
+}
+
+# needles for protected paths named in non-shell code (whole-token checks follow)
+F_CODE_NEEDLES=(.claude .mcp.json .git/config .git/hooks "'.git'" '".git"' .env.prod production.env .ssh/ hosts.yml .git-credentials .netrc .config/gh .config/team .config/git .gitconfig .zshrc .zshenv .zprofile .bashrc .bash_profile .curlrc .wgetrc .github/workflows)
+
+f_code_paths() {
+  # protected paths named in code $1 ($2 = inline|file): find each needle, take the path
+  # token around it (bounded), and classify it. Linear: no tokenising of the whole text.
+  local code=$1 how=$2 needle rest pre left right head tok k=0 count
+  while [ "$k" -lt "${#F_CODE_NEEDLES[@]}" ]; do
+    needle=${F_CODE_NEEDLES[k]}
+    k=$((k + 1))
+    rest=$code
+    count=0
+    while :; do
+      case $rest in *"$needle"*) ;; *) break ;; esac
+      count=$((count + 1))
+      if [ "$count" -gt 300 ]; then
+        deny script-scan "${F_SCAN_LABEL:-the code} names protected-looking paths too often to check. Run the needed steps directly."
+      fi
+      pre=${rest%%"$needle"*}
+      if [ "${#pre}" -gt 256 ]; then left=${pre:${#pre}-256}; else left=$pre; fi
+      left=${left##*[!A-Za-z0-9_.\/~+@-]}
+      rest=${rest:${#pre}}
+      head=${rest:0:512}
+      rest=${rest:${#needle}}
+      case $needle in
+        *[\'\"]*) tok=.git ;;
+        *)
+          right=${head%%[!A-Za-z0-9_.\/~+@-]*}
+          tok=$left$right
+          ;;
+      esac
+      # shellcheck disable=SC2088 # a literal ~ pattern on purpose
+      case $tok in '~' | '~/'*) tok=$F_HOME${tok#\~} ;; esac
+      f_path_kinds "$tok" ""
+      [ -n "$PK" ] || continue
+      if [ "$how" = inline ]; then
+        f_has_kind fence && deny fence-file "$M_FENCE"
+        f_has_kind workflow && deny workflow-edit "$M_WORKFLOW"
+        f_has_kind cred && deny credential-read "$M_CRED"
+        f_has_kind sshcfg && deny ssh-form "$M_SSH_FORM"
+        f_has_kind gitcfg && deny git-config "$M_GIT_CONFIG"
+        f_has_kind curlcfg && deny curl-github-write "$M_CURL"
+        f_has_kind shellrc && deny disguised "$M_RC"
+      else
+        deny script-scan "$F_SCAN_LABEL names a protected path ($tok). Run the needed steps directly so each can be checked."
+      fi
+    done
+  done
+  return 0
+}
+
+F_RE_METHOD='(^|[^A-Za-z0-9_-])(post|put|patch|delete)([^A-Za-z0-9_-]|$)'
+
+f_code_check() {
+  # non-shell code $1 in language $2, inline (-c/-e, here-doc) or from a scanned file
+  local code=$1 lang=$2 how=$3 spawn=0
+  f_code_paths "$code" "$how"
+  case $code in
+    *subprocess* | *os.system* | *os.popen* | *os.exec* | *os.spawn* | *pty.spawn* | *child_process* | *execSync* | *spawnSync* | *execFile* | *'exec('* | *'spawn('* | *'system('* | *popen* | *shell_exec* | *passthru* | *proc_open* | *Open3* | *Deno.run* | *Deno.Command* | *Bun.spawn* | *ProcessBuilder* | *Runtime.getRuntime*) spawn=1 ;;
+  esac
+  case $lang in
+    ruby | perl | perl5* | php | php[0-9]* | unknown)
+      case $code in *'`'* | *'%x('* | *'%x{'* | *'%x['* | *'qx('* | *'qx{'* | *'qx/'* | *'qx '*) spawn=1 ;; esac
+      ;;
+  esac
+  if [ "$spawn" = 1 ] && f_mentions "$code"; then
+    [ "$how" = inline ] && deny script-scan "inline $lang code starts a sensitive tool (git/gh/ssh/curl...). Run the command plainly instead."
+    deny script-scan "$F_SCAN_LABEL starts a sensitive tool (git/gh/ssh/curl...) from code. Run the command plainly instead."
+  fi
+  shopt -s nocasematch
+  case $code in
+    *api.github.com*)
+      if [[ $code =~ $F_RE_METHOD ]]; then
+        shopt -u nocasematch
+        [ "$how" = inline ] && deny script-scan "inline $lang code sends a write to the GitHub API. Use team-gh."
+        deny script-scan "$F_SCAN_LABEL sends a write to the GitHub API. Use team-gh."
+      fi
+      ;;
+  esac
+  shopt -u nocasematch
+  return 0
+}
+
+f_read_file() {
+  # f_read_file <abs path>: REPLY = content (up to 512 KB); 1 if missing or unreadable
+  local content=
+  [ -f "$1" ] && [ -r "$1" ] || return 1
+  IFS= read -r -d '' -n 524288 content <"$1" 2>/dev/null
+  REPLY=$content
+  return 0
+}
+
+f_scan_file() {
+  # f_scan_file <path word> <sh|exec|interpreter>: scan a file one level deep before it runs
+  local w=$1 kind=$2 p content first lang interp ib
+  [ "$F_SCAN_DEPTH" -ge 1 ] && return 0
+  case $w in *$'\001'*) return 0 ;; esac
+  f_resolve "$w"
+  p=$REPLY
+  case $p in $'\001'*) return 0 ;; esac
+  if [ -n "$F_PLUGIN_BIN" ]; then
+    case $p in "$F_PLUGIN_BIN"/*) return 0 ;; esac
+  fi
+  f_read_file "$p" || return 0
+  content=$REPLY
+  [ -n "$content" ] || return 0
+  first=${content%%$'\n'*}
+  lang=$kind
+  if [ "$kind" = exec ]; then
+    case $first in
+      '#!'*)
+        interp=${first#\#!}
+        interp=${interp#"${interp%%[! ]*}"}
+        ib=${interp%% *}
+        ib=${ib##*/}
+        if [ "$ib" = env ]; then
+          interp=${interp#* }
+          while :; do
+            case $interp in -S\ * | -i\ * | -\ * | -[a-zA-Z]\ *) interp=${interp#* } ;; *) break ;; esac
+          done
+          ib=${interp%% *}
+          ib=${ib##*/}
+        fi
+        f_lc "$ib"
+        if f_is_shell "$REPLY"; then lang='sh'; else lang=${REPLY:-unknown}; fi
+        ;;
+      *)
+        # no interpreter line: text runs as a shell script; a binary isn't scanned
+        case $first in *[$'\001'-$'\010'$'\016'-$'\037'$'\177']*) return 0 ;; esac
+        lang='sh'
+        ;;
+    esac
+  fi
+  local save_ctx=$F_SCAN_CTX save_label=$F_SCAN_LABEL save_depth=$F_SCAN_DEPTH save_m=$G_MENTION save_d=$G_DISG save_w=$G_WORDS save_e=$G_SENS_EXPORT
+  F_SCAN_LABEL="the script $w"
+  F_SCAN_DEPTH=1
+  if [ "$lang" = sh ]; then
+    F_SCAN_CTX=$F_SCAN_LABEL
+    G_MENTION=0
+    f_mentions "$content" && G_MENTION=1
+    G_DISG=
+    G_WORDS=
+    G_SENS_EXPORT=0
+    f_parse_text "$content" 0
+    f_disg_final
+  else
+    f_code_check "$content" "$lang" file
+  fi
+  F_SCAN_CTX=$save_ctx F_SCAN_LABEL=$save_label F_SCAN_DEPTH=$save_depth G_MENTION=$save_m G_DISG=$save_d G_WORDS=$save_w G_SENS_EXPORT=$save_e
+  return 0
+}
+
+# ------------------------------------------------------------ make
+
+f_make() {
+  local i=$1 j w dir=$VCWD file='' mf='' content
+  local -a targets vars
+  targets=() vars=()
+  j=$((i + 1))
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    j=$((j + 1))
+    case $w in
+      -C | --directory) f_resolve "${a[j]-}" "$dir"; dir=$REPLY; j=$((j + 1)) ;;
+      -C?*) f_resolve "${w#-C}" "$dir"; dir=$REPLY ;;
+      --directory=*) f_resolve "${w#*=}" "$dir"; dir=$REPLY ;;
+      -f | --file | --makefile) file=${a[j]-}; j=$((j + 1)) ;;
+      -f?*) file=${w#-f} ;;
+      --file=* | --makefile=*) file=${w#*=} ;;
+      --eval) f_mentions "${a[j]-}" && deny script-scan "make --eval runs a sensitive command. Run it plainly."; j=$((j + 1)) ;;
+      --eval=*) f_mentions "$w" && deny script-scan "make --eval runs a sensitive command. Run it plainly." ;;
+      -I | -j | -l | -o | -W | --include-dir | --jobs | --load-average | --old-file | --what-if | --assume-old | --assume-new) j=$((j + 1)) ;;
+      -*) ;;
+      *=*) vars+=("$w") ;;
+      *) targets+=("$w") ;;
+    esac
+  done
+  [ "$F_SCAN_DEPTH" -ge 1 ] && return 0
+  case $dir in '' | *$'\001'*) return 0 ;; esac
+  if [ -n "$file" ]; then
+    f_resolve "$file" "$dir"
+    mf=$REPLY
+  else
+    for w in GNUmakefile makefile Makefile; do
+      [ -f "$dir/$w" ] && { mf=$dir/$w; break; }
+    done
+  fi
+  [ -n "$mf" ] || return 0
+  f_read_file "$mf" || return 0
+  content=$REPLY
+  local save_ctx=$F_SCAN_CTX save_label=$F_SCAN_LABEL save_depth=$F_SCAN_DEPTH save_m=$G_MENTION save_d=$G_DISG save_w=$G_WORDS save_cwd=$VCWD save_e=$G_SENS_EXPORT
+  F_SCAN_LABEL="the make recipe in ${mf##*/}"
+  F_SCAN_CTX=$F_SCAN_LABEL
+  F_SCAN_DEPTH=1
+  VCWD=$dir
+  f_make_scan "$content" ${targets[@]+"${targets[@]}"} -- ${vars[@]+"${vars[@]}"}
+  F_SCAN_CTX=$save_ctx F_SCAN_LABEL=$save_label F_SCAN_DEPTH=$save_depth G_MENTION=$save_m G_DISG=$save_d G_WORDS=$save_w VCWD=$save_cwd G_SENS_EXPORT=$save_e
+  return 0
+}
+
+f_make_expand() {
+  # expand make references in $1 into REPLY: known simple variables, $(MAKE), $$ -> $;
+  # $(shell ...) is queued for analysis; anything else -> \001
+  local s=$1 out='' depth body c k found open close chunk
+  while [ -n "$s" ]; do
+    # shellcheck disable=SC2016 # literal $( ${ patterns on purpose
+    case $s in
+      '$$'*) out=$out\$; s=${s:2} ;;
+      '$('* | '${'*)
+        open=${s:1:1}
+        close=')'
+        [ "$open" = '{' ] && close='}'
+        s=${s:2}
+        depth=1
+        body=
+        while [ -n "$s" ]; do
+          c=${s:0:1}
+          s=${s:1}
+          if [ "$c" = "$open" ]; then
+            depth=$((depth + 1))
+          elif [ "$c" = "$close" ]; then
+            depth=$((depth - 1))
+            [ "$depth" = 0 ] && break
+          fi
+          body=$body$c
+        done
+        case $body in
+          'shell '*) MK_SHELL+=("${body#shell }"); out=$out$'\001' ;;
+          MAKE) out=${out}make ;;
+          *[!A-Za-z0-9_.-]*) out=$out$'\001' ;;
+          *)
+            found=0
+            k=0
+            while [ "$k" -lt "${#MK_VN[@]}" ]; do
+              if [ "${MK_VN[k]}" = "$body" ]; then
+                found=1
+                out=$out${MK_VV[k]}
+              fi
+              k=$((k + 1))
+            done
+            [ "$found" = 1 ] || out=$out$'\001'
+            ;;
+        esac
+        ;;
+      \$?*) out=$out$'\001'; s=${s:2} ;;
+      *)
+        chunk=${s%%\$*}
+        [ -n "$chunk" ] || chunk=$s
+        out=$out$chunk
+        s=${s:${#chunk}}
+        ;;
+    esac
+  done
+  REPLY=$out
+}
+
+f_make_scan() {
+  # f_make_scan <content> [targets...] -- [VAR=value...]
+  local content=$1
+  shift
+  local -a targets cmdvars MK_VN MK_VV MK_T MK_P MK_R MK_SHELL
+  targets=() cmdvars=() MK_VN=() MK_VV=() MK_T=() MK_P=() MK_R=() MK_SHELL=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do targets+=("$1"); shift; done
+  [ $# -gt 0 ] && shift
+  while [ $# -gt 0 ]; do cmdvars+=("$1"); shift; done
+  local line cur='' default='' k tl lhs pre_eq pre_colon vname vval tgts prq recipe t1 in_define=0
+  # variables from the command line win (they are added last, so they override)
+  local cont=''
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    # a trailing backslash continues the line
+    case $line in
+      *\\)
+        cont="$cont${line%\\} "
+        continue
+        ;;
+    esac
+    line=$cont$line
+    cont=''
+    if [ "$in_define" = 1 ]; then
+      case $line in endef*) in_define=0 ;; esac
+      continue
+    fi
+    case $line in
+      $'\t'*)
+        [ -n "$cur" ] && MK_R+=("$cur"$'\037'"${line#$'\t'}")
+        continue
+        ;;
+      '' | '#'*) continue ;;
+      define\ * | 'override define '*) in_define=1; cur=; continue ;;
+      include\ * | -include\ * | sinclude\ * | ifeq* | ifneq* | ifdef* | ifndef* | else* | endif* | unexport\ * | vpath*) cur=; continue ;;
+    esac
+    tl=${line#override }
+    tl=${tl#export }
+    pre_eq=${tl%%=*}
+    pre_colon=${tl%%:*}
+    case $tl in
+      *=*)
+        if [ "${#pre_eq}" -lt "${#pre_colon}" ] || [ "$pre_colon" = "$tl" ]; then
+          lhs=$pre_eq
+        else
+          case ${tl:${#pre_colon}} in
+            ':='* | '::='*) lhs=$pre_colon ;;
+            *) lhs= ;;
+          esac
+        fi
+        if [ -n "$lhs" ]; then
+          vval=${tl#"$lhs"}
+          case $lhs in *'!') vname=${lhs%!}; vval=${tl#*'!='}; MK_SHELL+=("$vval"); cur=; continue ;; esac
+          vname=${lhs%[?+:]}
+          vname=${vname%:}
+          vname=${vname%"${vname##*[! ]}"}
+          vname=${vname#"${vname%%[! ]*}"}
+          vval=${vval#*=}
+          vval=${vval#"${vval%%[! ]*}"}
+          MK_VN+=("$vname")
+          MK_VV+=("$vval")
+          cur=
+          continue
+        fi
+        ;;
+    esac
+    case $tl in
+      *:*)
+        tgts=${tl%%:*}
+        prq=${tl#*:}
+        prq=${prq#:}
+        recipe=
+        case $prq in *';'*) recipe=${prq#*;}; prq=${prq%%;*} ;; esac
+        case $prq in *=*) prq= ;; esac
+        cur=$tgts
+        MK_T+=("$tgts")
+        MK_P+=("$prq")
+        if [ -z "$default" ]; then
+          for t1 in $tgts; do
+            case $t1 in .* | *%*) ;; *) default=$t1; break ;; esac
+          done
+        fi
+        [ -n "$recipe" ] && MK_R+=("$cur"$'\037'"$recipe")
+        ;;
+      *) cur= ;;
+    esac
+  done <<MKEOF
+$content
+MKEOF
+  k=0
+  while [ "$k" -lt "${#cmdvars[@]}" ]; do
+    MK_VN+=("${cmdvars[k]%%=*}")
+    MK_VV+=("${cmdvars[k]#*=}")
+    k=$((k + 1))
+  done
+  [ "${#targets[@]}" -gt 0 ] || { [ -n "$default" ] && targets=("$default"); }
+  # resolve variable values once; $(shell ...) in them runs whenever make reads the file
+  k=0
+  while [ "$k" -lt "${#MK_VV[@]}" ]; do
+    case ${MK_VV[k]} in *'$'*) f_make_expand "${MK_VV[k]}"; MK_VV[k]=$REPLY ;; esac
+    k=$((k + 1))
+  done
+  # the targets that run: the requested ones and their prerequisites
+  local todo=" ${targets[*]+${targets[*]}} " done_=" " t p q r rt rl runs guard=0 save_cwd
+  while :; do
+    guard=$((guard + 1))
+    [ "$guard" -gt 500 ] && break
+    t=
+    for q in $todo; do
+      case $done_ in *" $q "*) ;; *) t=$q; break ;; esac
+    done
+    [ -n "$t" ] || break
+    done_="$done_$t "
+    k=0
+    while [ "$k" -lt "${#MK_T[@]}" ]; do
+      case " ${MK_T[k]} " in
+        *" $t "*)
+          f_make_expand "${MK_P[k]}"
+          for p in $REPLY; do
+            case $p in *$'\001'* | '|') ;; *) todo="$todo$p " ;; esac
+          done
+          ;;
+      esac
+      k=$((k + 1))
+    done
+  done
+  # each recipe line of those targets goes through the same analysis
+  k=0
+  while [ "$k" -lt "${#MK_R[@]}" ]; do
+    r=${MK_R[k]}
+    k=$((k + 1))
+    rt=${r%%$'\037'*}
+    rl=${r#*$'\037'}
+    runs=0
+    for t in $rt; do
+      case $done_ in *" $t "*) runs=1 ;; esac
+    done
+    [ "$runs" = 1 ] || continue
+    while :; do
+      case $rl in [@+-]* | ' '* | $'\t'*) rl=${rl:1} ;; *) break ;; esac
+    done
+    f_make_expand "$rl"
+    rl=$REPLY
+    G_MENTION=0
+    f_mentions "$rl" && G_MENTION=1
+    G_DISG='' G_WORDS='' G_SENS_EXPORT=0
+    save_cwd=$VCWD
+    f_parse_text "$rl" 0
+    VCWD=$save_cwd
+    f_disg_final
+  done
+  k=0
+  while [ "$k" -lt "${#MK_SHELL[@]}" ]; do
+    rl=${MK_SHELL[k]}
+    k=$((k + 1))
+    f_make_expand "$rl"
+    rl=$REPLY
+    G_MENTION=0
+    f_mentions "$rl" && G_MENTION=1
+    G_DISG='' G_WORDS='' G_SENS_EXPORT=0
+    f_parse_text "$rl" 0
+    f_disg_final
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ post-check and review agents
+
+f_post_check() {
+  # team-post-check <sha> <context> <state> <description>: only the matching review agent
+  local j=$(($1 + 1)) pos=0 w given=
+  if [ -z "$AG_CTX" ] || [ -n "$F_SCAN_CTX" ]; then
+    deny post-check-agent "$M_POST_CHECK"
+  fi
+  while [ "$j" -lt "$n" ]; do
+    w=${a[j]}
+    case $w in
+      --target-url) j=$((j + 2)); continue ;;
+      -*) j=$((j + 1)); continue ;;
+    esac
+    pos=$((pos + 1))
+    if [ "$pos" = 2 ]; then
+      given=$w
+      f_word_is_dynamic "${af[j]}" && given=
+      break
+    fi
+    j=$((j + 1))
+  done
+  [ "$given" = "$AG_CTX" ] || deny post-check-agent "$M_POST_CHECK"
+  return 0
+}
+
+f_agent_git() {
+  local i=$1 j w listing=0 pos=0
+  f_git_sub "$i"
+  case $GSUB in
+    status | diff | log | show | rev-parse | ls-files | ls-tree | cat-file | blame | describe | merge-base | shortlog | grep | fetch | for-each-ref | rev-list | name-rev | check-ignore | show-ref | '') return 0 ;;
+    branch)
+      j=$((GSUB_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        w=${a[j]}
+        j=$((j + 1))
+        case $w in
+          -a | -r | -l | --list | -v | -vv | --verbose | --show-current | --all | --remotes | --contains | --no-contains | --merged | --no-merged | --points-at | --sort=* | --format=* | --column* | --no-column | --color* | --no-color | -i | --ignore-case | --abbrev=* | --no-abbrev) listing=1 ;;
+          --sort | --format) listing=1; j=$((j + 1)) ;;
+          -*) return 1 ;;
+          *) pos=$((pos + 1)) ;;
+        esac
+      done
+      [ "$pos" = 0 ] || [ "$listing" = 1 ]
+      return
+      ;;
+    remote)
+      case ${a[GSUB_I + 1]-} in '' | -v | --verbose | show | get-url) return 0 ;; esac
+      return 1
+      ;;
+    config)
+      j=$((GSUB_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in --get | --get-all | --get-regexp | -l | --list | get | list) return 0 ;; esac
+        j=$((j + 1))
+      done
+      [ $((GSUB_I + 2)) = "$n" ] && return 0
+      return 1
+      ;;
+    worktree)
+      [ "${a[GSUB_I + 1]-}" = list ] && return 0
+      return 1
+      ;;
+    symbolic-ref)
+      j=$((GSUB_I + 1))
+      while [ "$j" -lt "$n" ]; do
+        case ${a[j]} in -*) ;; *) pos=$((pos + 1)) ;; esac
+        j=$((j + 1))
+      done
+      [ "$pos" -le 1 ]
+      return
+      ;;
+  esac
+  return 1
+}
+
+f_agent_bash() {
+  # review agents: plain readers, read-only git and gh, team-post-check (checked separately)
+  # and their listed extras; everything else is agent-bash
+  local i=$1 ok=0 I0=$1
+  case $lname in
+    team-post-check) return 0 ;;
+    cd | pwd | echo | printf | true | false | sort | uniq | cut | tr | '[[') ok=1 ;;
+    git) f_agent_git "$i" && ok=1 ;;
+    gh | team-gh)
+      f_gh_positionals "$i"
+      if [ "$GHG" = api ]; then
+        f_gh_api_write || ok=1
+      elif [ -z "$GHG" ] || f_gh_is_read; then
+        ok=1
+      fi
+      if [ "$ok" = 0 ] && [ "$lname" = team-gh ]; then
+        case "$AG_KIND $GHG $GHS" in
+          'reviewer pr comment' | 'security pr comment' | 'reviewer pr review' | 'security pr review') ok=1 ;;
+          'health issue create' | 'health issue list') ok=1 ;;
+        esac
+      fi
+      ;;
+    team-app)
+      if [ "$AG_KIND" = qa ]; then
+        case ${a[i + 1]-} in up | down | status) ok=1 ;; esac
+      fi
+      ;;
+    make | gmake)
+      if [ "$n" = $((i + 2)) ]; then
+        case "$AG_KIND ${a[i + 1]}" in 'qa e2e' | 'health audit') ok=1 ;; esac
+      fi
+      ;;
+    curl)
+      if [ "$AG_KIND" = qa ]; then
+        f_curl "$i" curl
+        [ "$CURL_LOCAL_GET" = 1 ] && ok=1
+      fi
+      ;;
+    *)
+      f_is_plain_read "$i" "$lname" && ok=1
+      ;;
+  esac
+  [ "$ok" = 1 ] && return 0
+  deny agent-bash "${T_AGENT#team:} is a read-only review agent: it may run plain readers, read-only git and gh, team-post-check for its own status and its listed extras. Report what you need instead of working around it."
+}
+
+# ============================================================ tools
+
+f_command_tool() {
+  VCWD=$T_CWD
+  G_MENTION=0
+  f_mentions "$T_CMD" && G_MENTION=1
+  G_DISG=
+  G_WORDS=
+  G_SENS_EXPORT=0
+  G_DECODE=0
+  P_S=$T_CMD
+  P_R=''
+  f_parse_seq '' 0
+  f_disg_final
+}
+
+f_file_tool() {
+  local p=$1
+  [ -n "$p" ] || return 0
+  # shellcheck disable=SC2088 # a literal ~ pattern on purpose
+  case $p in '~' | '~/'*) p=$F_HOME${p#\~} ;; esac
+  f_resolve "$p" "${T_CWD:-/}"
+  f_kind_literal "$REPLY"
+  case $FK in
+    fence) deny fence-file "$M_FENCE" ;;
+    workflow) deny workflow-edit "$M_WORKFLOW" ;;
+    cred) deny credential-read "$M_CRED" ;;
+    sshcfg) deny ssh-form "$M_SSH_FORM" ;;
+    gitcfg) deny git-config "$M_GIT_CONFIG" ;;
+    curlcfg) deny curl-github-write "$M_CURL" ;;
+    shellrc) deny disguised "$M_RC" ;;
+  esac
+  return 0
+}
+
+f_read_tool() {
+  # credentials read through the file tools
+  local p=$1
+  [ -n "$p" ] || return 0
+  # shellcheck disable=SC2088 # a literal ~ pattern on purpose
+  case $p in '~' | '~/'*) p=$F_HOME${p#\~} ;; esac
+  f_resolve "$p" "${T_CWD:-/}"
+  f_kind_literal "$REPLY"
+  [ "$FK" = cred ] && deny credential-read "$M_CRED"
+  return 0
+}
+
+# ============================================================ main
+
+fence_start_watchdog
+
+FENCE_IN=$(jq -rn '
+  def s: if . == null then "" elif type == "string" then . else error("bad field") end;
+  [inputs] | if length != 1 then error("exactly one JSON value expected") else .[0] end
+  | if type != "object" then error("not an object") else . end
+  | (.tool_input // {}) as $ti
+  | if ($ti | type) != "object" then error("tool_input is not an object") else . end
+  | if (.tool_name | type) != "string" or .tool_name == "" then error("tool_name missing") else . end
+  | if ($ti | has("command")) and (($ti.command | type) != "string") then error("command is not a string") else . end
+  | [ "T_TOOL=" + (.tool_name | @sh),
+      "T_HASCMD=" + (if ($ti | has("command")) then "1" else "0" end),
+      "T_CMD=" + ($ti.command // "" | s | @sh),
+      "T_FILE=" + ($ti.file_path // "" | s | @sh),
+      "T_NB=" + ($ti.notebook_path // "" | s | @sh),
+      "T_PATH=" + ($ti.path // "" | if type == "string" then . else "" end | @sh),
+      "T_CWD=" + (.cwd // "" | s | @sh),
+      "T_AGENT=" + (.agent_type // "" | s | @sh),
+      "T_AGENTID=" + (.agent_id // "" | tostring | @sh),
+      "T_NUL=" + (if ([$ti[]? | strings | test("\u0000")] | any) then "1" else "0" end)
+    ] | join("\n")
+' 2>/dev/null)
+fence_jq_status=$?
+
+if [ "$fence_jq_status" = 127 ]; then
+  fence_error internal-error "jq is not installed or not on PATH, so the fence can't read the call; it is blocked."
+fi
+if [ "$fence_jq_status" != 0 ] || [ -z "$FENCE_IN" ]; then
+  fence_error malformed-input "the hook input is not a valid PreToolUse JSON object, so the call is blocked."
+fi
+eval "$FENCE_IN"
+[ -n "$T_AGENT" ] && FENCE_AGENT=$T_AGENT
+if [ "$T_NUL" = 1 ]; then
+  fence_error malformed-input "the tool input contains a NUL byte, so the call is blocked."
+fi
+[ -n "$T_CWD" ] || T_CWD=${PWD:-/}
+case $T_CWD in /*) ;; *) T_CWD=${PWD:-/}/$T_CWD ;; esac
+
+if [ "$T_HASCMD" = 1 ]; then
+  FENCE_TEXT=$T_CMD
+else
+  case $T_TOOL in
+    Write | Edit | MultiEdit | Read | Grep | Glob | LS) FENCE_TEXT=${T_FILE:-${T_PATH:-$T_TOOL}} ;;
+    NotebookEdit | NotebookRead) FENCE_TEXT=${T_NB:-${T_FILE:-$T_TOOL}} ;;
+    *) FENCE_TEXT=$T_TOOL ;;
+  esac
+fi
+
+fence_decide() {
+if [ "${TEAM_FENCE_TEST_FAULT:-}" = 1 ]; then
+  # simulate a crash: the EXIT trap must turn it into an error-deny
+  exit 70
+fi
+case ${TEAM_FENCE_TEST_DELAY:-} in
+  '' | *[!0-9]*) ;;
+  *) sleep "$TEAM_FENCE_TEST_DELAY" ;;
+esac
+
+if [ -n "$F_HOME" ]; then
+  f_norm "$F_HOME"
+  F_HOME=$REPLY
+fi
+f_lc "$F_HOME"
+F_LHOME=$REPLY
+[ -n "$F_LHOME" ] || F_LHOME=/nonexistent-home
+f_norm "$F_CFGDIR"
+f_lc "$REPLY"
+F_LCFG=$REPLY
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  f_norm "$CLAUDE_PLUGIN_ROOT/bin"
+  F_PLUGIN_BIN=$REPLY
+fi
+f_review_agent && F_IS_REVIEW=1
+
+case $T_TOOL in
+  Write | Edit | MultiEdit | NotebookEdit | Agent | Task)
+    if [ "$F_IS_REVIEW" = 1 ]; then
+      FENCE_TEXT=$T_TOOL
+      deny agent-tool "${T_AGENT#team:}: $M_AGENT_TOOL"
+    fi
+    ;;
+esac
+
+if [ "$T_HASCMD" = 1 ]; then
+  f_command_tool
+else
+  case $T_TOOL in
+    Write | Edit | MultiEdit) f_file_tool "${T_FILE:-$T_PATH}" ;;
+    NotebookEdit) f_file_tool "${T_NB:-$T_FILE}" ;;
+    Read | Grep | Glob | NotebookRead | LS) f_read_tool "${T_FILE:-${T_PATH:-$T_NB}}" ;;
+  esac
+fi
+
+allow
+}
+
+# The decision runs in a child process. bash runs traps only between commands, so one slow
+# builtin could outlast the hook timeout (which fails open). The watchdog can always kill a
+# child, and this process then exits 2 with [fence:timeout].
+(
+  FENCE_CHILD=1
+  FENCE_WDPID=''
+  trap fence_on_exit EXIT
+  trap '' ALRM
+  fence_decide
+) &
+FENCE_CHILD_PID=$!
+wait "$FENCE_CHILD_PID"
+fence_status=$?
+fence_stop_watchdog
+FENCE_CHILD_PID=''
+case $fence_status in
+  0 | 2)
+    FENCE_DONE=1
+    exit "$fence_status"
+    ;;
+esac
+fence_error internal-error "the fence decision ended unexpectedly (status $fence_status), so the call is blocked. Retry; if it keeps failing, tell the owner."
