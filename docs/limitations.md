@@ -39,3 +39,5 @@ Writers started by `/team:start-issue` need the project folder trusted (once, in
 
 ## Plugin updates are manual
 Auto-update is off for this marketplace on purpose, since the fence runs in bypass mode. After a new release, run `claude plugin marketplace update dev-standards` and `claude plugin update team@dev-standards`, then restart or `/reload-plugins`.
+
+<!-- phase-4 gate probe: this PR is closed without merging -->
