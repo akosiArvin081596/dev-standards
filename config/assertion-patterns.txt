@@ -1,0 +1,15 @@
+# Assertion-looking lines: extended regexes (grep -E), case-sensitive. When a
+# REMOVED line of an existing test file matches (and the identical line was not
+# re-added), the PR gets the tests-changed label for the reviewer.
+[Aa]ssert
+[Ee]xpect[[:space:]]*\(
+\.should
+(^|[^A-Za-z0-9_])should[[:space:]_(]
+\.to(Be|Equal|StrictEqual|Have|Match|Throw|Contain|Raise|Eq|Include)
+\.(eq|eql|equal|equals|deep)[[:space:](.]
+(^|[^A-Za-z0-9_])(refute|verify|ensure)[A-Za-z_]*[[:space:]]*\(
+t\.(Error|Errorf|Fatal|Fatalf|Fail|FailNow)\(
+(^|[^A-Za-z0-9_])(require|is|ok|eq|same)\.[A-Z][A-Za-z]*\(
+(^|[^A-Za-z0-9_])(is|ok|isnt|like|is_deeply|cmp_ok)[[:space:]]*\(
+must(Be|Equal|Throw)|must_equal|must_be
+\[\[?[[:space:]].*[[:space:]](==|!=|-eq|-ne)[[:space:]]

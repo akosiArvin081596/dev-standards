@@ -1,0 +1,15 @@
+# Destructive-migration patterns: extended regexes (grep -E), case-insensitive,
+# matched against ADDED lines of files under the base commit's MIGRATIONS_GLOB.
+# A match makes the PR guarded. Stack-neutral: raw SQL plus common migration DSL names.
+drop[[:space:]]+(table|column|schema|database|view|materialized[[:space:]]+view|type|index)
+alter[[:space:]]+table.*[[:space:]]drop([[:space:]]|$)
+rename[[:space:]]+(table|column|to)([[:space:]]|$)
+alter[[:space:]]+table.*[[:space:]]rename([[:space:]]|$)
+truncate([[:space:]]|$|\()
+delete[[:space:]]+from
+drop_?(table|column|columns|index|schema)
+remove_?(column|columns|table|index|reference|timestamps)
+rename_?(table|column|index)
+dropifexists
+schema::drop
+(removefield|deletemodel|renamefield|renamemodel|alterfield)[[:space:]]*\(

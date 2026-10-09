@@ -1,0 +1,37 @@
+# Column names that look personal: extended regexes (grep -E), matched
+# case-insensitively against the lower-cased column name. A migration that adds
+# a matching column needs a rule or ignore line for it in ops/anonymize.
+e-?mail
+phone
+mobile
+msisdn
+(^|_)cell(_|$)
+(^|_)(first|last|middle|full|given|family|sur|nick|display|user|maiden|legal|contact|customer|client|person)_?name($|_)
+(^|_)name$
+^name_
+address
+street
+(^|_)(city|town|province|barangay)($|_)
+(^|_)(zip|postal|post)_?code($|_)
+(^|_)zip($|_)
+birth
+(^|_)dob($|_)
+(^|_)age($|_)
+token
+pass(word|wd|code|phrase)?($|_)
+(^|_)pwd($|_)
+secret
+(^|_)otp($|_)
+(^|_)(api|private|access|secret)_?key($|_)
+(^|_)(ssn|sss|tin|nin|nric|sin|passport|national_?id|tax_?id|gov_?id|umid|philhealth|pagibig)($|_)
+licen[cs]e_?(no|num|number)
+(^|_)ip(_?addr(ess)?)?($|_)
+(^|_)card
+(^|_)cvv|(^|_)cvc
+(^|_)iban($|_)
+(^|_)(bank|account|acct)_?(no|num|number)($|_)
+(^|_)(lat|lng|lon|latitude|longitude|geo|location)($|_)
+gender
+salary
+income
+signature

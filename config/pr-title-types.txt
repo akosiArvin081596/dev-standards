@@ -1,0 +1,14 @@
+# Conventional Commits types accepted in PR titles (one per line, lower case).
+# The branch types (feat fix chore docs refactor hotfix) plus the usual extras.
+feat
+fix
+hotfix
+chore
+docs
+refactor
+perf
+test
+build
+ci
+style
+revert

@@ -1,0 +1,12 @@
+# Paths that make a PR "guarded" (it then needs the owner's owner-approved).
+# One glob per line, matched against the full repo-relative path:
+#   **/ = zero or more folders, ** = anything, * = anything but "/", ? = one character.
+# Used by scripts/ci/guarded-paths.sh (profile "standards" guards every path).
+.claude/**
+CLAUDE.md
+**/CLAUDE.md
+.github/**
+.githooks/**
+Makefile
+ops/**
+.mcp.json

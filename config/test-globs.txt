@@ -1,0 +1,17 @@
+# Test files, for the test guard. Same glob syntax as guarded-globs.txt,
+# matched against paths relative to the ci working directory.
+**/test/**
+**/tests/**
+**/__tests__/**
+**/spec/**
+**/specs/**
+**/e2e/**
+**/*_test.*
+**/*.test.*
+**/*.spec.*
+**/*_spec.*
+**/test_*.*
+**/*Test.*
+**/*Tests.*
+**/*TestCase.*
+**/*IT.*

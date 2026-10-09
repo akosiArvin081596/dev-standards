@@ -1,0 +1,21 @@
+# Skip and focus markers: extended regexes (grep -E), case-sensitive, matched
+# against ADDED lines of test files. An added line that matches fails the test
+# guard, unless the identical line was removed in the same file (a moved line).
+\.(skip|only|todo|skipIf|runIf)[[:space:]]*\(
+(^|[^A-Za-z0-9_.$])x(it|test|describe|context|specify)[[:space:]]*\(
+(^|[^A-Za-z0-9_.$])f(it|describe|context)[[:space:]]*\(
+(^|[^A-Za-z0-9_.$])pending[[:space:]]*\(
+@skip
+@pytest\.mark\.(skip|skipif|xfail)
+@unittest\.(skip|expectedFailure)
+@Disabled
+@Ignore
+@Tag\(["']?skip
+@tag[[:space:]]+:skip
+(^|[^A-Za-z0-9_])t\.Skip(Now|f)?\(
+markTestSkipped
+markTestIncomplete
+->skip\(
+#\[ignore
+\[(Ignore|Skip)[]( ]
+Skip[[:space:]]*=[[:space:]]*"

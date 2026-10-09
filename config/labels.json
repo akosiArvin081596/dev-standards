@@ -1,0 +1,14 @@
+[
+  {"name": "bug", "color": "d73a4a", "description": "Something is broken"},
+  {"name": "feature", "color": "a2eeef", "description": "New behaviour, built behind a flag"},
+  {"name": "client-request", "color": "7057ff", "description": "Requested by the client"},
+  {"name": "high-risk", "color": "b60205", "description": "Touches HIGH_RISK_GLOBS: security review required (added by workflows)"},
+  {"name": "guarded", "color": "e99695", "description": "Changes the safety system or a destructive migration: needs the owner's yes (added by workflows)"},
+  {"name": "owner-approved", "color": "0e8a16", "description": "The owner said yes; counts only when the owner added it, removed on every new push"},
+  {"name": "tests-changed", "color": "fbca04", "description": "Test assertions changed: reviewer confirms it is a correction (added by workflows)"},
+  {"name": "needs-info", "color": "d876e3", "description": "Could not reproduce or decide: more information needed"},
+  {"name": "health", "color": "c5def5", "description": "Found by the weekly health check"},
+  {"name": "incident", "color": "ee0701", "description": "Production health check failed twice in a row"},
+  {"name": "main-red", "color": "d93f0b", "description": "The main pipeline is failing: fix it first"},
+  {"name": "fixes-main", "color": "1d76db", "description": "This PR fixes the main-red pipeline"}
+]
