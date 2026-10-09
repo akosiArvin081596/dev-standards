@@ -50,7 +50,7 @@ Required workflows never use `paths:` filters. The `ci / ci` check comes from a 
 | 0 | success (a plan shown without `--apply` is success) |
 | 1 | failure |
 | 2 | usage error (bad or missing arguments) |
-| 3 | not configured (Makefile target or config not filled in yet: "not configured: fill in for your stack") |
+| 3 | not configured (Makefile target or config not filled in yet: "not configured: fill in for your stack"). A recipe that exits 3 makes GNU make itself exit 2 and print `*** [<target>] Error 3`; callers detect "not configured" from that line or the message text. |
 | 4 | refused by policy (release PR, forbidden subcommand, wrong agent, would reuse a foreign resource) |
 | 5 | missing prerequisite (tool not installed, not in a git repo, config file missing) |
 | 6 | waiting for the owner (needs `--apply` with my yes, or a manual step I must do) |
@@ -85,7 +85,7 @@ Local Postgres credentials come from the standard `PGUSER`/`PGPASSWORD` (default
 | `CLAUDE.md` | project | ≤150 lines, no `@` imports |
 | `.claude/rules/team/*.md` | managed | one always-on file ≤60 lines |
 | `.claude/rules/project/*.md` | project | mostly `paths:`-scoped, each ≤80 lines |
-| `.claude/settings.json` | managed | plugin enable, deny/ask rules, SessionStart check, `autoMemoryEnabled: false`, `worktree.bgIsolation: "none"` |
+| `.claude/settings.json` | managed | plugin enable, deny/ask rules, SessionStart check, `autoMemoryEnabled: false`, `worktree.bgIsolation: "none"`, `enabledMcpjsonServers: ["playwright"]` |
 | `.claude/hooks/plugin-check` | managed | SessionStart: warns when the `team` plugin isn't installed+enabled |
 | `.claude/team-standards.lock` | `team-sync` | JSON: `{"standards_repo","release","files":{path: "sha256:<hex>"}}` |
 | `.mcp.json` | managed by template | Playwright MCP, isolated + headless, output dir `.team/evidence` |
@@ -255,7 +255,8 @@ bash 3.2 + BSD tools: no associative arrays, `mapfile`/`readarray`, `${v,,}`/`${
 
 | Folder | Writer |
 |---|---|
-| `plugins/team/hooks/`, `tests/hooks/` | fence engineer |
+| `plugins/team/hooks/` | fence engineer |
+| `tests/hooks/` | fence test engineer (QA), independent of the hook's author |
 | `.github/workflows/`, `scripts/ci/`, `config/`, `tests/ci/`, `tests/fixture-project/` | workflows engineer |
 | `plugins/team/server/`, `tests/server/` | server engineer |
 | `plugins/team/lib/team-common.sh` | lead (frozen; ask the lead for changes) |
