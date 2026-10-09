@@ -558,7 +558,7 @@ t_fences() {
   fi
   expect_rc 0 "real fence: every forbidden action denied, every control allowed" sh -c "cd '$r' && /bin/bash '$BIN/team-check-fences' --hook '$fence' --offline"
   if [ "$RC" != 0 ]; then grep '^FAIL' "$T/last.out" | sed 's/^/        | /'; fi
-  ok "real fence: table covers the forbidden list" [ "$(grep -c '^PASS  deny ' "$T/last.out")" -ge 45 ]
+  ok "real fence: table covers the forbidden list" [ "$(grep -cE '^PASS +deny ' "$T/last.out")" -ge 45 ]
   ok "real fence: simulated denials stay out of the real fence.log" [ ! -e "$TEAM_CONFIG_DIR/fence.log" ]
   jq '.permissions.deny -= ["Bash(git tag *)"]' "$REPO/managed/.claude/settings.json" > "$r/.claude/settings.json"
   expect_rc 1 "a missing deny rule fails the table" sh -c "cd '$r' && /bin/bash '$BIN/team-check-fences' --hook '$fence' --offline"
