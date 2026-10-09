@@ -173,6 +173,15 @@ git push origin main'
   fx_write "$FX/tmpbin/team-gh" '#!/bin/bash
 git push origin main'
   chmod +x "$p/scripts/"*.sh "$p/team-gh" "$FX/tmpbin/team-gh"
+  # bare-glob fixtures (review-fixes-1 S11): dirs with and without credential/fence names
+  fx_write "$p/build/a.txt" "fixture"
+  fx_write "$p/build/b.o" "fixture"
+  fx_write "$p/.team/evidence/issue-13/before-1.png" "fixture"
+  fx_write "$p/.team/evidence/issue-13/after-1.png" "fixture"
+  fx_write "$p/deploydir/production.env" "APP_KEY=decoy-fixture"
+  fx_write "$p/deploydir/readme.txt" "fixture"
+  fx_write "$p/envdir/.env.production" "APP_KEY=decoy-fixture"
+  fx_write "$p/envdir/.env" "APP_ENV=local"
   fx_repo "$p" feat/3-thing "git@github.com:someone/project.git" || return 1
 
   # plain: not a git repo

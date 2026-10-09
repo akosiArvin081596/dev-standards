@@ -1,0 +1,58 @@
+# expect	rule(s)	agent	tool	cwd	command/path	note	[env]
+# Code-review fixes round 1 (briefs/review-fixes-1.md): B2 git add / git rm, S9 read-only date for review agents,
+# S11 filesystem-aware bare globs. Written from the brief, not the hook.
+# project fixtures: build/ (a.txt b.o), .team/evidence/issue-13/ (pngs), deploydir/ (production.env readme.txt),
+#   envdir/ (.env.production .env), .claude/ (settings*.json agents/ hooks/), src/ (app.txt)
+#
+# --- B2: git add only stages; allowed for fence and workflow paths ---
+allow	fence-file	main	Bash	project	git add .claude/settings.json	stage settings.json
+allow	fence-file	main	Bash	project	git add .claude/settings.local.json .claude/agents/helper.md	stage several fence files
+allow	fence-file	main	Bash	project	git add .claude/hooks/check.sh	stage a .claude hook
+allow	fence-file	main	Bash	project	git add .mcp.json	stage .mcp.json
+allow	workflow-edit	main	Bash	project	git add .github/workflows/ci.yml	stage a project workflow
+allow	fence-file	main	Bash	project	git add -A	git add -A
+allow	fence-file	main	Bash	project	git add -u	git add -u
+allow	fence-file	main	Bash	project	git add .	git add .
+allow	fence-file	main	Bash	project	git status --porcelain && git add -A	check then stage everything
+allow	fence-file	main	Bash	plain	git -C {PROJ} add .claude/settings.json	git -C add of a fence file
+allow	fence-file	main	Bash	project	git rm --cached .claude/settings.json	rm --cached only unstages
+allow	fence-file	main	Bash	project	git rm --cached .mcp.json	rm --cached .mcp.json
+allow	workflow-edit	main	Bash	project	git rm --cached .github/workflows/ci.yml	rm --cached a workflow
+deny	fence-file	main	Bash	project	git rm .claude/settings.json	git rm deletes the working-tree file
+deny	fence-file	main	Bash	project	git rm -r .claude/hooks	git rm -r a fence folder
+deny	fence-file	main	Bash	project	git rm .mcp.json	git rm .mcp.json
+deny	workflow-edit	main	Bash	project	git rm .github/workflows/ci.yml	git rm a project workflow
+deny	fence-file	main	Bash	project	echo x > .claude/settings.json && git add .claude/settings.json	the write is still fenced even when staged after
+#
+# --- S9: review agents may read the date, never set it ---
+allow	agent-bash	team:team-health	Bash	project	date -u +%Y-%m-%d	health: date -u +FMT
+allow	agent-bash	team:team-reviewer	Bash	project	date	reviewer: date
+allow	agent-bash	team:team-security	Bash	project	date -u	security: date -u
+allow	agent-bash	team:team-qa	Bash	project	date +%s	qa: date +FMT
+allow	agent-bash	team:team-health	Bash	project	date -u +%Y-%m-%dT%H:%M:%SZ	health: ISO timestamp
+deny	agent-bash	team:team-health	Bash	project	date -s "2026-01-01 00:00:00"	health: date -s
+deny	agent-bash	team:team-reviewer	Bash	project	date -f /tmp/dates	reviewer: date -f
+deny	agent-bash	team:team-security	Bash	project	date 0101000026	security: setting the clock
+deny	agent-bash	team:team-qa	Bash	project	date -u 0101000026	qa: setting the clock with -u
+#
+# --- S11: bare * / ? final component is judged by what is in the directory ---
+allow	credential-read	main	Bash	project	rm -rf build/*	no credential or fence name in build/
+allow	credential-read	main	Bash	project	cat src/*	no credential or fence name in src/
+allow	credential-read	main	Bash	project	ls build/*	ls of a clean folder
+allow	credential-read	main	Bash	project	cp build/* /tmp/out/	cp from a clean folder
+allow	credential-read	main	Bash	project	mv .team/evidence/issue-13/* .team/evidence/14/	evidence move (skills S11)
+allow	credential-read	main	Bash	project	mv .team/evidence/issue-13/*.png .team/evidence/14/	evidence move of pngs
+allow	credential-read	main	Bash	project	cat build/?.txt	? glob in a clean folder
+deny	credential-read	main	Bash	project	cat deploydir/*	folder holds production.env
+deny	credential-read	main	Bash	project	cp deploydir/* /tmp/out/	cp from a folder holding production.env
+deny	credential-read	main	Bash	project	rm deploydir/*	rm in a folder holding production.env
+deny	credential-read	main	Bash	project	cat envdir/.*	dot glob matches .env.production
+deny	credential-read	main	Bash	plain	cd {PROJ}/deploydir && cat *	bare * after cd into the folder
+deny	fence-file	main	Bash	project	rm .claude/*	folder holds fence files
+deny	fence-file	main	Bash	project	mv .claude/agents/* /tmp/	agents folder entries are fence files
+allow	fence-file	main	Bash	project	cat .claude/*	plain read of a fence folder
+#
+# --- explicit fence-path globs keep their exemplar-based deny ---
+deny	fence-file	main	Bash	project	rm .claude/settings*.json	explicit settings*.json glob
+deny	fence-file	main	Bash	project	cp x .cl*/settings.json	explicit .cl* glob
+deny	fence-file	main	Bash	plain	echo x > {PROJ}/.claude/settings.l*.json	explicit glob, absolute path
