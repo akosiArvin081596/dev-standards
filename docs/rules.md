@@ -50,7 +50,7 @@ Required workflows never use `paths:` filters. The `ci / ci` check comes from a 
 | 0 | success (a plan shown without `--apply` is success) |
 | 1 | failure |
 | 2 | usage error (bad or missing arguments) |
-| 3 | not configured (Makefile target or config not filled in yet: "not configured: fill in for your stack"). A recipe that exits 3 makes GNU make itself exit 2 and print `*** [<target>] Error 3`; callers treat a target as not configured only when that line AND the message text are both present (a real tool exiting 3 is a failure). |
+| 3 | not configured (Makefile target or config not filled in yet: "not configured: fill in for your stack"). A recipe that exits 3 makes GNU make itself exit 2 and print `*** [<target>] Error 3`; callers treat a target as not configured only when that line AND the message text are both present (a real tool exiting 3 is a failure). A missing target or Makefile is a failure (exit 1), not exit 3. |
 | 4 | refused by policy (release PR, forbidden subcommand, wrong agent, would reuse a foreign resource) |
 | 5 | missing prerequisite (tool not installed, not in a git repo, config file missing) |
 | 6 | waiting for the owner (needs `--apply` with my yes, or a manual step I must do) |
